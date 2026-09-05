@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import load
 
 _module = None
 _DIR = os.path.dirname(os.path.abspath(__file__))
-_CSRC = os.path.join(_DIR, "../csrc")
+_CSRC = os.path.join(_DIR, "csrc")
 SUPPORTED_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
 
 
@@ -19,8 +19,9 @@ def cuda_arch_for_device() -> str:
 
     ``NANOVLLM_CUDA_ARCH`` is useful on build/login nodes where the visible
     device is not the eventual execution device. Otherwise use the current
-    CUDA device capability. A100 and V100 are supported build targets; the
-    runtime adapter still gates execution based on precision support.
+    CUDA device capability. A100 is the primary target; V100 is a best-effort
+    build target while the runtime adapter remains conservative and gates
+    execution based on precision support.
     """
 
     override = os.getenv("NANOVLLM_CUDA_ARCH")
@@ -86,7 +87,7 @@ def get_extension():
         return _module
 
     _module = load(
-        name="qwen_megakernel_C",
+        name="nanovllm_megakernel_C",
         sources=[
             os.path.join(_CSRC, "torch_bindings.cpp"),
             os.path.join(_CSRC, "kernel.cu"),

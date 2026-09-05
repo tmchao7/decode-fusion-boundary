@@ -33,8 +33,8 @@ Use a local Qwen3-0.6B model directory. Do not commit model weights, Hugging Fac
 ## 2. Static and smoke checks
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall nanovllm qwen_megakernel tools
+PYTHONPATH=src python -m unittest discover -s tests -v
+python -m compileall src/nanovllm tools
 ```
 
 Run a short correctness check before performance testing:
@@ -43,7 +43,7 @@ Run a short correctness check before performance testing:
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
-python tools/correctness_smoke.py /path/to/Qwen3-0.6B \
+python -m tools.correctness_smoke /path/to/Qwen3-0.6B \
   --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
   --max-tokens 8 \
   --require-megakernel \
@@ -56,7 +56,7 @@ For V100, use `sm_70` and omit `--require-megakernel`; a fallback is expected un
 
 ```bash
 NANOVLLM_CUDA_ARCH=sm_80 \
-python bench_megakernel.py /path/to/Qwen3-0.6B \
+python -m benchmarks.compare /path/to/Qwen3-0.6B \
   --backends torch-eager,torch-cudagraph,megakernel \
   --prompt-lengths 32,128,512 \
   --batch-sizes 1,8,32 \
@@ -70,7 +70,7 @@ python bench_megakernel.py /path/to/Qwen3-0.6B \
 Generate plots from the JSON:
 
 ```bash
-python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
+python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
 ```
 
 ## 4. Nsight profiling
@@ -81,13 +81,13 @@ Profile a short run only; do not use profiling output as the latency benchmark.
 NANOVLLM_CUDA_ARCH=sm_80 \
 nsys profile --trace=cuda,nvtx \
   --output=results/a100_nsys \
-  python bench_megakernel.py /path/to/Qwen3-0.6B \
+  python -m benchmarks.compare /path/to/Qwen3-0.6B \
     --backends megakernel --prompt-lengths 32 --max-tokens 32 --warmup 1 --runs 1
 
 NANOVLLM_CUDA_ARCH=sm_80 \
 ncu --set full --target-processes all \
   --export results/a100_ncu \
-  python bench_megakernel.py /path/to/Qwen3-0.6B \
+  python -m benchmarks.compare /path/to/Qwen3-0.6B \
     --backends megakernel --prompt-lengths 32 --max-tokens 32 --warmup 1 --runs 1
 ```
 

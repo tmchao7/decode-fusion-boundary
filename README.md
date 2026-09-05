@@ -18,12 +18,14 @@ standard backend and are marked as non-comparable in benchmark reports.
 ## Repository Layout
 
 ```text
-nanovllm/                 Core runtime, scheduler, model, and backends
-qwen_megakernel/          CUDA extension and fixed-shape Qwen kernel
-benchmarks/               Controlled and realistic workload definitions
+src/nanovllm/             Core runtime, scheduler, model, and public API
+src/nanovllm/backends/    Execution backends
+  megakernel/             Qwen CUDA extension, wrapper, and kernel sources
+benchmarks/               Workload definitions and benchmark entrypoints
 tests/                    CPU-safe unit tests
 tools/                    Correctness, environment, and plotting utilities
 docs/                     Kernel design and server runbook
+examples/                 Minimal inference examples
 ```
 
 ## Server Environment
@@ -69,7 +71,7 @@ Run the short correctness gate before long experiments:
 
 ```bash
 CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
-python tools/correctness_smoke.py /PATH/TO/Qwen3-0.6B \
+python -m tools.correctness_smoke /PATH/TO/Qwen3-0.6B \
   --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
   --max-tokens 8 --require-megakernel \
   --json results/a100-correctness.json
@@ -79,7 +81,7 @@ Run controlled prompt-length and batch experiments:
 
 ```bash
 NANOVLLM_CUDA_ARCH=sm_80 \
-python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+python -m benchmarks.compare /PATH/TO/Qwen3-0.6B \
   --suite performance \
   --workloads benchmarks/workloads.json \
   --backends torch-eager,torch-cudagraph,megakernel \
@@ -91,7 +93,7 @@ Run natural-language workloads separately:
 
 ```bash
 NANOVLLM_CUDA_ARCH=sm_80 \
-python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+python -m benchmarks.compare /PATH/TO/Qwen3-0.6B \
   --suite realistic --workloads benchmarks/workloads.json \
   --json results/a100-realistic.json --markdown results/a100-realistic.md
 ```
@@ -99,7 +101,7 @@ python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
 Generate plots:
 
 ```bash
-python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
+python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
 ```
 
 The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
@@ -110,7 +112,7 @@ Nsight profiling is documented in `docs/server_benchmark.md`.
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall nanovllm qwen_megakernel tools
+python -m compileall src/nanovllm tools
 ```
 
 See `docs/megakernel_design.md` for the planned direct paged-KV integration.

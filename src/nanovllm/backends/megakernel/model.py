@@ -15,7 +15,7 @@ KV_SIZE = 8 * HEAD_DIM  # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
-_decode = torch.ops.qwen_megakernel_C.decode
+_decode = torch.ops.nanovllm_megakernel_C.decode
 
 
 def _rope_tables(rope_theta: float = 10000.0):
@@ -269,7 +269,7 @@ class Decoder:
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         for tid in ids[:-1]:
             self.step(tid)
-        _gen = torch.ops.qwen_megakernel_C.generate_nosync
+        _gen = torch.ops.nanovllm_megakernel_C.generate_nosync
         output_ids = _gen(
             ids[-1],
             max_tokens,

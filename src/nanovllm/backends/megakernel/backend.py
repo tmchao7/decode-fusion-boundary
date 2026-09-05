@@ -41,7 +41,7 @@ def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 class MegakernelBackend:
-    """Lazy adapter around ``qwen_megakernel``'s single-token decoder."""
+    """Lazy adapter around the packaged single-token decoder."""
 
     def __init__(self, config, model):
         self.config = config
@@ -110,15 +110,8 @@ class MegakernelBackend:
                 f"detected sm_{capability[0]}{capability[1]}"
             )
 
-        try:
-            from qwen_megakernel.qwen_megakernel.build import get_extension
-            from qwen_megakernel.qwen_megakernel.model import (
-                Decoder,
-                weights_from_nano_model,
-            )
-        except ModuleNotFoundError:
-            from qwen_megakernel.build import get_extension
-            from qwen_megakernel.model import Decoder, weights_from_nano_model
+        from .build import get_extension
+        from .model import Decoder, weights_from_nano_model
 
         get_extension()
         weights = weights_from_nano_model(self.model, self.config.hf_config)

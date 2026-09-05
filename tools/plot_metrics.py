@@ -1,4 +1,4 @@
-"""Create PNG summaries from bench_megakernel.py JSON output."""
+"""Create PNG summaries from benchmark.py JSON output."""
 
 from __future__ import annotations
 

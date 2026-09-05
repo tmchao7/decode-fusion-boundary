@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "megakernel-vllm"
 version = "0.2.0"
 readme = "README.md"
 description = "Qwen Megakernel research extension for nano-vLLM"
@@ -20,5 +20,8 @@ dependencies = [
 Homepage="https://github.com/tmchao7/MegaKernel-vLLM"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["nanovllm*"]
+
+[tool.setuptools.package-data]
+nanovllm = ["backends/megakernel/csrc/*.cu", "backends/megakernel/csrc/*.cpp"]

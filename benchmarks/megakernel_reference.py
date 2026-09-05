@@ -1,4 +1,4 @@
-"""Benchmark: Qwen megakernel vs PyTorch HuggingFace baseline."""
+"""Benchmark: Qwen Megakernel vs PyTorch Hugging Face baseline."""
 
 import gc
 import time
@@ -56,7 +56,10 @@ def bench_pytorch_hf():
 
 
 def bench_megakernel():
-    from qwen_megakernel.model import Decoder
+    from nanovllm.backends.megakernel.build import get_extension
+
+    get_extension()
+    from nanovllm.backends.megakernel.model import Decoder
 
     dec = Decoder(verbose=False)
 
@@ -101,7 +104,10 @@ def correctness_check():
     )
     model.eval()
 
-    from qwen_megakernel.model import Decoder
+    from nanovllm.backends.megakernel.build import get_extension
+
+    get_extension()
+    from nanovllm.backends.megakernel.model import Decoder
 
     dec = Decoder(weights=None, tokenizer=tokenizer, verbose=False)
 
