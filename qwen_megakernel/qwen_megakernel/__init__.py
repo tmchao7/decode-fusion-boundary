@@ -1,4 +1,4 @@
-"""Qwen Megakernel — single-kernel Qwen3-0.6B decode for RTX 5090."""
+"""Qwen Megakernel — single-kernel Qwen3-0.6B decode for A100."""
 
 from qwen_megakernel.build import get_extension as _get_ext
 

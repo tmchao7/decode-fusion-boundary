@@ -1,30 +1,36 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
+# Megakernel-vLLM
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+A research implementation that extends nano-vLLM with a Qwen3-0.6B Megakernel
+decode backend and reproducible A100/V100 evaluation tooling.
 
-# Nano-vLLM
+## Current Scope
 
-A lightweight vLLM implementation built from scratch.
+The repository currently contains three execution paths:
 
-## Key Features
+- `torch-eager`: standard nano-vLLM PyTorch execution;
+- `torch-cudagraph`: standard nano-vLLM CUDA Graph execution;
+- `megakernel`: Qwen3-0.6B BF16 greedy decode on an A100-class GPU, limited to
+  one sequence and `max_model_len <= 2048`.
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+Megakernel requests that are unsupported or run on V100 fall back to the
+standard backend and are marked as non-comparable in benchmark reports.
 
-## Installation
+## Repository Layout
 
-For a normal Python installation:
-
-```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+```text
+nanovllm/                 Core runtime, scheduler, model, and backends
+qwen_megakernel/          CUDA extension and fixed-shape Qwen kernel
+benchmarks/               Controlled and realistic workload definitions
+tests/                    CPU-safe unit tests
+tools/                    Correctness, environment, and plotting utilities
+docs/                     Kernel design and server runbook
 ```
 
-For the A100/V100 server workflow, use the repository setup script instead:
+## Server Environment
+
+Use Miniconda for Python isolation. The setup script installs Python 3.11, a
+CUDA-enabled PyTorch wheel, project dependencies, and the repository in
+editable mode. The server must provide `nvidia-smi` and `nvcc`.
 
 ```bash
 bash setup_server.sh
@@ -32,139 +38,79 @@ conda activate nano-vllm-server
 python tools/verify_server_env.py
 ```
 
-The script creates a Python 3.11 Miniconda environment, installs the CUDA
-PyTorch wheel, installs `requirements.server.txt`, and installs this repository
-in editable mode. It requires `nvidia-smi` and `nvcc` to already be available
-from the server driver/toolkit or module system.
-
-## Model Download
-
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
+Set `NANOVLLM_MODEL_PATH` when the model path should also be checked.
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+
+llm = LLM("/PATH/TO/Qwen3-0.6B", enforce_eager=True)
+params = SamplingParams(temperature=0.6, max_tokens=128)
+outputs = llm.generate(["Explain KV cache in one paragraph."], params)
+print(outputs[0]["text"])
 ```
 
-### Optional Qwen Megakernel Decode Backend
-
-The experimental backend targets Qwen3-0.6B BF16 greedy decode on an A100. It
-keeps prefill and unsupported requests on the standard path, and falls back
-when the model, batch, sampling mode, or GPU is incompatible:
+For Megakernel decode:
 
 ```python
 llm = LLM(
-    "/YOUR/QWEN3-0.6B/PATH",
+    "/PATH/TO/Qwen3-0.6B",
     decode_backend="megakernel",
-    max_model_len=2048,
     max_num_seqs=1,
+    max_model_len=2048,
 )
-sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
+params = SamplingParams(temperature=0.0, max_tokens=128)
 ```
 
-Build the optional CUDA extension on the target server, not on macOS:
+## Correctness and Benchmarking
 
-```bash
-cd qwen_megakernel && NANOVLLM_CUDA_ARCH=sm_80 python -m qwen_megakernel.bench
-```
-
-The first integration milestone uses a private contiguous KV cache and
-supports one sequence at a time. Batch/paged-KV support remains a follow-up
-optimization; use the default backend for sampling or multi-sequence runs.
-
-Currently runnable paths:
-
-- `torch-eager`: standard nano-vLLM PyTorch execution;
-- `torch-cudagraph`: standard nano-vLLM CUDA Graph execution when
-  `enforce_eager=False`;
-- `megakernel`: Qwen3-0.6B BF16, A100-class GPU, greedy, single-sequence
-  decode. On V100 or an unsupported request it records fallback and uses the
-  standard backend instead of claiming Megakernel performance.
-
-For an end-to-end A/B comparison of eager PyTorch, CUDA Graph, and Megakernel:
-
-```bash
-NANOVLLM_CUDA_ARCH=sm_80 python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
-  --backends torch-eager,torch-cudagraph,megakernel \
-  --prompt-lengths 32,128,512 \
-  --max-tokens 128 --warmup 2 --runs 10 \
-  --json results/a100.json --markdown results/a100.md
-```
-
-Run the realistic natural-language suite separately when you want a semantic
-workload report:
-
-```bash
-NANOVLLM_CUDA_ARCH=sm_80 python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
-  --suite realistic \
-  --workloads benchmarks/workloads.json \
-  --backends torch-eager,torch-cudagraph,megakernel \
-  --json results/a100-realistic.json \
-  --markdown results/a100-realistic.md
-```
-
-The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
-throughput, peak CUDA memory, optional NVML telemetry, backend fallback reasons,
-and greedy-token correctness against the eager baseline. It also emits NVTX
-ranges named `nano_vllm_request`, `nano_vllm_prefill`,
-`nano_vllm_decode_step`, and `megakernel_decode`.
-
-Use Nsight Systems/Compute separately on the server to collect kernel launches,
-memcpy operations, DRAM/L2 throughput, achieved occupancy, and SM utilization:
-
-Before a long benchmark, run the short correctness gate and generate plots from
-saved JSON results:
+Run the short correctness gate before long experiments:
 
 ```bash
 CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
 python tools/correctness_smoke.py /PATH/TO/Qwen3-0.6B \
   --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
-  --max-tokens 8 \
-  --require-megakernel --json results/a100_correctness.json
+  --max-tokens 8 --require-megakernel \
+  --json results/a100-correctness.json
+```
+
+Run controlled prompt-length and batch experiments:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 \
+python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+  --suite performance \
+  --workloads benchmarks/workloads.json \
+  --backends torch-eager,torch-cudagraph,megakernel \
+  --batch-sizes 1,8,32 --max-tokens 128 --warmup 2 --runs 10 \
+  --json results/a100.json --markdown results/a100.md
+```
+
+Run natural-language workloads separately:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 \
+python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+  --suite realistic --workloads benchmarks/workloads.json \
+  --json results/a100-realistic.json --markdown results/a100-realistic.md
+```
+
+Generate plots:
+
+```bash
 python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
 ```
 
-Design notes and the complete server procedure are documented in
-`docs/megakernel_design.md` and `docs/server_benchmark.md`.
+The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
+throughput, CUDA Event time, peak memory, fallback reasons, and correctness.
+Nsight profiling is documented in `docs/server_benchmark.md`.
 
+## Development Checks
 
 ```bash
-nsys profile --trace=cuda,nvtx --output=results/a100_megakernel \
-  python bench_megakernel.py /PATH/TO/Qwen3-0.6B --backends megakernel
-ncu --set full --target-processes all --export results/a100_megakernel \
-  python bench_megakernel.py /PATH/TO/Qwen3-0.6B --backends megakernel
+python -m unittest discover -s tests -v
+python -m compileall nanovllm qwen_megakernel tools
 ```
 
-## Benchmark
-
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+See `docs/megakernel_design.md` for the planned direct paged-KV integration.

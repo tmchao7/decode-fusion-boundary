@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nano-vllm"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "Qwen Megakernel research extension for nano-vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -20,7 +19,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/tmchao7/MegaKernel-vLLM"
 
 [tool.setuptools.packages.find]
 where = ["."]

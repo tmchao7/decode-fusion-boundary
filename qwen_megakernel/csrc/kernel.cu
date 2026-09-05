@@ -1,5 +1,5 @@
 /**
- * Fused single-kernel decode for Qwen3-0.6B on RTX 5090.
+ * Fused single-kernel decode for Qwen3-0.6B on A100.
  *
  * Everything — embedding lookup, 28 transformer layers (RMSNorm, QKV, RoPE,
  * attention, O-proj, MLP), and final norm — runs inside one cooperative kernel
