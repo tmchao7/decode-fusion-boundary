@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from nanovllm.metrics import (
+    CudaEventTimer,
     MetricsCollector,
     RequestMetrics,
     aggregate_requests,
@@ -81,6 +82,23 @@ class MetricsMathTests(unittest.TestCase):
     def test_metrics_are_json_serializable(self):
         request = RequestMetrics(1, 2, 0.0, [1.0], 1, 0.1, 0.2, "torch", "torch")
         json.dumps(request.to_dict())
+
+    def test_cuda_event_timer_is_safe_without_cuda(self):
+        timer = CudaEventTimer()
+        self.assertIsNone(timer.elapsed_seconds())
+
+    def test_collector_tracks_cuda_phase_time(self):
+        class FakeTimer:
+            def elapsed_seconds(self):
+                return 0.05
+
+        collector = MetricsCollector("torch")
+        collector.add_request(4, 8, 0.0)
+        seq = SimpleNamespace(seq_id=4)
+        collector.record_step([seq], True, 0.1, "torch", None, cuda_timer=FakeTimer())
+        report = collector.report(wall_time=0.1)
+        self.assertEqual(report["summary"]["cuda_prefill_time_ms_total"], 50.0)
+        self.assertEqual(report["requests"][0]["cuda_prefill_time_ms"], 50.0)
 
     def test_collector_tracks_phase_tokens_and_backend_fallback(self):
         collector = MetricsCollector("megakernel")

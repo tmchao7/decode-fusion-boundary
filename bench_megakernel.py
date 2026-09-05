@@ -240,8 +240,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         "## Request Metrics",
         "",
-        "| Backend | Prompt | Batch | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | Decode tok/s | Peak memory (GiB) | Status |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Backend | Prompt | Batch | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | Host decode p50 (ms) | CUDA decode p50 (ms) | Decode tok/s | Peak memory (GiB) | Status |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for experiment in payload["experiments"]:
         summary = experiment["summary"]
@@ -254,6 +254,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"| {experiment['backend']} | {experiment['workload']['prompt_length']} | "
             f"{experiment['workload']['batch_size']} | {value('ttft_ms')} | "
             f"{value('tpot_ms')} | {value('itl_ms')} | {value('e2e_ms')} | "
+            f"{value('decode_time_ms')} | {value('cuda_decode_time_ms')} | "
             f"{summary.get('decode_tok_s', 0.0) or 0.0:.2f} | {peak_gib} | "
             f"{','.join(experiment.get('backend_actual', [])) or 'unknown'} |"
         )

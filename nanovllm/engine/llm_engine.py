@@ -10,7 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.metrics import MetricsCollector, nvtx_range
+from nanovllm.metrics import CudaEventTimer, MetricsCollector, nvtx_range
 
 
 class LLMEngine:
@@ -60,9 +60,14 @@ class LLMEngine:
             seq.seq_id: len(seq.completion_token_ids) for seq in seqs
         }
         model_start = perf_counter()
+        cuda_timer = CudaEventTimer() if metrics is not None else None
+        if cuda_timer is not None:
+            cuda_timer.start()
         range_name = "nano_vllm_prefill" if is_prefill else "nano_vllm_decode_step"
         with nvtx_range(range_name):
             token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if cuda_timer is not None:
+            cuda_timer.stop()
         model_duration = perf_counter() - model_start
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         token_timestamp = perf_counter()
@@ -73,6 +78,7 @@ class LLMEngine:
                 model_duration,
                 self.model_runner.last_backend_used,
                 self.model_runner.last_fallback_reason,
+                cuda_timer=cuda_timer,
             )
             for seq in seqs:
                 new_tokens = len(seq.completion_token_ids) - before_completion[seq.seq_id]

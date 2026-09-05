@@ -88,6 +88,21 @@ ranges named `nano_vllm_request`, `nano_vllm_prefill`,
 Use Nsight Systems/Compute separately on the server to collect kernel launches,
 memcpy operations, DRAM/L2 throughput, achieved occupancy, and SM utilization:
 
+Before a long benchmark, run the short correctness gate and generate plots from
+saved JSON results:
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
+python tools/correctness_smoke.py /PATH/TO/Qwen3-0.6B \
+  --prompt-lengths 8,32,128 --max-tokens 8 \
+  --require-megakernel --json results/a100_correctness.json
+python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
+```
+
+Design notes and the complete server procedure are documented in
+`docs/megakernel_design.md` and `docs/server_benchmark.md`.
+
+
 ```bash
 nsys profile --trace=cuda,nvtx --output=results/a100_megakernel \
   python bench_megakernel.py /PATH/TO/Qwen3-0.6B --backends megakernel

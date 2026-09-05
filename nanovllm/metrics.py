@@ -43,6 +43,38 @@ def summarize(values: Iterable[float], scale: float = 1.0) -> dict[str, float | 
     }
 
 
+class CudaEventTimer:
+    """Lazy CUDA-event timer used only during explicit metrics collection."""
+
+    def __init__(self):
+        self.enabled = False
+        self.start_event = None
+        self.end_event = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                self.start_event = torch.cuda.Event(enable_timing=True)
+                self.end_event = torch.cuda.Event(enable_timing=True)
+                self.enabled = True
+        except Exception:
+            self.enabled = False
+
+    def start(self) -> None:
+        if self.enabled:
+            self.start_event.record()
+
+    def stop(self) -> None:
+        if self.enabled:
+            self.end_event.record()
+
+    def elapsed_seconds(self) -> float | None:
+        if not self.enabled:
+            return None
+        self.end_event.synchronize()
+        return self.start_event.elapsed_time(self.end_event) / 1000.0
+
+
 @dataclass
 class RequestMetrics:
     request_id: int
@@ -56,6 +88,8 @@ class RequestMetrics:
     backend_actual: str | None = None
     fallback_reason: str | None = None
     error: str | None = None
+    cuda_prefill_time: float = 0.0
+    cuda_decode_time: float = 0.0
 
     def _ttft(self) -> float | None:
         if not self.token_times:
@@ -92,6 +126,8 @@ class RequestMetrics:
             "tpot_ms": None if tpot is None else tpot * 1000.0,
             "prefill_time_ms": self.prefill_time * 1000.0,
             "decode_time_ms": self.decode_time * 1000.0,
+            "cuda_prefill_time_ms": self.cuda_prefill_time * 1000.0,
+            "cuda_decode_time_ms": self.cuda_decode_time * 1000.0,
             "e2e_ms": None if e2e is None else e2e * 1000.0,
             "prefill_tok_s": _safe_rate(self.prompt_tokens, self.prefill_time),
             "decode_tok_s": _safe_rate(self.output_tokens, self.decode_time),
@@ -122,6 +158,10 @@ class MetricsCollector:
         self.decode_steps = 0
         self.prefill_time = 0.0
         self.decode_time = 0.0
+        self.cuda_prefill_time = 0.0
+        self.cuda_decode_time = 0.0
+        self.pending_cuda_steps = []
+        self._cuda_finalized = False
 
     def add_request(self, request_id: int, prompt_tokens: int, arrival_time: float) -> None:
         if self.time_origin is None:
@@ -145,6 +185,7 @@ class MetricsCollector:
         duration: float,
         backend_actual: str | None,
         fallback_reason: str | None,
+        cuda_timer: CudaEventTimer | None = None,
     ) -> None:
         self.step_count += 1
         if is_prefill:
@@ -167,6 +208,31 @@ class MetricsCollector:
                 )
             if fallback_reason and request.fallback_reason is None:
                 request.fallback_reason = fallback_reason
+        if cuda_timer is not None:
+            self.pending_cuda_steps.append(
+                ([seq.seq_id for seq in seqs], is_prefill, cuda_timer)
+            )
+
+    def _finalize_cuda_timing(self) -> None:
+        if self._cuda_finalized:
+            return
+        self._cuda_finalized = True
+        for request_ids, is_prefill, timer in self.pending_cuda_steps:
+            duration = timer.elapsed_seconds()
+            if duration is None:
+                continue
+            if is_prefill:
+                self.cuda_prefill_time += duration
+            else:
+                self.cuda_decode_time += duration
+            for request_id in request_ids:
+                request = self.requests.get(request_id)
+                if request is None:
+                    continue
+                if is_prefill:
+                    request.cuda_prefill_time += duration
+                else:
+                    request.cuda_decode_time += duration
 
     def record_token(self, request_id: int, timestamp: float) -> None:
         request = self.requests.get(request_id)
@@ -183,6 +249,7 @@ class MetricsCollector:
             request.error = error
 
     def report(self, wall_time: float | None = None) -> dict[str, Any]:
+        self._finalize_cuda_timing()
         summary = aggregate_requests(self.requests.values(), wall_time=wall_time)
         summary.update(
             {
@@ -191,6 +258,8 @@ class MetricsCollector:
                 "decode_steps": self.decode_steps,
                 "prefill_time_ms_total": self.prefill_time * 1000.0,
                 "decode_time_ms_total": self.decode_time * 1000.0,
+                "cuda_prefill_time_ms_total": self.cuda_prefill_time * 1000.0,
+                "cuda_decode_time_ms_total": self.cuda_decode_time * 1000.0,
             }
         )
         return {
@@ -228,6 +297,12 @@ def aggregate_requests(
     e2e_values = [request["e2e_ms"] / 1000.0 for request in completed]
     prefill_values = [request["prefill_time_ms"] / 1000.0 for request in completed]
     decode_values = [request["decode_time_ms"] / 1000.0 for request in completed]
+    cuda_prefill_values = [
+        request["cuda_prefill_time_ms"] / 1000.0 for request in completed
+    ]
+    cuda_decode_values = [
+        request["cuda_decode_time_ms"] / 1000.0 for request in completed
+    ]
     prompt_tokens = sum(request["prompt_tokens"] for request in completed)
     output_tokens = sum(request["output_tokens"] for request in completed)
     if wall_time is None and completed:
@@ -254,6 +329,10 @@ def aggregate_requests(
         "tpot_ms": summarize(tpot_values),
         "itl_ms": summarize(itl_values),
         "e2e_ms": summarize(e2e_values),
+        "prefill_time_ms": summarize(prefill_values, scale=1000.0),
+        "decode_time_ms": summarize(decode_values, scale=1000.0),
+        "cuda_prefill_time_ms": summarize(cuda_prefill_values, scale=1000.0),
+        "cuda_decode_time_ms": summarize(cuda_decode_values, scale=1000.0),
         "prefill_tok_s": _safe_rate(prompt_tokens, sum(prefill_values)),
         "decode_tok_s": _safe_rate(output_tokens, sum(decode_values)),
         "output_tok_s": _safe_rate(output_tokens, wall_time),

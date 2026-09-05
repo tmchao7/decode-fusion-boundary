@@ -5,7 +5,8 @@
 - `nanovllm/` is the installable Python package. Core runtime flow lives in `engine/` (scheduling, blocks, model execution), reusable operators in `layers/`, model definitions in `models/`, and shared helpers in `utils/`.
 - `nanovllm/config.py`, `llm.py`, and `sampling_params.py` define the public configuration and inference API.
 - `example.py` is the smallest end-to-end inference example; `bench.py` contains the throughput benchmark. Static assets are under `assets/`.
-- `qwen_megakernel/` is an optional, nested CUDA-focused benchmark project for Qwen3-0.6B, primarily targeting A100 (`sm_80`); changes there require server-side CUDA tooling.
+- `qwen_megakernel/` is an optional CUDA-focused benchmark project for Qwen3-0.6B, primarily targeting A100 (`sm_80`); changes there require server-side CUDA tooling.
+- `docs/` contains the paged-KV design and the A100/V100 server runbook; `tools/` contains correctness and visualization utilities.
 
 ## Build, Test, and Development Commands
 
@@ -16,6 +17,8 @@ python -m pip install -e .       # install the package in editable mode
 python example.py                # run local generation; update the model path first
 python bench.py                  # benchmark throughput on the configured GPU
 python bench_megakernel.py MODEL # compare backends and write latency/throughput metrics
+python tools/correctness_smoke.py MODEL # short greedy correctness gate on GPU
+python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
 python -m compileall nanovllm    # fast syntax/import compilation smoke check
 ```
 
