@@ -43,6 +43,58 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+### Optional Qwen Megakernel Decode Backend
+
+The experimental backend targets Qwen3-0.6B BF16 greedy decode on an A100. It
+keeps prefill and unsupported requests on the standard path, and falls back
+when the model, batch, sampling mode, or GPU is incompatible:
+
+```python
+llm = LLM(
+    "/YOUR/QWEN3-0.6B/PATH",
+    decode_backend="megakernel",
+    max_model_len=2048,
+    max_num_seqs=1,
+)
+sampling_params = SamplingParams(temperature=0.0, max_tokens=256)
+```
+
+Build the optional CUDA extension on the target server, not on macOS:
+
+```bash
+cd qwen_megakernel && NANOVLLM_CUDA_ARCH=sm_80 python -m qwen_megakernel.bench
+```
+
+The first integration milestone uses a private contiguous KV cache and
+supports one sequence at a time. Batch/paged-KV support remains a follow-up
+optimization; use the default backend for sampling or multi-sequence runs.
+
+For an end-to-end A/B comparison of eager PyTorch, CUDA Graph, and Megakernel:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+  --backends torch-eager,torch-cudagraph,megakernel \
+  --prompt-lengths 32,128,512 \
+  --max-tokens 128 --warmup 2 --runs 10 \
+  --json results/a100.json --markdown results/a100.md
+```
+
+The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
+throughput, peak CUDA memory, optional NVML telemetry, backend fallback reasons,
+and greedy-token correctness against the eager baseline. It also emits NVTX
+ranges named `nano_vllm_request`, `nano_vllm_prefill`,
+`nano_vllm_decode_step`, and `megakernel_decode`.
+
+Use Nsight Systems/Compute separately on the server to collect kernel launches,
+memcpy operations, DRAM/L2 throughput, achieved occupancy, and SM utilization:
+
+```bash
+nsys profile --trace=cuda,nvtx --output=results/a100_megakernel \
+  python bench_megakernel.py /PATH/TO/Qwen3-0.6B --backends megakernel
+ncu --set full --target-processes all --export results/a100_megakernel \
+  python bench_megakernel.py /PATH/TO/Qwen3-0.6B --backends megakernel
+```
+
 ## Benchmark
 
 See `bench.py` for benchmark.

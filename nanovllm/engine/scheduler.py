@@ -22,6 +22,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    # schedule 收集 要处理的token序列 及其对应的flag(p or d)，貌似一次就反馈一组？就返回一个元组
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -56,14 +57,14 @@ class Scheduler:
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
+            seq = self.running.popleft() # 取出running队头的准备decode
+            while not self.block_manager.can_append(seq): # 不能申请KV cache了
+                if self.running: # 先优先踢出running的队末
                     self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
+                else: # 这个情况是 waiting队列很多 ，running空了，但是还是优先于prefill 导致 自己刚从running出来准备decode失败
+                    self.preempt(seq) # 只能踢走自己了
                     break
-            else:
+            else:  # 推理
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
@@ -72,6 +73,7 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    # 用于将处于running队列或者即将decode的 提回等待队列
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True

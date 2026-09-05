@@ -1,13 +1,17 @@
 import pickle
+import warnings
+
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.backends.megakernel import MegakernelBackend
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.metrics import nvtx_range
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -30,6 +34,13 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        self.megakernel = (
+            MegakernelBackend(config, self.model)
+            if config.decode_backend == "megakernel"
+            else None
+        )
+        self.last_backend_used = "torch"
+        self.last_fallback_reason = None
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -38,14 +49,14 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
+        if self.world_size > 1: # 多卡场景
+            if rank == 0: # 主进程
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
-            else:
+            else: # 非主进程
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
-                self.loop()
+                self.loop() # 死循环等待 主进程
 
     def exit(self):
         if self.world_size > 1:
@@ -83,8 +94,10 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        # 主卡执行
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
+        # 所有卡执行
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -136,18 +149,20 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
+            start = seq.num_cached_tokens # 过滤掉seq命中的kv cache 的计算起始位置
+            seqlen_q = seq.num_scheduled_tokens # 本次seq要算的token数
             end = start + seqlen_q
-            seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            seqlen_k = end # 当前序列总共拥有的 KV Cache 长度
+            input_ids.extend(seq[start:end]) # 抽出 seq tokens
+            positions.extend(range(start, end)) #
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            # 本 Batch 中最长的 Q 长度和最长的 K 长度
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
+            # 计算kv cache 的分配的槽位的 逻辑位置->物理位置的映射 slot_mapping
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
@@ -159,7 +174,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache 前缀缓存命中
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -175,9 +190,10 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
+            input_ids.append(seq.last_token) # 取最后一个token
             positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            context_lens.append(len(seq)) # 记录当前上下文长度
+            # 本次新算出的 KV 要写入显存的哪个绝对地址
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -212,6 +228,43 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        self.last_backend_used = "torch"
+        self.last_fallback_reason = None
+        # The first Megakernel milestone is intentionally a single-sequence,
+        # greedy decode path. Unsupported requests fall back to the existing
+        # PyTorch/eager/CUDA-Graph implementation below.
+        if self.megakernel is not None:
+            decision = MegakernelBackend.compatibility(
+                self.config, seqs, is_prefill
+            )
+            if not decision.supported and not is_prefill:
+                self.last_fallback_reason = decision.reason
+            if decision.supported:
+                try:
+                    with nvtx_range("megakernel_decode"):
+                        token_ids = self.megakernel.decode(seqs[0])
+                    self.last_backend_used = "megakernel"
+                    return token_ids
+                except Exception as exc:
+                    # Once a kernel step has started, its private contiguous KV
+                    # cache may have advanced while nano-vLLM's paged cache has
+                    # not. Do not silently produce incorrect tokens by falling
+                    # back after that point.
+                    if self.megakernel.decoder is not None:
+                        raise RuntimeError(
+                            "Megakernel decode failed after initialization; "
+                            "restart with decode_backend=\"torch\""
+                        ) from exc
+                    self.megakernel.disable(str(exc))
+                    self.last_fallback_reason = str(exc)
+                    warnings.warn(
+                        "Megakernel unavailable; falling back to the standard "
+                        f"backend: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        # 对输入seqs进行 p or d的处理 ,这里返回对seqs中的seq的id和位置
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

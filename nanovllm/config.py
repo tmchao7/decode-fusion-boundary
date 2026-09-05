@@ -3,6 +3,16 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
+VALID_DECODE_BACKENDS = {"torch", "megakernel"}
+
+
+def validate_decode_backend(value: str) -> str:
+    if value not in VALID_DECODE_BACKENDS:
+        options = ", ".join(sorted(VALID_DECODE_BACKENDS))
+        raise ValueError(f"decode_backend must be one of: {options}; got {value!r}")
+    return value
+
+
 @dataclass(slots=True)
 class Config:
     model: str
@@ -12,12 +22,14 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    decode_backend: str = "torch"
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
+        self.decode_backend = validate_decode_backend(self.decode_backend)
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8

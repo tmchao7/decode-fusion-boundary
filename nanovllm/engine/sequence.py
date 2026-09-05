@@ -37,6 +37,10 @@ class Sequence:
         return self.token_ids[key]
 
     @property
+    def is_greedy(self):
+        return self.temperature <= 1e-10
+
+    @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
 
