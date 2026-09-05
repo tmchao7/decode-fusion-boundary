@@ -13,7 +13,8 @@ def _number(value, default=0.0):
 
 def _label(experiment):
     workload = experiment["workload"]
-    return f"{experiment['backend']}\np{workload['prompt_length']} b{workload['batch_size']}"
+    lengths = workload.get("prompt_lengths") or ["natural"]
+    return f"{experiment['backend']}\np{','.join(map(str, lengths))} b{workload['batch_size']}"
 
 
 def main() -> None:
@@ -77,7 +78,7 @@ def main() -> None:
         speedup = comparison["metrics"].get("output_tok_s", {}).get("speedup")
         if speedup is None:
             continue
-        label = f"{comparison['optimized_backend']} p{comparison['prompt_length']} b{comparison['batch_size']}"
+        label = f"{comparison['optimized_backend']} {comparison['workload_id']} b{comparison['batch_size']}"
         ax.bar(label, speedup)
         plotted = True
     ax.axhline(1.0, color="black", linewidth=1)

@@ -103,6 +103,18 @@ NANOVLLM_CUDA_ARCH=sm_80 python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
   --json results/a100.json --markdown results/a100.md
 ```
 
+Run the realistic natural-language suite separately when you want a semantic
+workload report:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 python bench_megakernel.py /PATH/TO/Qwen3-0.6B \
+  --suite realistic \
+  --workloads benchmarks/workloads.json \
+  --backends torch-eager,torch-cudagraph,megakernel \
+  --json results/a100-realistic.json \
+  --markdown results/a100-realistic.md
+```
+
 The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
 throughput, peak CUDA memory, optional NVML telemetry, backend fallback reasons,
 and greedy-token correctness against the eager baseline. It also emits NVTX
@@ -118,7 +130,8 @@ saved JSON results:
 ```bash
 CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
 python tools/correctness_smoke.py /PATH/TO/Qwen3-0.6B \
-  --prompt-lengths 8,32,128 --max-tokens 8 \
+  --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
+  --max-tokens 8 \
   --require-megakernel --json results/a100_correctness.json
 python tools/plot_metrics.py results/a100.json --output-dir results/a100-plots
 ```

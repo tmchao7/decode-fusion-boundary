@@ -1,7 +1,8 @@
 """Reproducible nano-vLLM A/B benchmark with request-level metrics.
 
-Run on an A100/V100 server. The script intentionally keeps CUDA profiling out
-of latency measurements; use the NVTX ranges with Nsight separately.
+Run on an A100/V100 server. Controlled token-length workloads are useful for
+kernel analysis; the realistic workload suite exercises natural-language
+requests separately. CUDA profiling stays outside latency measurements.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import os
 import random
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -22,6 +23,7 @@ from nanovllm.metrics import (
     dump_json,
     environment_metadata,
 )
+from tools.workloads import load_workloads
 
 
 BACKEND_CONFIGS = {
@@ -29,12 +31,15 @@ BACKEND_CONFIGS = {
     "torch-cudagraph": {"decode_backend": "torch", "enforce_eager": False},
     "megakernel": {"decode_backend": "megakernel", "enforce_eager": False},
 }
+PromptFactory = Callable[[int, int], str | list[int]]
 
 
 def parse_int_list(value: str) -> list[int]:
     values = [int(item.strip()) for item in value.split(",") if item.strip()]
     if not values or any(item <= 0 for item in values):
-        raise argparse.ArgumentTypeError("expected a comma-separated list of positive integers")
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of positive integers"
+        )
     return values
 
 
@@ -62,15 +67,37 @@ def _backend_actual_is_megakernel(summary: dict[str, Any]) -> bool:
     return "megakernel" in summary.get("backend_actuals", [])
 
 
+def synthetic_factory(prompt_lengths: list[int], seed: int) -> PromptFactory:
+    def factory(run_index: int, slot: int) -> list[int]:
+        length = prompt_lengths[slot % len(prompt_lengths)]
+        index = max(0, run_index) * 1000 + slot
+        return prompt_ids(length, seed, index)
+
+    return factory
+
+
+def realistic_factory(prompt: str) -> PromptFactory:
+    def factory(run_index: int, slot: int) -> str:
+        if run_index <= 0:
+            return prompt
+        return f"{prompt}\n\nBenchmark variation {run_index}; keep the answer focused."
+
+    return factory
+
+
 def run_case(
     model_path: str,
     backend_name: str,
-    prompt_length: int,
+    workload_id: str,
+    category: str,
+    prompt_factory: PromptFactory,
+    prompt_lengths: list[int] | None,
     batch_size: int,
     max_tokens: int,
     warmup: int,
     runs: int,
     seed: int,
+    ignore_eos: bool,
 ) -> dict[str, Any]:
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"unknown backend: {backend_name}")
@@ -84,21 +111,27 @@ def run_case(
         max_num_seqs=batch_size,
         max_model_len=2048,
     )
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
-    warmup_prompts = [prompt_ids(prompt_length, seed + 17, index) for index in range(warmup)]
-    measured_count = runs * batch_size
-    measured_prompts = [
-        prompt_ids(prompt_length, seed, index + warmup + 1)
-        for index in range(measured_count)
-    ]
-
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=max_tokens,
+        ignore_eos=ignore_eos,
+    )
     try:
-        for prompt in warmup_prompts:
-            llm.generate([prompt], sampling_params, use_tqdm=False)
+        for warmup_index in range(warmup):
+            warmup_prompts = [
+                prompt_factory(-(warmup_index + 1), slot)
+                for slot in range(batch_size)
+            ]
+            llm.generate(warmup_prompts, sampling_params, use_tqdm=False)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
 
+        measured_prompts = [
+            prompt_factory(run_index, slot)
+            for run_index in range(1, runs + 1)
+            for slot in range(batch_size)
+        ]
         telemetry = GpuTelemetrySampler().start()
         try:
             result = llm.generate_with_metrics(
@@ -120,12 +153,15 @@ def run_case(
             "backend": backend_name,
             "backend_config": backend_config,
             "workload": {
-                "prompt_length": prompt_length,
+                "id": workload_id,
+                "category": category,
+                "prompt_lengths": prompt_lengths,
                 "batch_size": batch_size,
                 "max_tokens": max_tokens,
                 "warmup": warmup,
                 "runs": runs,
                 "seed": seed,
+                "ignore_eos": ignore_eos,
             },
             "summary": summary,
             "requests": result["metrics"]["requests"],
@@ -151,11 +187,9 @@ def run_case(
 
 
 def mark_correctness(experiments: list[dict[str, Any]]) -> None:
-    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for experiment in experiments:
-        workload = experiment["workload"]
-        key = (workload["prompt_length"], workload["batch_size"])
-        grouped.setdefault(key, []).append(experiment)
+        grouped.setdefault(experiment["workload"]["id"], []).append(experiment)
 
     for group in grouped.values():
         reference = next(
@@ -173,8 +207,10 @@ def mark_correctness(experiments: list[dict[str, Any]]) -> None:
                 if expected != actual
             ]
             mismatches.extend(
-                range(min(len(reference_outputs), len(experiment["outputs"])),
-                      max(len(reference_outputs), len(experiment["outputs"])))
+                range(
+                    min(len(reference_outputs), len(experiment["outputs"])),
+                    max(len(reference_outputs), len(experiment["outputs"])),
+                )
             )
             experiment["correctness"] = {
                 "reference_backend": "torch-eager",
@@ -186,15 +222,12 @@ def mark_correctness(experiments: list[dict[str, Any]]) -> None:
 def add_comparisons(
     experiments: list[dict[str, Any]], baseline_backend: str
 ) -> list[dict[str, Any]]:
-    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for experiment in experiments:
-        workload = experiment["workload"]
-        grouped.setdefault(
-            (workload["prompt_length"], workload["batch_size"]), []
-        ).append(experiment)
+        grouped.setdefault(experiment["workload"]["id"], []).append(experiment)
 
     comparisons = []
-    for (prompt_length, batch_size), group in grouped.items():
+    for workload_id, group in grouped.items():
         baseline = next(
             (item for item in group if item["backend"] == baseline_backend), None
         )
@@ -214,15 +247,16 @@ def add_comparisons(
                     metric["comparable"] = False
                     metric["improvement_pct"] = None
                     metric["speedup"] = None
-                comparison_status = "fallback/not_applicable"
+                comparison_status = "fallback_or_incorrect"
             else:
                 comparison_status = "comparable"
             comparisons.append(
                 {
+                    "workload_id": workload_id,
+                    "category": optimized["workload"]["category"],
                     "baseline_backend": baseline_backend,
                     "optimized_backend": optimized["backend"],
-                    "prompt_length": prompt_length,
-                    "batch_size": batch_size,
+                    "batch_size": optimized["workload"]["batch_size"],
                     "status": comparison_status,
                     "metrics": comparison,
                 }
@@ -240,28 +274,31 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         "## Request Metrics",
         "",
-        "| Backend | Prompt | Batch | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | Host decode p50 (ms) | CUDA decode p50 (ms) | Decode tok/s | Peak memory (GiB) | Status |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Workload | Backend | Prompt lengths | Batch | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | Host decode p50 (ms) | CUDA decode p50 (ms) | Decode tok/s | Peak memory (GiB) | Status |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for experiment in payload["experiments"]:
         summary = experiment["summary"]
+        workload = experiment["workload"]
         peak = summary.get("peak_memory_allocated_bytes")
         peak_gib = "n/a" if peak is None else f"{peak / 2**30:.2f}"
+
         def value(metric: str) -> str:
             item = summary.get(metric, {}).get("p50")
             return "n/a" if item is None else f"{item:.3f}"
+
+        lengths = workload.get("prompt_lengths") or ["natural"]
         lines.append(
-            f"| {experiment['backend']} | {experiment['workload']['prompt_length']} | "
-            f"{experiment['workload']['batch_size']} | {value('ttft_ms')} | "
-            f"{value('tpot_ms')} | {value('itl_ms')} | {value('e2e_ms')} | "
-            f"{value('decode_time_ms')} | {value('cuda_decode_time_ms')} | "
-            f"{summary.get('decode_tok_s', 0.0) or 0.0:.2f} | {peak_gib} | "
-            f"{','.join(experiment.get('backend_actual', [])) or 'unknown'} |"
+            f"| {workload['id']} | {experiment['backend']} | {','.join(map(str, lengths))} | "
+            f"{workload['batch_size']} | {value('ttft_ms')} | {value('tpot_ms')} | "
+            f"{value('itl_ms')} | {value('e2e_ms')} | {value('decode_time_ms')} | "
+            f"{value('cuda_decode_time_ms')} | {summary.get('decode_tok_s', 0.0) or 0.0:.2f} | "
+            f"{peak_gib} | {','.join(experiment.get('backend_actual', [])) or 'unknown'} |"
         )
     lines.extend(["", "## Baseline Comparisons", ""])
     for comparison in payload["comparisons"]:
         lines.append(
-            f"### prompt={comparison['prompt_length']}, batch={comparison['batch_size']} "
+            f"### {comparison['workload_id']} "
             f"({comparison['optimized_backend']} vs {comparison['baseline_backend']})"
         )
         lines.append(f"Status: **{comparison['status']}**")
@@ -290,12 +327,14 @@ def render_markdown(payload: dict[str, Any]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", help="Local Qwen3-0.6B model directory")
+    parser.add_argument("--workloads", default="benchmarks/workloads.json")
+    parser.add_argument("--suite", choices=("performance", "realistic", "all"), default="performance")
     parser.add_argument(
         "--backends",
         default="torch-eager,torch-cudagraph,megakernel",
         help="Comma-separated backend names",
     )
-    parser.add_argument("--prompt-lengths", type=parse_int_list, default=[32, 128, 512])
+    parser.add_argument("--prompt-lengths", type=parse_int_list)
     parser.add_argument("--batch-sizes", type=parse_int_list, default=[1, 8, 32])
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=2)
@@ -304,9 +343,11 @@ def main() -> None:
     parser.add_argument("--json", dest="json_path")
     parser.add_argument("--markdown", dest="markdown_path")
     parser.add_argument("--skip-batch", action="store_true")
+    parser.add_argument("--skip-mixed-batch", action="store_true")
     parser.add_argument("--baseline", default="torch-cudagraph")
     args = parser.parse_args()
 
+    workload_payload = load_workloads(args.workloads)
     backends = [item.strip() for item in args.backends.split(",") if item.strip()]
     invalid = set(backends) - set(BACKEND_CONFIGS)
     if invalid:
@@ -315,39 +356,91 @@ def main() -> None:
         parser.error("--baseline must be included in --backends")
 
     experiments = []
-    for prompt_length in args.prompt_lengths:
-        for backend in backends:
-            experiments.append(
-                run_case(
-                    args.model,
-                    backend,
-                    prompt_length,
-                    1,
-                    args.max_tokens,
-                    args.warmup,
-                    args.runs,
-                    args.seed,
-                )
-            )
-    if not args.skip_batch:
-        for batch_size in args.batch_sizes:
-            for backend in [item for item in backends if item != "megakernel"]:
+    performance_lengths = args.prompt_lengths or workload_payload["performance"]["prompt_lengths"]
+    if args.suite in ("performance", "all"):
+        for prompt_length in performance_lengths:
+            for backend in backends:
                 experiments.append(
                     run_case(
                         args.model,
                         backend,
-                        128,
-                        batch_size,
+                        f"perf_p{prompt_length}_b1",
+                        "controlled_performance",
+                        synthetic_factory([prompt_length], args.seed),
+                        [prompt_length],
+                        1,
                         args.max_tokens,
                         args.warmup,
                         args.runs,
                         args.seed,
+                        ignore_eos=True,
+                    )
+                )
+        if not args.skip_batch:
+            for batch_size in args.batch_sizes:
+                for backend in [item for item in backends if item != "megakernel"]:
+                    experiments.append(
+                        run_case(
+                            args.model,
+                            backend,
+                            f"perf_p128_b{batch_size}",
+                            "controlled_batch",
+                            synthetic_factory([128], args.seed),
+                            [128],
+                            batch_size,
+                            args.max_tokens,
+                            args.warmup,
+                            args.runs,
+                            args.seed,
+                            ignore_eos=True,
+                        )
+                    )
+        if not args.skip_mixed_batch:
+            for mix in workload_payload["performance"].get("batch_mixes", []):
+                mix_lengths = [int(length) for length in mix["prompt_lengths"]]
+                for backend in [item for item in backends if item != "megakernel"]:
+                    experiments.append(
+                        run_case(
+                            args.model,
+                            backend,
+                            mix["id"],
+                            mix["category"],
+                            synthetic_factory(mix_lengths, args.seed),
+                            mix_lengths,
+                            len(mix_lengths),
+                            args.max_tokens,
+                            args.warmup,
+                            args.runs,
+                            args.seed,
+                            ignore_eos=True,
+                        )
+                    )
+
+    if args.suite in ("realistic", "all"):
+        for item in workload_payload["correctness"]:
+            for backend in backends:
+                experiments.append(
+                    run_case(
+                        args.model,
+                        backend,
+                        item["id"],
+                        item["category"],
+                        realistic_factory(item["prompt"]),
+                        None,
+                        1,
+                        int(item["max_tokens"]),
+                        max(1, min(args.warmup, 2)),
+                        max(1, min(args.runs, 3)),
+                        args.seed,
+                        ignore_eos=False,
                     )
                 )
 
+    if not experiments:
+        parser.error("no workloads selected")
     mark_correctness(experiments)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "environment": environment_metadata(),
         "git": git_metadata(),
         "model": os.path.abspath(args.model),

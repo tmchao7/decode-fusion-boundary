@@ -44,7 +44,7 @@ CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
 python tools/correctness_smoke.py /path/to/Qwen3-0.6B \
-  --prompt-lengths 8,32,128 \
+  --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
   --max-tokens 8 \
   --require-megakernel \
   --json results/a100_correctness.json

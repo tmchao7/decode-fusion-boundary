@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from nanovllm import LLM, SamplingParams
+from tools.workloads import load_workloads, select_correctness_workloads
 
 BACKENDS = {
     "torch-eager": {"decode_backend": "torch", "enforce_eager": True},
@@ -39,8 +40,10 @@ def run_backend(model: str, name: str, prompts: list[list[int]], max_tokens: int
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
+    parser.add_argument("--workloads", default="benchmarks/workloads.json")
+    parser.add_argument("--workload-ids")
     parser.add_argument("--backends", default="torch-eager,torch-cudagraph,megakernel")
-    parser.add_argument("--prompt-lengths", default="8,32,128")
+    parser.add_argument("--prompt-lengths", help="Use synthetic prompts instead of realistic workloads")
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--require-megakernel", action="store_true")
@@ -53,8 +56,21 @@ def main() -> None:
         parser.error(f"unknown backend(s): {', '.join(sorted(unknown))}")
     if "torch-eager" not in backend_names:
         parser.error("--backends must include torch-eager as the correctness reference")
-    lengths = [int(value) for value in args.prompt_lengths.split(",") if value]
-    prompts = [prompt_ids(length, args.seed) for length in lengths]
+    workload_ids = (
+        [value.strip() for value in args.workload_ids.split(",") if value.strip()]
+        if args.workload_ids
+        else None
+    )
+    if args.prompt_lengths:
+        prompt_lengths = [int(value) for value in args.prompt_lengths.split(",") if value]
+        prompts = [prompt_ids(length, args.seed) for length in prompt_lengths]
+        workload_names = [f"synthetic_p{length}" for length in prompt_lengths]
+    else:
+        workload_payload = load_workloads(args.workloads)
+        selected = select_correctness_workloads(workload_payload, workload_ids)
+        prompts = [item["prompt"] for item in selected]
+        prompt_lengths = None
+        workload_names = [item["id"] for item in selected]
 
     results = {}
     for backend in backend_names:
@@ -89,7 +105,8 @@ def main() -> None:
 
     payload = {
         "model": os.path.abspath(args.model),
-        "prompt_lengths": lengths,
+        "workloads": workload_names,
+        "prompt_lengths": prompt_lengths,
         "max_tokens": args.max_tokens,
         "checks": checks,
     }
