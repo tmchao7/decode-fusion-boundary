@@ -10,9 +10,10 @@
 
 ## Build, Test, and Development Commands
 
-This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment.
+This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment. For the GPU server, prefer the checked-in `environment.server.yml`, `requirements.server.txt`, and `setup_server.sh` workflow.
 
 ```bash
+bash setup_server.sh            # create the Miniconda/CUDA server environment
 python -m pip install -e .       # install the package in editable mode
 python example.py                # run local generation; update the model path first
 python bench.py                  # benchmark throughput on the configured GPU

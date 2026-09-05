@@ -1,0 +1,10 @@
+name: nano-vllm-server
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - ninja
+  - cmake
+  - packaging

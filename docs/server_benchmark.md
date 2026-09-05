@@ -4,12 +4,28 @@ All CUDA commands in this document are intended for the GPU server, not a develo
 
 ## 1. Environment
 
+The recommended setup is Miniconda for Python isolation, the official CUDA PyTorch wheel for the runtime, and the server's NVIDIA driver/CUDA toolkit for `nvidia-smi` and `nvcc`. The PyTorch wheel does not replace the driver, and compiling the Megakernel extension still requires `nvcc`.
+
+From the repository root:
+
 ```bash
-cd /path/to/MegaKernel-vLLM
-python -m pip install -e .
-cd qwen_megakernel
-python -m pip install -r requirements.txt
-cd ..
+bash setup_server.sh
+conda activate nano-vllm-server
+```
+
+The script uses Python 3.11, PyTorch 2.8.0 with the CUDA 12.8 wheel, and the pinned project runtime requirements. Override the defaults when the server requires another supported wheel:
+
+```bash
+NANOVLLM_TORCH_VERSION=2.8.0 \
+NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
+bash setup_server.sh
+```
+
+Check a specific local model too:
+
+```bash
+NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
+python tools/verify_server_env.py
 ```
 
 Use a local Qwen3-0.6B model directory. Do not commit model weights, Hugging Face tokens, profiler reports, or generated result files.

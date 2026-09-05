@@ -1,0 +1,15 @@
+# PyTorch is installed separately by setup_server.sh from the selected CUDA wheel index.
+# Keep this file focused on the Python/runtime dependencies used by nano-vLLM.
+transformers>=4.51,<5
+triton>=3.0,<4
+flash-attn>=2.7,<3
+xxhash>=3.5
+numpy>=1.26,<3
+tqdm>=4.66
+safetensors>=0.5
+huggingface-hub>=0.30
+accelerate>=1.0
+einops>=0.8
+psutil>=6.0
+pynvml>=12.535
+matplotlib>=3.8

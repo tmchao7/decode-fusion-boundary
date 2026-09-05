@@ -18,9 +18,24 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+For a normal Python installation:
+
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
+
+For the A100/V100 server workflow, use the repository setup script instead:
+
+```bash
+bash setup_server.sh
+conda activate nano-vllm-server
+python tools/verify_server_env.py
+```
+
+The script creates a Python 3.11 Miniconda environment, installs the CUDA
+PyTorch wheel, installs `requirements.server.txt`, and installs this repository
+in editable mode. It requires `nvidia-smi` and `nvcc` to already be available
+from the server driver/toolkit or module system.
 
 ## Model Download
 
@@ -68,6 +83,15 @@ cd qwen_megakernel && NANOVLLM_CUDA_ARCH=sm_80 python -m qwen_megakernel.bench
 The first integration milestone uses a private contiguous KV cache and
 supports one sequence at a time. Batch/paged-KV support remains a follow-up
 optimization; use the default backend for sampling or multi-sequence runs.
+
+Currently runnable paths:
+
+- `torch-eager`: standard nano-vLLM PyTorch execution;
+- `torch-cudagraph`: standard nano-vLLM CUDA Graph execution when
+  `enforce_eager=False`;
+- `megakernel`: Qwen3-0.6B BF16, A100-class GPU, greedy, single-sequence
+  decode. On V100 or an unsupported request it records fallback and uses the
+  standard backend instead of claiming Megakernel performance.
 
 For an end-to-end A/B comparison of eager PyTorch, CUDA Graph, and Megakernel:
 
