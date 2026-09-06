@@ -1,6 +1,7 @@
 # Megakernel-vLLM server commands
 # Run on the A100/V100 server. Replace only REPO and MODEL below.
 # This workflow uses uv; do not run the old Conda workflow.
+# uv will use an existing server Python and will not download CPython.
 
 export REPO=/PATH/TO/MegaKernel-vLLM
 export MODEL=/PATH/TO/Qwen3-0.6B
@@ -27,10 +28,20 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 uv --version
+
+# If the server uses an enterprise proxy, prefer its native CA store.
+# If the CA is not installed system-wide, uncomment and set this path:
+# export SSL_CERT_FILE=/PATH/TO/company-ca-bundle.pem
+export UV_SYSTEM_CERTS=true
+
 bash setup_server.sh
 source .venv/bin/activate
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
+export UV_PYTHON_DOWNLOADS=0
+export UV_SYSTEM_CERTS=true
+# If the proxy CA is not installed system-wide, set this before setup_server.sh:
+# export SSL_CERT_FILE=/PATH/TO/company-ca-bundle.pem
 
 # Verify the GPU, BF16, required packages, nano-vLLM import, and model config.
 NANOVLLM_MODEL_PATH="$MODEL" \

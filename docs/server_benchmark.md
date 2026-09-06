@@ -4,7 +4,7 @@ All CUDA commands in this document are intended for the GPU server, not a develo
 
 ## 1. Environment
 
-The recommended server setup uses `uv` for Python isolation and fast dependency installation. The NVIDIA driver, `nvidia-smi`, CUDA toolkit, and `nvcc` remain system/module dependencies. PyTorch's wheel supplies the CUDA runtime used by Python; it does not replace the driver or the compiler required by the Megakernel.
+The recommended server setup uses `uv` for Python isolation and fast dependency installation. The script reuses an existing server Python 3.10–3.12 and disables uv-managed CPython downloads. The NVIDIA driver, `nvidia-smi`, CUDA toolkit, and `nvcc` remain system/module dependencies. PyTorch's wheel supplies the CUDA runtime used by Python; it does not replace the driver or the compiler required by the Megakernel.
 
 From the repository root:
 
@@ -13,7 +13,7 @@ bash setup_server.sh
 source .venv/bin/activate
 ```
 
-The script creates `.venv` with Python 3.11, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. To use another PyTorch CUDA wheel index:
+The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. To use another PyTorch CUDA wheel index:
 
 ```bash
 NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
@@ -27,7 +27,7 @@ NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
 python -m tools.verify_server_env --require-megakernel
 ```
 
-If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
+If uv reports `invalid peer certificate: UnknownIssuer`, do not disable TLS verification. Set `UV_SYSTEM_CERTS=true` when the enterprise CA is installed in the system trust store, or set `SSL_CERT_FILE=/path/to/company-ca-bundle.pem` to the PEM bundle supplied by the server administrator. If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
 
 ```bash
 module avail cuda

@@ -31,10 +31,11 @@ examples/                 Minimal inference examples
 
 ## Server Environment
 
-Use `uv` for fast Python environment setup. The setup script creates a
-Python 3.11 `.venv`, installs a CUDA-enabled PyTorch wheel and project
-dependencies, and installs the repository in editable mode. The server must
-provide `nvidia-smi` and `nvcc`.
+Use `uv` for fast Python environment setup. The setup script reuses an
+existing server Python 3.10–3.12, explicitly avoids downloading a managed
+CPython, installs a CUDA-enabled PyTorch wheel and project dependencies, and
+installs the repository in editable mode. The server must provide `nvidia-smi`
+and `nvcc`.
 
 ```bash
 bash setup_server.sh

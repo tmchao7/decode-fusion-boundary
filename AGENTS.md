@@ -10,7 +10,7 @@
 
 ## Build, Test, and Development Commands
 
-This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment. For the GPU server, use the checked-in `requirements.server.txt`, `setup_server.sh`, and `SERVER_COMMANDS.txt` workflow; `uv` manages the Python environment while the system provides the NVIDIA driver and `nvcc`.
+This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment. For the GPU server, use the checked-in `requirements.server.txt`, `setup_server.sh`, and `SERVER_COMMANDS.txt` workflow; `uv` creates the environment from an existing system Python while the system provides the NVIDIA driver and `nvcc`.
 
 ```bash
 bash setup_server.sh            # create the uv/CUDA server environment
