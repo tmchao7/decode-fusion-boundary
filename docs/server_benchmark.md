@@ -4,31 +4,37 @@ All CUDA commands in this document are intended for the GPU server, not a develo
 
 ## 1. Environment
 
-The recommended setup is Miniconda for Python isolation, the official CUDA PyTorch wheel for the runtime, and the server's NVIDIA driver/CUDA toolkit for `nvidia-smi` and `nvcc`. The PyTorch wheel does not replace the driver, and compiling the Megakernel extension still requires `nvcc`.
+The recommended server setup uses `uv` for Python isolation and fast dependency installation. The NVIDIA driver, `nvidia-smi`, CUDA toolkit, and `nvcc` remain system/module dependencies. PyTorch's wheel supplies the CUDA runtime used by Python; it does not replace the driver or the compiler required by the Megakernel.
 
 From the repository root:
 
 ```bash
 bash setup_server.sh
-conda activate nano-vllm-server
+source .venv/bin/activate
 ```
 
-The script uses Python 3.11, PyTorch 2.8.0 with the CUDA 12.8 wheel, and the pinned project runtime requirements. Override the defaults when the server requires another supported wheel:
+The script creates `.venv` with Python 3.11, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. To use another PyTorch CUDA wheel index:
 
 ```bash
-NANOVLLM_TORCH_VERSION=2.8.0 \
 NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
 bash setup_server.sh
 ```
 
-Check a specific local model too:
+Validate a local Qwen3-0.6B model:
 
 ```bash
 NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
 python -m tools.verify_server_env --require-megakernel
 ```
 
-Use a local Qwen3-0.6B model directory. Do not commit model weights, Hugging Face tokens, profiler reports, or generated result files.
+If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
+
+```bash
+module avail cuda
+module load cuda/<server-version>
+```
+
+Do not commit model weights, credentials, benchmark results, or profiler reports.
 
 ## 2. Static, build, and smoke checks
 

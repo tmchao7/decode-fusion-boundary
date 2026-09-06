@@ -1,0 +1,118 @@
+# Megakernel-vLLM server commands
+# Run on the A100/V100 server. Replace only REPO and MODEL below.
+# This workflow uses uv; do not run the old Conda workflow.
+
+export REPO=/PATH/TO/MegaKernel-vLLM
+export MODEL=/PATH/TO/Qwen3-0.6B
+cd "$REPO"
+
+# Get the latest integration branch.
+git fetch origin
+git switch codex/paged-kv-megakernel-integration 2>/dev/null || \
+  git switch --track origin/codex/paged-kv-megakernel-integration
+git pull --ff-only
+git log -1 --oneline
+
+# Check the system NVIDIA driver and CUDA toolkit.
+nvidia-smi
+nvcc --version
+
+# If nvcc is unavailable, stop and load the server CUDA module first:
+# module avail cuda
+# module load cuda/<server-version>
+
+# Install uv if needed, then create the Python 3.11 environment.
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+uv --version
+bash setup_server.sh
+source .venv/bin/activate
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
+
+# Verify the GPU, BF16, required packages, nano-vLLM import, and model config.
+NANOVLLM_MODEL_PATH="$MODEL" \
+python -m tools.verify_server_env --require-megakernel
+
+# Build the packaged CUDA extension for A100.
+export NANOVLLM_CUDA_ARCH=sm_80
+python -m nanovllm.backends.megakernel.build 2>&1 | tee results/a100_build.log
+
+# Run the local Python tests before GPU execution.
+PYTHONPATH=src python -m unittest discover -s tests -v
+
+# Single-sequence correctness smoke test.
+CUDA_LAUNCH_BLOCKING=1 \
+TORCH_SHOW_CPP_STACKTRACES=1 \
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m tools.correctness_smoke "$MODEL" \
+  --prompt-lengths 8,32 \
+  --batch-sizes 1 \
+  --max-tokens 8 \
+  --require-megakernel \
+  --json results/a100_smoke_single.json \
+  2>&1 | tee results/a100_smoke_single.log
+
+# Paged-KV block-boundary correctness test (default block size is 256).
+CUDA_LAUNCH_BLOCKING=1 \
+TORCH_SHOW_CPP_STACKTRACES=1 \
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m tools.correctness_smoke "$MODEL" \
+  --prompt-lengths 255,256,257,512 \
+  --batch-sizes 1 \
+  --max-tokens 8 \
+  --require-megakernel \
+  --json results/a100_smoke_boundary.json \
+  2>&1 | tee results/a100_smoke_boundary.log
+
+# Batch correctness test.
+CUDA_LAUNCH_BLOCKING=1 \
+TORCH_SHOW_CPP_STACKTRACES=1 \
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m tools.correctness_smoke "$MODEL" \
+  --prompt-lengths 32,128,255,256,257,512 \
+  --batch-sizes 1,2 \
+  --max-tokens 8 \
+  --require-megakernel \
+  --json results/a100_smoke_batch.json \
+  2>&1 | tee results/a100_smoke_batch.log
+
+# Full A/B benchmark only after all correctness tests pass.
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m benchmarks.compare "$MODEL" \
+  --suite performance \
+  --workloads benchmarks/workloads.json \
+  --backends torch-eager,torch-cudagraph,megakernel \
+  --prompt-lengths 32,128,512,1024 \
+  --batch-sizes 1,8,32 \
+  --max-tokens 128 \
+  --warmup 2 \
+  --runs 10 \
+  --json results/a100_performance.json \
+  --markdown results/a100_performance.md \
+  2>&1 | tee results/a100_performance.log
+
+# Generate plots.
+python -m tools.plot_metrics \
+  results/a100_performance.json \
+  --output-dir results/a100_plots
+
+# Optional short Nsight Systems profile.
+NANOVLLM_CUDA_ARCH=sm_80 \
+nsys profile --trace=cuda,nvtx --sample=none \
+  --output=results/a100_megakernel_nsys \
+  python -m benchmarks.compare "$MODEL" \
+    --suite performance --backends megakernel \
+    --prompt-lengths 32 --batch-sizes 1 \
+    --max-tokens 32 --warmup 1 --runs 1
+
+# Optional short Nsight Compute profile.
+NANOVLLM_CUDA_ARCH=sm_80 \
+ncu --set full --target-processes all \
+  --export results/a100_megakernel_ncu \
+  python -m benchmarks.compare "$MODEL" \
+    --suite performance --backends megakernel \
+    --prompt-lengths 32 --batch-sizes 1 \
+    --max-tokens 32 --warmup 1 --runs 1

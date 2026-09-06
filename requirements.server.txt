@@ -1,4 +1,6 @@
 # PyTorch is installed separately by setup_server.sh from the selected CUDA wheel index.
+# FlashAttention is also installed separately with --no-build-isolation because
+# it may need the server CUDA toolkit and nvcc.
 # Keep this file focused on the Python/runtime dependencies used by nano-vLLM.
 transformers>=4.51,<5
 triton>=3.0,<4

@@ -8,7 +8,7 @@
 
 ```bash
 bash setup_server.sh
-conda activate nano-vllm-server
+source .venv/bin/activate
 python -m tools.verify_server_env
 ```
 

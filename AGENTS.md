@@ -10,17 +10,17 @@
 
 ## Build, Test, and Development Commands
 
-This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment. For the GPU server, prefer the checked-in `environment.server.yml`, `requirements.server.txt`, and `setup_server.sh` workflow.
+This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/Triton environment. For the GPU server, use the checked-in `requirements.server.txt`, `setup_server.sh`, and `SERVER_COMMANDS.txt` workflow; `uv` manages the Python environment while the system provides the NVIDIA driver and `nvcc`.
 
 ```bash
-bash setup_server.sh            # create the Miniconda/CUDA server environment
+bash setup_server.sh            # create the uv/CUDA server environment
 python -m pip install -e .      # install the package in editable mode
 python examples/basic_generation.py       # run local generation; update the model path first
 python -m benchmarks.baseline        # benchmark standard nano-vLLM throughput
 python -m benchmarks.compare MODEL       # compare backends and write metrics
 python -m tools.correctness_smoke MODEL # short greedy correctness gate on GPU
 python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
-python -m compileall src/nanovllm tools   # fast syntax/import compilation smoke check
+python -m compileall src/nanovllm benchmarks tools # fast syntax/import compilation smoke check
 ```
 
 Use a local Hugging Face model directory (for example, `~/huggingface/Qwen3-0.6B/`); do not add model weights or credentials to Git.
