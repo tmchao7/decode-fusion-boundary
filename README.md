@@ -115,4 +115,10 @@ python -m unittest discover -s tests -v
 python -m compileall src/nanovllm tools
 ```
 
-See `docs/megakernel_design.md` for the planned direct paged-KV integration.
+## 中文项目说明
+
+- [指标说明](docs/01_指标说明.md)：TTFT、TPOT、ITL、E2E、吞吐、显存和正确性口径；
+- [Benchmark 方法](docs/02_Benchmark方法.md)：服务器实验矩阵、运行步骤、结果保存和 Nsight 使用方式；
+- [基线与创新](docs/03_基线与创新.md)：baseline、Megakernel 模块、当前已实现能力和后续边界；
+- [Megakernel 设计笔记](docs/megakernel_design.md)：paged-KV 直连目标和 kernel 演进路径；
+- [服务器运行手册](docs/server_benchmark.md)：A100/V100 环境配置与完整命令。

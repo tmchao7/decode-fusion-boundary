@@ -6,7 +6,7 @@
 - `src/nanovllm/config.py`, `llm.py`, and `sampling_params.py` define the public configuration and inference API.
 - `examples/basic_generation.py` is the smallest end-to-end inference example; `benchmarks/` contains batch and Megakernel benchmarks.
 - `src/nanovllm/backends/megakernel/` contains the Qwen CUDA kernel, C++ bindings, build helper, and backend adapter; changes there require server-side CUDA tooling.
-- `docs/` contains the paged-KV design and the A100/V100 server runbook; `tools/` contains correctness and visualization utilities.
+- `docs/` contains the paged-KV design, A100/V100 server runbook, and Chinese metric/baseline/benchmark notes; `tools/` contains correctness and visualization utilities.
 
 ## Build, Test, and Development Commands
 
@@ -16,7 +16,7 @@ This project targets Python 3.10–3.12 and requires a compatible CUDA/PyTorch/T
 bash setup_server.sh            # create the Miniconda/CUDA server environment
 python -m pip install -e .      # install the package in editable mode
 python examples/basic_generation.py       # run local generation; update the model path first
-python -m benchmarks.baseline MODEL # benchmark standard nano-vLLM throughput
+python -m benchmarks.baseline        # benchmark standard nano-vLLM throughput
 python -m benchmarks.compare MODEL       # compare backends and write metrics
 python -m tools.correctness_smoke MODEL # short greedy correctness gate on GPU
 python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
