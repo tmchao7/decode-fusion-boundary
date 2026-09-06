@@ -47,7 +47,7 @@ class MegakernelBackend:
         self.config = config
         self.model = model
         self.decoder = None
-        self.sequence_id = None
+        self.kv_cache = None
         self.disabled_reason = None
 
     @staticmethod
@@ -89,6 +89,13 @@ class MegakernelBackend:
             return Compatibility(False, "Megakernel v1 supports max_model_len <= 2048")
         return Compatibility(True)
 
+    def set_kv_cache(self, kv_cache) -> None:
+        """Attach the nano-vLLM-owned ``[K/V, layer, block, token, head, dim]`` cache."""
+
+        if kv_cache is None or kv_cache.dim() != 6 or kv_cache.shape[0] != 2:
+            raise ValueError("kv_cache must have shape [2, layers, blocks, tokens, heads, dim]")
+        self.kv_cache = kv_cache
+
     def disable(self, reason: str) -> None:
         self.disabled_reason = reason
 
@@ -97,6 +104,8 @@ class MegakernelBackend:
             raise RuntimeError(self.disabled_reason)
         if self.decoder is not None:
             return
+        if self.kv_cache is None:
+            raise RuntimeError("nano-vLLM KV cache has not been attached")
 
         # Keep the extension optional and isolated from the normal import path.
         import torch
@@ -111,26 +120,33 @@ class MegakernelBackend:
             )
 
         from .build import get_extension
-        from .model import Decoder, weights_from_nano_model
 
         get_extension()
+        from .model import Decoder, weights_from_nano_model
         weights = weights_from_nano_model(self.model, self.config.hf_config)
-        self.decoder = Decoder(weights=weights, tokenizer=None, verbose=False)
+        self.decoder = Decoder(
+            weights=weights,
+            tokenizer=None,
+            verbose=False,
+            k_cache=self.kv_cache[0],
+            v_cache=self.kv_cache[1],
+            block_size=self.config.kvcache_block_size,
+            num_cache_blocks=self.kv_cache.shape[2],
+        )
 
-    def decode(self, seq) -> list[int]:
+    def decode(self, seq, block_table) -> list[int]:
         """Decode one token and return a one-element Python token-id list.
 
-        The first call reconstructs the Megakernel's contiguous KV state from
-        the full prompt by replaying prompt tokens. Subsequent calls only run
-        the current last token. This establishes an integration baseline while
-        the paged-KV direct path is developed separately.
+        The caller supplies the current nano-vLLM block table. The decoder
+        writes the new K/V values into the scheduler-owned paged cache and
+        reads prior positions through that same cache; no prompt replay or
+        private contiguous cache is used.
         """
 
         self._ensure_decoder()
-        if self.sequence_id != seq.seq_id:
-            self.decoder.reset()
-            for token_id in seq.prompt_token_ids:
-                self.decoder.step(token_id)
-            self.sequence_id = seq.seq_id
-        token_id = self.decoder.step(seq.last_token)
+        token_id = self.decoder.step(
+            seq.last_token,
+            position=len(seq) - 1,
+            block_table=block_table,
+        )
         return [int(token_id)]

@@ -2,7 +2,7 @@
 
 本文档记录当前 Megakernel 直接接入 nano-vLLM 后，与原有 runtime、KV cache 和 scheduler 不顺承的地方。当前版本优先用于建立单序列 correctness 和 kernel 性能基线；以下问题需要后续逐项处理，完成前不能把项目描述为“完整复用 nano-vLLM paged KV cache 的 Megakernel”。
 
-## 当前数据流
+## 当前数据流（开发分支目标路径）
 
 ```text
 nano-vLLM prefill
@@ -11,12 +11,11 @@ nano-vLLM prefill
     ↓
 Megakernel decode adapter
     ↓
-重新 replay prompt
-    ↓
-写入 Megakernel private contiguous KV cache
-    ↓
-Megakernel 后续 decode
+decode_paged 直接读取/写回同一份 cache
 ```
+
+旧的 private contiguous cache 和 prompt replay 只保留在 reference 代码中，
+不应再被 nano-vLLM 集成路径使用。A100 上的 CUDA correctness 仍需服务器验证。
 
 理想数据流应为：
 
@@ -28,9 +27,9 @@ nano-vLLM scheduler
 Megakernel 直接读取和写入
 ```
 
-## P0：统一 cache contract（已建立测试基线）
+## P0：统一 cache contract（已建立测试基线，CUDA 待验证）
 
-`src/nanovllm/backends/megakernel/cache.py` 现在定义了 nano-vLLM KV cache 的 shape、element stride、物理 block 映射和 flat element offset 规则。它只定义契约，不代表 CUDA kernel 已经完成 paged KV 直连；后续 kernel 必须遵守该契约。
+`src/nanovllm/backends/megakernel/cache.py` 定义了 nano-vLLM KV cache 的 shape、element stride、物理 block 映射和 flat element offset 规则。当前开发分支已经增加 `decode_paged` operator 和 kernel paged 地址计算；是否在 A100 上正确执行仍需服务器验证。
 
 ## P0：重复 KV cache 与重复计算
 
@@ -52,7 +51,7 @@ V cache: [28, 8, 2048, 128], BF16
 - 无法复用 nano-vLLM 的 KV cache pool；
 - 不适合多请求和高并发场景。
 
-**后续处理：**让 Megakernel 接收 nano-vLLM 已经分配的 `kv_cache`，删除 Decoder 内部独立创建的 K/V cache。
+**当前进展：**backend 已接收并绑定 nano-vLLM 的 `kv_cache`，paged decoder 不再创建独立 K/V cache；需要通过服务器 correctness 后才能关闭此问题。
 
 ### 问题 2：prompt 被重复计算
 
@@ -65,7 +64,7 @@ nano-vLLM 已经执行了 prefill，但 Megakernel 首次 decode 时会重新遍
 - 端到端 benchmark 不再反映纯 decode 优化；
 - 可能掩盖 kernel 本身的收益。
 
-**后续处理：**先让 Megakernel 支持“接管 prefill 产出的 KV cache”，然后再评估是否需要 fused prefill；在此之前，报告中必须单独区分 kernel decode latency 和端到端 TTFT。
+**当前进展：**decode 路径已改为接管 prefill 产出的 paged KV cache，并移除 adapter 内的 prompt replay；需要 A100 token-level correctness 和 TTFT 对比来关闭此问题。
 
 ## P1：无法顺承原有 scheduler
 
@@ -106,7 +105,7 @@ nano-vLLM 的 prefix cache 通过 block hash 和 block table 管理。当前 Meg
 
 ### 问题 5：连续布局与 paged 布局不一致
 
-当前 Megakernel 按如下方式访问 cache：
+当前开发分支的 Megakernel paged path 按如下方式访问 cache：
 
 ```text
 kv_head × max_seq_len × head_dim + position × head_dim

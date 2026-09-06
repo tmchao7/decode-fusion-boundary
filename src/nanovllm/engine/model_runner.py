@@ -34,16 +34,15 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
-        self.megakernel = (
-            MegakernelBackend(config, self.model)
-            if config.decode_backend == "megakernel"
-            else None
-        )
+        self.megakernel = None
         self.last_backend_used = "torch"
         self.last_fallback_reason = None
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        if config.decode_backend == "megakernel":
+            self.megakernel = MegakernelBackend(config, self.model)
+            self.megakernel.set_kv_cache(self.kv_cache)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -240,16 +239,17 @@ class ModelRunner:
             if not decision.supported and not is_prefill:
                 self.last_fallback_reason = decision.reason
             if decision.supported:
+                self.prepare_decode(seqs)
+                context = get_context()
                 try:
                     with nvtx_range("megakernel_decode"):
-                        token_ids = self.megakernel.decode(seqs[0])
-                    self.last_backend_used = "megakernel"
-                    return token_ids
+                        token_ids = self.megakernel.decode(
+                            seqs[0], context.block_tables[0]
+                        )
                 except Exception as exc:
-                    # Once a kernel step has started, its private contiguous KV
-                    # cache may have advanced while nano-vLLM's paged cache has
-                    # not. Do not silently produce incorrect tokens by falling
-                    # back after that point.
+                    # Once a kernel step has started, nano-vLLM's shared paged
+                    # cache may have been updated. Do not silently produce
+                    # incorrect tokens by falling back after that point.
                     if self.megakernel.decoder is not None:
                         raise RuntimeError(
                             "Megakernel decode failed after initialization; "
@@ -263,6 +263,11 @@ class ModelRunner:
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                else:
+                    self.last_backend_used = "megakernel"
+                    return token_ids
+                finally:
+                    reset_context()
 
         # 对输入seqs进行 p or d的处理 ,这里返回对seqs中的seq的id和位置
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)

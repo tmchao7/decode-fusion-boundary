@@ -58,6 +58,18 @@ class PagedKVCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "physical block"):
             self.spec.physical_slot([-1], 0)
 
+    def test_supports_cache_capacity_beyond_a_single_prompt(self):
+        spec = PagedKVCacheSpec(
+            num_layers=28,
+            num_blocks=32,
+            block_size=256,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype_itemsize=2,
+        )
+        self.assertEqual(spec.shape, (2, 28, 32, 256, 8, 128))
+        self.assertEqual(spec.physical_slot([11, 4], 257), (4, 1))
+
     def test_rejects_invalid_dimensions(self):
         with self.assertRaisesRegex(ValueError, "positive"):
             PagedKVCacheSpec(0, 1, 4, 1, 8, 2)

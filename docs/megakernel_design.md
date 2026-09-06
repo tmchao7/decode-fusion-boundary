@@ -13,7 +13,9 @@ This is a correctness and launch-overhead baseline, not yet the final paged-KV i
 
 ## Target decode interface
 
-The next kernel interface should receive the scheduler's existing metadata directly:
+The current development path receives the scheduler's existing metadata
+through the single-sequence `decode_paged` operator; the eventual batch API
+will use the same contract directly:
 
 ```text
 decode_batch(
@@ -53,8 +55,8 @@ The first correctness version may keep the LM head as a second kernel. Any kerne
 
 ## Validation milestones
 
-1. Single sequence, contiguous KV cache, exact greedy token match.
-2. Single sequence, direct paged KV read/write, exact token match.
+1. Single sequence, contiguous reference KV cache, exact greedy token match.
+2. Single sequence, direct paged KV read/write, exact token match on the server.
 3. Batch decode with block tables and per-sequence context lengths.
 4. Sampling/logits support only after greedy correctness and profiling are stable.
 

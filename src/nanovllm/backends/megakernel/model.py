@@ -16,6 +16,7 @@ MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
 _decode = torch.ops.nanovllm_megakernel_C.decode
+_decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
 
 
 def _rope_tables(rope_theta: float = 10000.0):
@@ -177,6 +178,10 @@ class Decoder:
         tokenizer=None,
         model_name="Qwen/Qwen3-0.6B",
         verbose: bool = True,
+        k_cache=None,
+        v_cache=None,
+        block_size: int | None = None,
+        num_cache_blocks: int | None = None,
     ):
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
@@ -196,16 +201,39 @@ class Decoder:
 
         self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-        # KV cache
-        self._k_cache = torch.zeros(
-            NUM_LAYERS,
-            NUM_KV_HEADS,
-            MAX_SEQ_LEN,
-            HEAD_DIM,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        self._v_cache = torch.zeros_like(self._k_cache)
+        # KV cache. When views are provided, they must be nano-vLLM's
+        # [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        # tensors; the Megakernel then uses the scheduler's block table.
+        if (k_cache is None) != (v_cache is None):
+            raise ValueError("k_cache and v_cache must be provided together")
+        self._paged = k_cache is not None
+        if self._paged:
+            if k_cache.dim() != 5 or v_cache.shape != k_cache.shape:
+                raise ValueError("paged KV cache views must have matching 5D shapes")
+            if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+                raise ValueError("paged KV cache views must use BF16")
+            self._k_cache = k_cache
+            self._v_cache = v_cache
+            self._block_size = int(block_size or k_cache.shape[2])
+            self._num_cache_blocks = int(num_cache_blocks or k_cache.shape[1])
+            if k_cache.shape[0] != NUM_LAYERS:
+                raise ValueError("paged KV cache layer count does not match Qwen3-0.6B")
+            if k_cache.shape[1] != self._num_cache_blocks:
+                raise ValueError("num_cache_blocks does not match k_cache")
+            if k_cache.shape[2] != self._block_size:
+                raise ValueError("block_size does not match k_cache")
+            if k_cache.shape[3:] != (NUM_KV_HEADS, HEAD_DIM):
+                raise ValueError("paged KV cache head shape does not match Qwen3-0.6B")
+        else:
+            self._k_cache = torch.zeros(
+                NUM_LAYERS,
+                NUM_KV_HEADS,
+                MAX_SEQ_LEN,
+                HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._v_cache = torch.zeros_like(self._k_cache)
 
         # Scratch buffers (single-token decode)
         f32 = dict(dtype=torch.float32, device="cuda")
@@ -223,8 +251,46 @@ class Decoder:
         self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
         self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
 
-    def step(self, token_id: int) -> int:
-        """Decode one token. Returns the next token id."""
+    def step(self, token_id: int, position: int | None = None, block_table=None) -> int:
+        """Decode one token and return the next token id.
+
+        Paged mode requires the caller to provide the logical position and the
+        device block table for the current sequence. Legacy mode keeps the
+        original contiguous-cache operator for the standalone reference tool.
+        """
+        if self._paged:
+            if position is None or block_table is None:
+                raise ValueError("paged decode requires position and block_table")
+            _decode_paged(
+                self._out_token,
+                token_id,
+                self._embed_weight,
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight,
+                self._cos_table,
+                self._sin_table,
+                self._k_cache,
+                self._v_cache,
+                self._hidden,
+                self._act,
+                self._res,
+                self._q,
+                self._k,
+                self._v,
+                self._attn_out,
+                self._mlp_inter,
+                self._norm_out,
+                self._bmax_vals,
+                self._bmax_idxs,
+                block_table,
+                NUM_LAYERS,
+                position,
+                self._block_size,
+                self._num_cache_blocks,
+                self._attn_scale,
+            )
+            return self._out_token.item()
         _decode(
             self._out_token,
             token_id,
@@ -257,14 +323,17 @@ class Decoder:
 
     def reset(self):
         self._position = 0
-        self._k_cache.zero_()
-        self._v_cache.zero_()
+        if not self._paged:
+            self._k_cache.zero_()
+            self._v_cache.zero_()
 
     @property
     def position(self) -> int:
         return self._position
 
     def generate(self, prompt: str, max_tokens: int = 100) -> str:
+        if self._paged:
+            raise RuntimeError("generate() is only available for contiguous reference mode")
         self.reset()
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         for tid in ids[:-1]:

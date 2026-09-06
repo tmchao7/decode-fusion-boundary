@@ -313,6 +313,19 @@ ldg_prefetch_weights_l2(const __nv_bfloat16 *__restrict__ weights,
     s_dummy = dummy;
 }
 
+__device__ inline __nv_bfloat16 *ldg_kv_ptr(
+    __nv_bfloat16 *__restrict__ cache, int kv_head, int position,
+    int max_seq_len, const int *__restrict__ block_table, int block_size) {
+  if (block_table == nullptr) {
+    return cache + kv_head * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+  }
+  int logical_block = position / block_size;
+  int block_offset = position % block_size;
+  int physical_block = block_table[logical_block];
+  return cache + physical_block * block_size * KV_SIZE
+      + block_offset * KV_SIZE + kv_head * HEAD_DIM;
+}
+
 __device__ void ldg_attention(
     auto &grid, float *__restrict__ q, float *__restrict__ k,
     const float *__restrict__ v, __nv_bfloat16 *__restrict__ k_cache,
@@ -323,6 +336,7 @@ __device__ void ldg_attention(
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const __nv_bfloat16 *__restrict__ cos_table,
     const __nv_bfloat16 *__restrict__ sin_table, int position,
+    const int *__restrict__ block_table, int block_size,
     // Weights to prefetch during attention (for blocks not doing attention)
     const __nv_bfloat16 *__restrict__ o_weight,
     const __nv_bfloat16 *__restrict__ gate_weight,
@@ -350,10 +364,10 @@ __device__ void ldg_attention(
     for (int h = warp_id; h < NUM_KV_HEADS; h += LDG_NUM_WARPS) {
       float *k_head = k + h * HEAD_DIM;
       const float *v_head = v + h * HEAD_DIM;
-      __nv_bfloat16 *kc =
-          k_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
-      __nv_bfloat16 *vc =
-          v_cache + h * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+      __nv_bfloat16 *kc = ldg_kv_ptr(
+          k_cache, h, position, max_seq_len, block_table, block_size);
+      __nv_bfloat16 *vc = ldg_kv_ptr(
+          v_cache, h, position, max_seq_len, block_table, block_size);
 
       float ss = 0.0f;
       for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE)
@@ -508,10 +522,10 @@ __device__ void ldg_attention(
 
     // Each warp processes a subset of cache positions
     for (int pos = warp_id; pos < cache_len; pos += LDG_NUM_WARPS) {
-      const __nv_bfloat16 *k_pos =
-          k_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
-      const __nv_bfloat16 *v_pos =
-          v_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
+      const __nv_bfloat16 *k_pos = ldg_kv_ptr(
+          k_cache, kv_head, pos, max_seq_len, block_table, block_size);
+      const __nv_bfloat16 *v_pos = ldg_kv_ptr(
+          v_cache, kv_head, pos, max_seq_len, block_table, block_size);
 
       // Q @ K with __ldg
       float score = 0.0f;
@@ -1258,8 +1272,8 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
     ldg_attention(grid, g_q, g_k, g_v, layer_k_cache, layer_v_cache, g_attn_out,
                   cache_len, max_seq_len, attn_scale, w.q_norm_weight,
-                  w.k_norm_weight, cos_table, sin_table, position,
-                  w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
+                  w.k_norm_weight, cos_table, sin_table, position, nullptr,
+                  max_seq_len, w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
                   w.down_proj_weight, kv_flag, attn_flag, layer);
 
     ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
@@ -1325,6 +1339,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     unsigned int *__restrict__ barrier_sense,
     unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
     int num_layers, int position, int input_token_id, int max_seq_len,
+    const int *__restrict__ block_table, int block_size, int num_cache_blocks,
     float attn_scale) {
   int cache_len = position + 1;
   int block_id = blockIdx.x;
@@ -1358,7 +1373,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
 
   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
 
-  int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+  int kv_cache_layer_stride =
+      block_table ? num_cache_blocks * block_size * KV_SIZE
+                  : NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
   for (int layer = 0; layer < num_layers; layer++) {
     const LDGLayerWeights &w = layer_weights[layer];
@@ -1373,8 +1390,8 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
 
     ldg_attention(grid, g_q, g_k, g_v, layer_k_cache, layer_v_cache, g_attn_out,
                   cache_len, max_seq_len, attn_scale, w.q_norm_weight,
-                  w.k_norm_weight, cos_table, sin_table, position,
-                  w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
+                  w.k_norm_weight, cos_table, sin_table, position, block_table,
+                  block_size, w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
                   w.down_proj_weight, kv_flag, attn_flag, layer);
 
     ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
@@ -1482,6 +1499,7 @@ extern "C" void launch_ldg_decode_direct(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int max_seq_len,
+    const int *block_table, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
@@ -1495,7 +1513,8 @@ extern "C" void launch_ldg_decode_direct(
       (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
       (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      position, input_token_id, max_seq_len, attn_scale);
+      position, input_token_id, max_seq_len, block_table, block_size,
+      num_cache_blocks, attn_scale);
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(

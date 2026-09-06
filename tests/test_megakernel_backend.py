@@ -62,6 +62,29 @@ class MegakernelBackendTests(unittest.TestCase):
         decision = MegakernelBackend.compatibility(config, [seq], is_prefill=False)
         self.assertFalse(decision.supported)
 
+    def test_decode_uses_attached_cache_and_does_not_replay_prompt(self):
+        backend = MegakernelBackend(self.make_config(), model=None)
+        backend.set_kv_cache(SimpleNamespace(dim=lambda: 6, shape=(2, 28, 4, 256, 8, 128)))
+
+        calls = []
+
+        class FakeDecoder:
+            def step(self, token_id, position, block_table):
+                calls.append((token_id, position, block_table))
+                return 17
+
+        backend.decoder = FakeDecoder()
+        class SequenceStub:
+            seq_id = 1
+            last_token = 99
+            prompt_token_ids = [1, 2, 3]
+
+            def __len__(self):
+                return 1
+
+        self.assertEqual(backend.decode(SequenceStub(), block_table="device-table"), [17])
+        self.assertEqual(calls, [(99, 0, "device-table")])
+
 
 if __name__ == "__main__":
     unittest.main()
