@@ -76,11 +76,11 @@ combined cache:  [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
 
 ## P1：无法顺承原有 scheduler
 
-### 问题 3：只能支持单序列
+### 问题 3：不能消费 nano-vLLM 的 batch sequence 整体计算
 
 **状态：未实现。**
 
-当前 backend 要求：
+当前 backend 只能处理：
 
 ```text
 len(seqs) == 1
@@ -89,15 +89,29 @@ tensor_parallel_size == 1
 greedy sampling
 ```
 
-nano-vLLM scheduler 原本可以在一个 decode step 中调度多条 sequence，但 Megakernel 直接拒绝 batch，并回退标准路径。
+原始 nano-vLLM 在 decode 阶段会由 scheduler 将多条 running sequence 组成一个 batch：每条 sequence 提供一个 `last_token`，并携带自己的 `context_len`、`block_table` 和 `slot_mapping`。当前 Megakernel 不能接收这个完整 batch，也不能在一次 Megakernel 调用中完成多条 sequence 的整体 decode；当 `len(seqs) > 1` 时会拒绝 batch 并回退标准路径。
 
 **影响：**
 
+- 当前 Megakernel 不能复用 nano-vLLM 的 iteration-level/continuous batching；
 - 无法评估 Megakernel 在真实并发场景的收益；
-- batch workload 实际测到的是 fallback，而不是 Megakernel；
-- 无法复用 scheduler 的连续 batch 调度能力。
+- batch workload 实际测到的是 fallback，而不是 Megakernel batch 性能；
+- 多条 sequence 的 KV cache 读写和输出 token 仍由标准 backend 完成。
 
-**后续处理：**设计 `decode_batch()` 接口，传入每条 sequence 的 `context_lens`、`block_tables` 和 `slot_mapping`，先完成 batch=2/8 的 correctness，再扩大规模。
+**后续处理：**设计并实现 `decode_batch()` 接口，传入：
+
+```text
+input_ids[batch]
+positions[batch]
+context_lens[batch]
+block_tables[batch, max_blocks]
+slot_mapping[batch]
+k_cache
+v_cache
+output_token_ids[batch]
+```
+
+先完成 batch=2/8 的 correctness，再扩大到 mixed-length batch 和 batch=32。
 
 ### 问题 4：不能复用 prefix cache
 
