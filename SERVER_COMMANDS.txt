@@ -36,14 +36,16 @@ export UV_SYSTEM_CERTS=true
 export UV_PYTHON_DOWNLOADS=0
 export UV_LINK_MODE=copy
 export UV_HTTP_TIMEOUT=300
-# Ordinary Python packages use this domestic mirror. PyTorch keeps its CUDA index.
-export NANOVLLM_PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# Prefer Huawei Cloud for ordinary packages, torch, and nvidia-* dependencies.
+# The setup script keeps the official CUDA index only as a fallback for misses.
+export NANOVLLM_PYPI_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple/
 
 bash setup_server.sh
 source .venv/bin/activate
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 # Alternatives if needed:
+# export NANOVLLM_PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 # export NANOVLLM_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 # export NANOVLLM_PYPI_INDEX_URL=https://pypi.org/simple
 # If the proxy CA is not installed system-wide, set this before setup_server.sh:

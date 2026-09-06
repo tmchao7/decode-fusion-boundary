@@ -13,7 +13,7 @@ bash setup_server.sh
 source .venv/bin/activate
 ```
 
-The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. Ordinary Python packages default to the Tsinghua PyPI mirror; PyTorch remains on its dedicated CUDA index. To use another PyTorch CUDA wheel index:
+The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. Ordinary Python packages, PyTorch, and `nvidia-*` CUDA dependencies prefer the Huawei Cloud PyPI mirror; the official PyTorch CUDA index remains only as a fallback for packages missing from the mirror. To use another PyTorch CUDA wheel index:
 
 ```bash
 NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
@@ -23,7 +23,7 @@ bash setup_server.sh
 To change only the ordinary Python package mirror:
 
 ```bash
-NANOVLLM_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+NANOVLLM_PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 bash setup_server.sh
 ```
 

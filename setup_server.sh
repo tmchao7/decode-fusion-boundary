@@ -6,7 +6,7 @@ PYTHON_VERSION="${NANOVLLM_PYTHON_VERSION:-3.11}"
 PYTHON_BIN="${NANOVLLM_PYTHON_BIN:-}"
 TORCH_VERSION="${NANOVLLM_TORCH_VERSION:-2.8.0}"
 TORCH_CUDA_INDEX="${NANOVLLM_TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu128}"
-PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://mirrors.huaweicloud.com/repository/pypi/simple/}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${ROOT_DIR}/${ENV_DIR}"
 
@@ -67,7 +67,8 @@ fi
 PYTHON_VERSION_ACTUAL="$("${PYTHON_BIN}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
 echo "Using existing Python: ${PYTHON_BIN} (${PYTHON_VERSION_ACTUAL})"
 echo "Python package index: ${PYPI_INDEX_URL}"
-echo "PyTorch CUDA index: ${TORCH_CUDA_INDEX}"
+echo "PyTorch primary index: ${PYPI_INDEX_URL}"
+echo "PyTorch CUDA fallback index: ${TORCH_CUDA_INDEX}"
 uv venv "${VENV_DIR}" \
   --python "${PYTHON_BIN}" \
   --no-managed-python \
@@ -80,9 +81,12 @@ uv pip install --python "${PYTHON}" \
 uv pip install --python "${PYTHON}" \
   --index-url "${PYPI_INDEX_URL}" \
   ninja packaging
+# Prefer the fast domestic mirror for torch and its nvidia-* dependencies;
+# keep the official CUDA index as a fallback for packages not mirrored there.
 uv pip install --python "${PYTHON}" \
   "torch==${TORCH_VERSION}" \
-  --index-url "${TORCH_CUDA_INDEX}"
+  --index-url "${PYPI_INDEX_URL}" \
+  --extra-index-url "${TORCH_CUDA_INDEX}"
 
 # FlashAttention is installed separately because it may need a local CUDA build.
 grep -v '^flash-attn' requirements.server.txt > /tmp/nano-vllm-requirements-no-flash.txt
