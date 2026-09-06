@@ -20,6 +20,7 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.metrics import (
     GpuTelemetrySampler,
     compare_metric_summaries,
+    merge_metric_reports,
     dump_json,
     environment_metadata,
 )
@@ -85,6 +86,48 @@ def realistic_factory(prompt: str) -> PromptFactory:
     return factory
 
 
+def merge_telemetry(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge best-effort NVML summaries without inventing unavailable values."""
+
+    available = [summary for summary in summaries if summary.get("available")]
+    if not available:
+        errors = [summary.get("error") for summary in summaries if summary.get("error")]
+        return {
+            "available": False,
+            "error": errors[0] if errors else None,
+            "samples": 0,
+        }
+    merged = {
+        "available": True,
+        "error": next(
+            (summary.get("error") for summary in summaries if summary.get("error")),
+            None,
+        ),
+        "samples": sum(int(summary.get("samples", 0)) for summary in available),
+    }
+    for key in (
+        "max_gpu_utilization_pct",
+        "max_memory_utilization_pct",
+        "max_memory_used_bytes",
+        "max_power_watts",
+        "max_temperature_c",
+    ):
+        values = [summary[key] for summary in available if key in summary]
+        if values:
+            merged[key] = max(values)
+    utilization = [
+        (summary["mean_gpu_utilization_pct"], summary.get("samples", 0))
+        for summary in available
+        if "mean_gpu_utilization_pct" in summary
+    ]
+    total_samples = sum(samples for _, samples in utilization)
+    if total_samples:
+        merged["mean_gpu_utilization_pct"] = sum(
+            value * samples for value, samples in utilization
+        ) / total_samples
+    return merged
+
+
 def run_case(
     model_path: str,
     backend_name: str,
@@ -127,28 +170,42 @@ def run_case(
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
 
-        measured_prompts = [
-            prompt_factory(run_index, slot)
-            for run_index in range(1, runs + 1)
-            for slot in range(batch_size)
-        ]
-        telemetry = GpuTelemetrySampler().start()
-        try:
-            result = llm.generate_with_metrics(
-                measured_prompts,
-                sampling_params,
-                use_tqdm=False,
-            )
-        finally:
-            telemetry.stop()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        run_results = []
+        for run_index in range(1, runs + 1):
+            measured_prompts = [
+                prompt_factory(run_index, slot)
+                for slot in range(batch_size)
+            ]
+            telemetry = GpuTelemetrySampler().start()
+            try:
+                result = llm.generate_with_metrics(
+                    measured_prompts,
+                    sampling_params,
+                    use_tqdm=False,
+                )
+            finally:
+                telemetry.stop()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        summary = result["metrics"]["summary"]
+            run_results.append(
+                {
+                    "metrics": result["metrics"],
+                    "outputs": [output["token_ids"] for output in result["outputs"]],
+                    "telemetry": telemetry.summary(),
+                }
+            )
+
+        merged_metrics = merge_metric_reports(
+            [run_result["metrics"] for run_result in run_results]
+        )
+        summary = merged_metrics["summary"]
         if torch.cuda.is_available():
             summary["peak_memory_allocated_bytes"] = torch.cuda.max_memory_allocated()
             summary["peak_memory_reserved_bytes"] = torch.cuda.max_memory_reserved()
-        summary["telemetry"] = telemetry.summary()
+        summary["telemetry"] = merge_telemetry(
+            [run_result["telemetry"] for run_result in run_results]
+        )
         return {
             "backend": backend_name,
             "backend_config": backend_config,
@@ -164,8 +221,12 @@ def run_case(
                 "ignore_eos": ignore_eos,
             },
             "summary": summary,
-            "requests": result["metrics"]["requests"],
-            "outputs": [output["token_ids"] for output in result["outputs"]],
+            "requests": merged_metrics["requests"],
+            "outputs": [
+                output
+                for run_result in run_results
+                for output in run_result["outputs"]
+            ],
             "backend_actual": summary.get("backend_actuals", []),
             "fallback": {
                 "count": summary.get("fallback_count", 0),
@@ -182,6 +243,7 @@ def run_case(
                 "sm_throughput": None,
             },
         }
+
     finally:
         llm.exit()
 

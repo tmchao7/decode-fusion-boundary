@@ -37,7 +37,7 @@ editable mode. The server must provide `nvidia-smi` and `nvcc`.
 ```bash
 bash setup_server.sh
 conda activate nano-vllm-server
-python tools/verify_server_env.py
+python -m tools.verify_server_env
 ```
 
 Set `NANOVLLM_MODEL_PATH` when the model path should also be checked.

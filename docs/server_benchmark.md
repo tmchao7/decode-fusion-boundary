@@ -25,16 +25,23 @@ Check a specific local model too:
 
 ```bash
 NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
-python tools/verify_server_env.py
+python -m tools.verify_server_env --require-megakernel
 ```
 
 Use a local Qwen3-0.6B model directory. Do not commit model weights, Hugging Face tokens, profiler reports, or generated result files.
 
-## 2. Static and smoke checks
+## 2. Static, build, and smoke checks
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall src/nanovllm tools
+```
+
+Compile the extension separately before running a correctness test:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m nanovllm.backends.megakernel.build
 ```
 
 Run a short correctness check before performance testing:

@@ -97,3 +97,8 @@ def get_extension():
         verbose=False,
     )
     return _module
+
+
+if __name__ == "__main__":
+    get_extension()
+    print("Megakernel extension build: OK")

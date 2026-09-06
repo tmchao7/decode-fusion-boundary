@@ -116,3 +116,33 @@ class MetricsMathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class MetricsMergeTests(unittest.TestCase):
+    def test_merge_reports_preserves_requests_and_adds_wall_time(self):
+        from nanovllm.metrics import merge_metric_reports
+
+        first = MetricsCollector("torch")
+        first.add_request(1, 4, 0.0)
+        first.record_token(1, 0.2)
+        second = MetricsCollector("torch")
+        second.add_request(2, 8, 0.0)
+        second.record_token(2, 0.3)
+        merged = merge_metric_reports(
+            [first.report(wall_time=0.2), second.report(wall_time=0.3)]
+        )
+        self.assertEqual(merged["summary"]["request_count"], 2)
+        self.assertEqual(merged["summary"]["output_tokens"], 2)
+        self.assertEqual(merged["summary"]["wall_time_s"], 0.5)
+        self.assertEqual(len(merged["requests"]), 2)
+
+class BatchThroughputTests(unittest.TestCase):
+    def test_summary_throughput_uses_step_time_once_for_a_batch(self):
+        collector = MetricsCollector("torch")
+        collector.add_request(1, 10, 0.0)
+        collector.add_request(2, 20, 0.0)
+        seqs = [SimpleNamespace(seq_id=1), SimpleNamespace(seq_id=2)]
+        collector.record_step(seqs, True, 0.5, "torch", None)
+        collector.record_token(1, 0.6)
+        collector.record_token(2, 0.6)
+        summary = collector.report(wall_time=0.6)["summary"]
+        self.assertEqual(summary["prefill_tok_s"], 60.0)

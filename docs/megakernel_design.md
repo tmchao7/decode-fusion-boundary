@@ -6,7 +6,8 @@ The current backend is intentionally conservative:
 
 - prefill stays on the standard nano-vLLM PyTorch path;
 - Megakernel is limited to Qwen3-0.6B, BF16, greedy decode, one sequence, and `max_model_len <= 2048`;
-- the first decode path owns a private contiguous KV cache and replays the prompt once;
+- the integrated single-sequence decode path receives nano-vLLM's paged KV cache and block table;
+- the standalone reference decoder may still use a private contiguous cache;
 - unsupported requests or V100 execution fall back to the standard backend.
 
 This is a correctness and launch-overhead baseline, not yet the final paged-KV implementation.

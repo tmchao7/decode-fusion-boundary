@@ -1,6 +1,12 @@
 # Megakernel 与 nano-vLLM 集成问题清单
 
-本文档记录当前 Megakernel 直接接入 nano-vLLM 后，与原有 runtime、KV cache 和 scheduler 不顺承的地方。当前版本优先用于建立单序列 correctness 和 kernel 性能基线；以下问题需要后续逐项处理，完成前不能把项目描述为“完整复用 nano-vLLM paged KV cache 的 Megakernel”。
+本文档记录当前 Megakernel 接入 nano-vLLM 后，与原有 runtime、KV cache 和 scheduler 之间的集成状态。问题按依赖关系排序，状态分为：
+
+- **已实现，待服务器验证**：代码路径和本地测试已完成，但需要 A100/V100 真实 CUDA correctness 或 profiling；
+- **未实现**：尚未进入集成路径；
+- **已关闭**：有完整测试和服务器证据。
+
+当前没有任何问题可以标记为“已关闭”，因为 paged kernel 尚未在 A100 上编译并完成 token-level correctness。
 
 ## 当前数据流（开发分支目标路径）
 
@@ -35,27 +41,29 @@ Megakernel 直接读取和写入
 
 ### 问题 1：Megakernel 固定申请最大长度
 
-当前 `src/nanovllm/backends/megakernel/model.py` 创建：
+**状态：已实现，待服务器验证。** 集成路径不再创建独立 cache；只有 standalone reference 模式仍会创建 contiguous cache。
+
+当前 paged 集成路径使用 `src/nanovllm/engine/model_runner.py` 分配的 cache：
 
 ```text
-K cache: [28, 8, 2048, 128], BF16
-V cache: [28, 8, 2048, 128], BF16
+K/V cache view: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+combined cache:  [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
 ```
 
-两份 cache 合计约 224 MiB。即使请求只包含几十个 token，也会预留完整的 2048 token capacity，无法按 block 按需分配。
+`num_blocks` 由 nano-vLLM 的 GPU memory budget 决定，sequence 通过 block table 按需占用 block；固定 2048 contiguous cache 只存在于 standalone reference 模式。
 
 **影响：**
 
-- 显存利用率低；
-- 最大长度被硬编码为 2048；
-- 无法复用 nano-vLLM 的 KV cache pool；
-- 不适合多请求和高并发场景。
+- standalone reference 模式显存利用率低；
+- reference 模式最大长度被硬编码为 2048；
+- 集成 paged path 已能复用 nano-vLLM 的 KV cache pool；
+- 多请求场景仍受 Megakernel batch 限制。
 
 **当前进展：**backend 已接收并绑定 nano-vLLM 的 `kv_cache`，paged decoder 不再创建独立 K/V cache；需要通过服务器 correctness 后才能关闭此问题。
 
 ### 问题 2：prompt 被重复计算
 
-nano-vLLM 已经执行了 prefill，但 Megakernel 首次 decode 时会重新遍历 `seq.prompt_token_ids`，用 `decoder.step()` replay 整个 prompt。
+**状态：已实现，待服务器验证。** nano-vLLM prefill 后，Megakernel 首次 decode 直接接收共享 paged cache；旧的 prompt replay 仅保留在 contiguous reference 代码路径。
 
 **影响：**
 
@@ -69,6 +77,8 @@ nano-vLLM 已经执行了 prefill，但 Megakernel 首次 decode 时会重新遍
 ## P1：无法顺承原有 scheduler
 
 ### 问题 3：只能支持单序列
+
+**状态：未实现。**
 
 当前 backend 要求：
 
@@ -91,7 +101,9 @@ nano-vLLM scheduler 原本可以在一个 decode step 中调度多条 sequence�
 
 ### 问题 4：不能复用 prefix cache
 
-nano-vLLM 的 prefix cache 通过 block hash 和 block table 管理。当前 Megakernel 不读取已有 `block_table`，也不理解 prefix cache 命中后的逻辑位置。
+**状态：未实现。** 虽然 kernel 已经读取 `block_table`，但 prefix-cache 命中、共享 block 和 ref-count 生命周期还没有服务器 correctness 覆盖。
+
+nano-vLLM 的 prefix cache 通过 block hash 和 block table 管理。当前 kernel 已能接收单序列 `block_table`，但 prefix cache 命中、共享 block 和 ref-count 生命周期还没有完整 GPU correctness 覆盖。
 
 **影响：**
 
@@ -105,21 +117,18 @@ nano-vLLM 的 prefix cache 通过 block hash 和 block table 管理。当前 Meg
 
 ### 问题 5：连续布局与 paged 布局不一致
 
-当前开发分支的 Megakernel paged path 按如下方式访问 cache：
+**状态：代码已实现，待服务器验证。** `decode_paged` 已增加 paged 地址计算；旧 contiguous 访问仍保留用于 reference benchmark。
+
+当前开发分支保留两种访问模式：
 
 ```text
-kv_head × max_seq_len × head_dim + position × head_dim
+reference path: kv_head × max_seq_len × head_dim + position × head_dim
+paged path:     [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
 ```
 
-nano-vLLM 使用：
+集成路径的 `decode_paged` 已按 nano-vLLM paged layout 计算地址；reference path 仅用于独立 contiguous benchmark。
 
-```text
-[2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-```
-
-二者不能直接共享同一个 tensor 指针。
-
-**后续处理：**统一 kernel metadata 和地址计算：
+**后续处理：**继续完善并验证 kernel metadata 和地址计算：
 
 ```text
 logical_block = position // block_size
@@ -133,25 +142,53 @@ kernel 必须覆盖 block 边界、不同 sequence 长度和最后一个不完�
 
 ### 问题 6：只支持 greedy decode
 
+**状态：未实现。**
+
 当前 kernel 直接完成 argmax，无法直接承载 `temperature` sampling。非 greedy 请求会回退标准路径。
 
 ### 问题 7：暂不支持 tensor parallel
+
+**状态：未实现。**
 
 Megakernel 假设完整权重位于单卡，当前 backend 要求 `tensor_parallel_size=1`。nano-vLLM 原本支持多卡权重切分和通信。
 
 ### 问题 8：两套状态生命周期不同
 
-nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 block 释放；Megakernel Decoder 维护自己的 position、KV cache 和 scratch buffer。请求抢占、切换或异常时，两套状态不能自动同步。
+**状态：部分处理，待服务器验证。** 集成 decoder 已不再持有 sequence-specific KV cache 和 prompt replay state，但 sequence 抢占、block 复用和异常路径仍未完成 GPU 测试。
+
+nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 block 释放；Megakernel 当前只保留共享 cache view 和 scratch buffer，position/block table 来自当前 sequence/context。请求抢占、切换或异常复用仍未完成 GPU 验证。
 
 **后续处理顺序：**
 
-1. 单序列 paged KV 直连；
+1. 单序列 paged KV 直连（代码已完成，服务器待验证）；
 2. cache 写入和读取 correctness；
 3. sequence 完成/释放同步；
 4. batch decode；
 5. prefix cache；
 6. sampling；
 7. tensor parallel。
+
+## 当前阶段完成情况
+
+### 已完成的代码工作
+
+- 统一了 `PagedKVCacheSpec` 的 shape、stride 和物理 block 映射契约；
+- 增加 `decode_paged` PyTorch operator；
+- CUDA kernel 增加单序列 paged KV 地址计算；
+- backend 绑定 nano-vLLM 的 K/V cache view；
+- 首次 decode 移除 prompt replay；
+- 保留 torch eager、CUDA Graph 和 contiguous reference 作为对照/回退路径；
+- 增加本地 contract、backend 和 CUDA source tests。
+
+### 尚未完成的真实验证
+
+- A100 上编译 `decode_paged`；
+- block 边界 `255/256/257` token correctness；
+- prefill 写入 cache 后 Megakernel 直接读取 correctness；
+- 新 token 写回 `slot_mapping` 对应物理位置；
+- 多次请求后的 block 释放和复用；
+- Nsight launch/memory 指标；
+- batch、prefix cache、V100 FP16、sampling 和 tensor parallel。
 
 ## 每个问题的关闭标准
 
@@ -168,7 +205,7 @@ nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 bloc
 
 当前可以准确描述为：
 
-> 在 nano-vLLM 中集成了一个面向 Qwen3-0.6B 单序列 greedy decode 的 CUDA Megakernel 原型，并保留标准 PyTorch/CUDA Graph 路径用于 correctness、fallback 和性能对比。
+> 在 nano-vLLM 的单序列 decode 路径中加入了一个初步的 paged-KV Megakernel 接口，复用 scheduler 分配的 K/V cache；该路径已完成本地静态验证，A100 CUDA correctness 待验证。
 
 当前不能描述为：
 
