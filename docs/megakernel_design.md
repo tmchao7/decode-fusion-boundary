@@ -58,7 +58,8 @@ The first correctness version may keep the LM head as a second kernel. Any kerne
 
 1. Single sequence, contiguous reference KV cache, exact greedy token match.
 2. Single sequence, direct paged KV read/write, exact token match on the server.
-3. Batch decode with block tables and per-sequence context lengths.
+3. Initial batch decode with block tables and per-sequence context lengths.
+4. Sequence-level parallel batch decode after correctness is stable.
 4. Sampling/logits support only after greedy correctness and profiling are stable.
 
 A100 (`sm_80`) is the primary performance target. V100 (`sm_70`) is currently a compatibility/fallback target until a validated FP16 kernel path exists.

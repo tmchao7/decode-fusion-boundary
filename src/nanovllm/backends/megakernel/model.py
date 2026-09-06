@@ -1,6 +1,7 @@
 """Weight loading and high-level decode API for Qwen3-0.6B."""
 
 import math
+import os
 import struct
 
 import torch
@@ -17,6 +18,8 @@ VOCAB_SIZE = 151936
 
 _decode = torch.ops.nanovllm_megakernel_C.decode
 _decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
+_decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
+LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
 
 def _rope_tables(rope_theta: float = 10000.0):
@@ -182,11 +185,15 @@ class Decoder:
         v_cache=None,
         block_size: int | None = None,
         num_cache_blocks: int | None = None,
+        max_batch_size: int = 1,
     ):
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
+        self._max_batch_size = int(max_batch_size)
+        if self._max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
 
         # Keep references so tensors stay alive (prevents GC of weight memory).
         self._weights = weights
@@ -235,21 +242,31 @@ class Decoder:
             )
             self._v_cache = torch.zeros_like(self._k_cache)
 
-        # Scratch buffers (single-token decode)
+        # Scratch buffers are partitioned by sequence in paged batch mode.
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
-        self._hidden = torch.empty(HIDDEN_SIZE, **bf16)
-        self._act = torch.empty(HIDDEN_SIZE, **f32)
-        self._res = torch.empty(HIDDEN_SIZE, **f32)
-        self._q = torch.empty(Q_SIZE, **f32)
-        self._k = torch.empty(KV_SIZE, **f32)
-        self._v = torch.empty(KV_SIZE, **f32)
-        self._attn_out = torch.empty(Q_SIZE, **f32)
-        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE, **f32)
-        self._norm_out = torch.empty(HIDDEN_SIZE, **f32)
-        self._bmax_vals = torch.empty(4096, **f32)
-        self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
-        self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
+        self._hidden = torch.empty((self._max_batch_size, HIDDEN_SIZE), **bf16)
+        self._act = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
+        self._res = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
+        self._q = torch.empty((self._max_batch_size, Q_SIZE), **f32)
+        self._k = torch.empty((self._max_batch_size, KV_SIZE), **f32)
+        self._v = torch.empty((self._max_batch_size, KV_SIZE), **f32)
+        self._attn_out = torch.empty((self._max_batch_size, Q_SIZE), **f32)
+        self._mlp_inter = torch.empty(
+            (self._max_batch_size, INTERMEDIATE_SIZE), **f32
+        )
+        self._norm_out = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
+        self._bmax_vals = torch.empty(
+            self._max_batch_size * LDG_LM_NUM_BLOCKS, **f32
+        )
+        self._bmax_idxs = torch.empty(
+            self._max_batch_size * LDG_LM_NUM_BLOCKS,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self._out_token = torch.empty(
+            self._max_batch_size, dtype=torch.int32, device="cuda"
+        )
 
     def step(self, token_id: int, position: int | None = None, block_table=None) -> int:
         """Decode one token and return the next token id.
@@ -320,6 +337,53 @@ class Decoder:
         )
         self._position += 1
         return self._out_token.item()
+
+    def step_batch(self, input_token_ids, positions, block_tables) -> list[int]:
+        """Decode one token for each sequence using one paged batch operator."""
+
+        if not self._paged:
+            raise RuntimeError("step_batch() requires paged KV cache mode")
+        batch_size = int(input_token_ids.numel())
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(
+                f"batch size must be between 1 and {self._max_batch_size}"
+            )
+        if (
+            positions.numel() != batch_size
+            or block_tables.dim() != 2
+            or block_tables.shape[0] != batch_size
+        ):
+            raise ValueError("batch metadata shapes do not match")
+        _decode_paged_batch(
+            self._out_token[:batch_size],
+            input_token_ids,
+            positions,
+            block_tables,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            NUM_LAYERS,
+            self._block_size,
+            self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return self._out_token[:batch_size].cpu().tolist()
 
     def reset(self):
         self._position = 0

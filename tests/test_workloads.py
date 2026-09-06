@@ -31,3 +31,12 @@ class WorkloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CorrectnessSmokeHelperTests(unittest.TestCase):
+    def test_builds_deterministic_synthetic_batch_cases(self):
+        from tools.correctness_smoke import build_cases, compare_outputs
+
+        cases = build_cases("benchmarks/workloads.json", [8], None, [1, 2], 0)
+        self.assertEqual([case["id"] for case in cases], ["synthetic_p8_b1", "synthetic_p8_b2"])
+        self.assertEqual(len(cases[1]["prompts"]), 2)
+        self.assertEqual(compare_outputs([[1, 2]], [[1, 3]])[0], [0])

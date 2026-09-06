@@ -2,9 +2,9 @@
 
 The CUDA extension is imported lazily so the regular nano-vLLM backend remains
 usable on machines without CUDA, and so importing the package never triggers a
-CUDA build. The first implementation intentionally handles only single-sequence
-Qwen3-0.6B greedy decode; callers should use :meth:`compatibility` before
-invoking :meth:`decode` and fall back to the normal model path otherwise.
+CUDA build. The initial paged implementation supports Qwen3-0.6B greedy decode
+with a conservative batch limit; callers should use :meth:`compatibility`
+before invoking :meth:`decode` or :meth:`decode_batch`.
 """
 
 from dataclasses import dataclass
@@ -12,6 +12,7 @@ from typing import Any
 
 
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
+MAX_BATCH_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -54,18 +55,20 @@ class MegakernelBackend:
     def compatibility(config, seqs, is_prefill: bool) -> Compatibility:
         if is_prefill:
             return Compatibility(False, "Megakernel is decode-only; use the prefill backend")
-        if len(seqs) != 1:
-            return Compatibility(False, "Megakernel v1 supports one decode sequence")
-        if _get_attr(config, "max_num_seqs", 1) != 1:
+        max_batch_size = min(
+            _get_attr(config, "max_num_seqs", MAX_BATCH_SIZE), MAX_BATCH_SIZE
+        )
+        if not 1 <= len(seqs) <= max_batch_size:
             return Compatibility(
                 False,
-                "Megakernel v1 requires max_num_seqs=1 while paged KV sync is pending",
+                f"Megakernel v1 supports batch sizes from 1 to {max_batch_size}",
             )
         if _get_attr(config, "tensor_parallel_size", 1) != 1:
             return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
 
-        seq = seqs[0]
-        if not bool(_get_attr(seq, "is_greedy", False)):
+        for seq in seqs:
+            if bool(_get_attr(seq, "is_greedy", False)):
+                continue
             temperature = _get_attr(seq, "temperature", None)
             if temperature is None or temperature > 1e-10:
                 return Compatibility(False, "Megakernel v1 supports greedy sampling only")
@@ -132,7 +135,16 @@ class MegakernelBackend:
             v_cache=self.kv_cache[1],
             block_size=self.config.kvcache_block_size,
             num_cache_blocks=self.kv_cache.shape[2],
+            max_batch_size=min(
+                _get_attr(self.config, "max_num_seqs", 1), MAX_BATCH_SIZE
+            ),
         )
+
+    def decode_batch(self, input_ids, positions, block_tables) -> list[int]:
+        """Decode one token for each scheduler-selected sequence."""
+
+        self._ensure_decoder()
+        return self.decoder.step_batch(input_ids, positions, block_tables)
 
     def decode(self, seq, block_table) -> list[int]:
         """Decode one token and return a one-element Python token-id list.

@@ -78,27 +78,27 @@ combined cache:  [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
 
 ### 问题 3：不能消费 nano-vLLM 的 batch sequence 整体计算
 
-**状态：未实现。**
+**状态：代码已实现，待服务器验证和性能优化。**
 
-当前 backend 只能处理：
+当前 backend 的初始 paged batch 限制是：
 
 ```text
-len(seqs) == 1
-max_num_seqs == 1
+1 <= len(seqs) <= 32
+max_num_seqs >= len(seqs)
 tensor_parallel_size == 1
 greedy sampling
 ```
 
-原始 nano-vLLM 在 decode 阶段会由 scheduler 将多条 running sequence 组成一个 batch：每条 sequence 提供一个 `last_token`，并携带自己的 `context_len`、`block_table` 和 `slot_mapping`。当前 Megakernel 不能接收这个完整 batch，也不能在一次 Megakernel 调用中完成多条 sequence 的整体 decode；当 `len(seqs) > 1` 时会拒绝 batch 并回退标准路径。
+原始 nano-vLLM 在 decode 阶段会由 scheduler 将多条 running sequence 组成一个 batch：每条 sequence 提供一个 `last_token`，并携带自己的 `context_len`、`block_table` 和 `slot_mapping`。当前 Megakernel 已能接收最多 32 条 sequence，并通过 `decode_paged_batch` 在一次 PyTorch operator 调用中处理整个 batch；为降低初版同步风险，kernel 内部暂时按 sequence 依次处理，尚未做到 sequence 级并行。
 
 **影响：**
 
-- 当前 Megakernel 不能复用 nano-vLLM 的 iteration-level/continuous batching；
-- 无法评估 Megakernel 在真实并发场景的收益；
-- batch workload 实际测到的是 fallback，而不是 Megakernel batch 性能；
-- 多条 sequence 的 KV cache 读写和输出 token 仍由标准 backend 完成。
+- 当前 batch kernel 还没有发挥 sequence 级并行度；
+- 无法在服务器验证前确认真实并发场景收益；
+- batch workload 需要检查 `backend_actual`，避免把 fallback 当成 Megakernel 性能；
+- 多 sequence 的 KV cache 读写虽已进入 Megakernel operator，但生命周期和性能仍待验证。
 
-**后续处理：**设计并实现 `decode_batch()` 接口，传入：
+**后续处理：**在现有 `decode_paged_batch()` 接口上完成 correctness，并逐步并行化 kernel，传入：
 
 ```text
 input_ids[batch]
@@ -202,7 +202,8 @@ nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 bloc
 - 新 token 写回 `slot_mapping` 对应物理位置；
 - 多次请求后的 block 释放和复用；
 - Nsight launch/memory 指标；
-- batch、prefix cache、V100 FP16、sampling 和 tensor parallel。
+- batch paged KV 的 A100 correctness 和 sequence 级并行性能；
+- prefix cache、V100 FP16、sampling 和 tensor parallel。
 
 ## 每个问题的关闭标准
 

@@ -41,6 +41,31 @@ class MegakernelBackendTests(unittest.TestCase):
             MegakernelBackend.compatibility(config, [seq], is_prefill=False).supported
         )
 
+    def test_accepts_small_greedy_batch(self):
+        config = self.make_config(max_num_seqs=8)
+        seq = SimpleNamespace(temperature=0.0)
+        decision = MegakernelBackend.compatibility(
+            config, [seq, seq], is_prefill=False
+        )
+        self.assertTrue(decision.supported, decision.reason)
+
+    def test_rejects_batch_with_mixed_sampling_modes(self):
+        config = self.make_config(max_num_seqs=8)
+        seqs = [
+            SimpleNamespace(temperature=0.0),
+            SimpleNamespace(temperature=0.6),
+        ]
+        decision = MegakernelBackend.compatibility(config, seqs, is_prefill=False)
+        self.assertFalse(decision.supported)
+        self.assertIn("greedy", decision.reason)
+
+    def test_rejects_batch_above_initial_limit(self):
+        config = self.make_config(max_num_seqs=64)
+        seqs = [SimpleNamespace(temperature=0.0) for _ in range(33)]
+        decision = MegakernelBackend.compatibility(config, seqs, is_prefill=False)
+        self.assertFalse(decision.supported)
+        self.assertIn("32", decision.reason)
+
     def test_rejects_batch_and_tensor_parallel(self):
         config = self.make_config(tensor_parallel_size=2)
         seq = SimpleNamespace(temperature=0.0)
@@ -49,18 +74,33 @@ class MegakernelBackendTests(unittest.TestCase):
         )
         self.assertFalse(decision.supported)
 
-    def test_rejects_default_multi_sequence_capacity_until_paged_sync(self):
+    def test_accepts_single_sequence_with_default_capacity(self):
         config = self.make_config(max_num_seqs=512)
         seq = SimpleNamespace(temperature=0.0)
         decision = MegakernelBackend.compatibility(config, [seq], is_prefill=False)
-        self.assertFalse(decision.supported)
-        self.assertIn("max_num_seqs", decision.reason)
+        self.assertTrue(decision.supported, decision.reason)
 
     def test_rejects_non_qwen_shapes(self):
         config = self.make_config(hf_config=SimpleNamespace(model_type="llama"))
         seq = SimpleNamespace(temperature=0.0)
         decision = MegakernelBackend.compatibility(config, [seq], is_prefill=False)
         self.assertFalse(decision.supported)
+
+    def test_decode_batch_delegates_device_metadata(self):
+        backend = MegakernelBackend(self.make_config(), model=None)
+        calls = []
+
+        class FakeDecoder:
+            def step_batch(self, input_ids, positions, block_tables):
+                calls.append((input_ids, positions, block_tables))
+                return [17, 23]
+
+        backend.decoder = FakeDecoder()
+        self.assertEqual(
+            backend.decode_batch("input_ids", "positions", "block_tables"),
+            [17, 23],
+        )
+        self.assertEqual(calls, [("input_ids", "positions", "block_tables")])
 
     def test_decode_uses_attached_cache_and_does_not_replay_prompt(self):
         backend = MegakernelBackend(self.make_config(), model=None)

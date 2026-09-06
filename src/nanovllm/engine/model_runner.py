@@ -239,13 +239,18 @@ class ModelRunner:
             if not decision.supported and not is_prefill:
                 self.last_fallback_reason = decision.reason
             if decision.supported:
-                self.prepare_decode(seqs)
+                input_ids, positions = self.prepare_decode(seqs)
                 context = get_context()
                 try:
                     with nvtx_range("megakernel_decode"):
-                        token_ids = self.megakernel.decode(
-                            seqs[0], context.block_tables[0]
-                        )
+                        if len(seqs) == 1:
+                            token_ids = self.megakernel.decode(
+                                seqs[0], context.block_tables[0]
+                            )
+                        else:
+                            token_ids = self.megakernel.decode_batch(
+                                input_ids, positions, context.block_tables
+                            )
                 except Exception as exc:
                     # Once a kernel step has started, nano-vLLM's shared paged
                     # cache may have been updated. Do not silently produce

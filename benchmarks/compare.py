@@ -440,7 +440,7 @@ def main() -> None:
                 )
         if not args.skip_batch:
             for batch_size in args.batch_sizes:
-                for backend in [item for item in backends if item != "megakernel"]:
+                for backend in backends:
                     experiments.append(
                         run_case(
                             args.model,
@@ -460,7 +460,7 @@ def main() -> None:
         if not args.skip_mixed_batch:
             for mix in workload_payload["performance"].get("batch_mixes", []):
                 mix_lengths = [int(length) for length in mix["prompt_lengths"]]
-                for backend in [item for item in backends if item != "megakernel"]:
+                for backend in backends:
                     experiments.append(
                         run_case(
                             args.model,

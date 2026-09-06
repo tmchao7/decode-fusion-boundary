@@ -10,6 +10,7 @@
  * Model:         Qwen/Qwen3-0.6B (bf16 weights)
  */
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
@@ -28,7 +29,7 @@ constexpr int Q_SIZE = NUM_Q_HEADS * HEAD_DIM;   // 2048
 constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 
 #ifndef LDG_NUM_BLOCKS
-#define LDG_NUM_BLOCKS 128
+#define LDG_NUM_BLOCKS 80
 #endif
 #ifndef LDG_BLOCK_SIZE
 #define LDG_BLOCK_SIZE 512
@@ -65,6 +66,9 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #endif
 #ifndef LDG_PREFETCH_UP
 #define LDG_PREFETCH_UP 1
+#endif
+#ifndef LDG_MAX_BATCH
+#define LDG_MAX_BATCH 32
 #endif
 
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
@@ -1197,6 +1201,185 @@ __global__ void ldg_lm_head_fused(const float *__restrict__ hidden,
 }
 
 // =============================================================================
+__global__ void ldg_lm_head_fused_batch(
+    const float *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ weight,
+    float *__restrict__ block_max_vals,
+    int *__restrict__ block_max_idxs,
+    int *__restrict__ output_token,
+    unsigned int *__restrict__ counter, int num_blocks,
+    int batch_size, int hidden_stride, int block_max_stride) {
+  int global_block = blockIdx.x;
+  int seq_id = global_block / num_blocks;
+  int local_block = global_block % num_blocks;
+  if (seq_id >= batch_size)
+    return;
+
+  hidden += seq_id * hidden_stride;
+  block_max_vals += seq_id * block_max_stride;
+  block_max_idxs += seq_id * block_max_stride;
+  output_token += seq_id;
+  counter += seq_id;
+
+  __shared__ __align__(16) float s_hidden[HIDDEN_SIZE];
+
+  for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
+    s_hidden[i] = hidden[i];
+  }
+  __syncthreads();
+
+  int warp_id = threadIdx.x / WARP_SIZE;
+  int lane_id = threadIdx.x % WARP_SIZE;
+
+  int rows_per_block = (LDG_VOCAB_SIZE + num_blocks - 1) / num_blocks;
+  int row_start = local_block * rows_per_block;
+  int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+
+  float local_max = -INFINITY;
+  int local_max_idx = -1;
+
+  int warp_stride = LDG_LM_BLOCK_SIZE / WARP_SIZE;
+  int base = row_start + warp_id * LDG_LM_ROWS_PER_WARP;
+
+  for (int m_base = base; m_base < row_end;
+       m_base += warp_stride * LDG_LM_ROWS_PER_WARP) {
+    int rows[LDG_LM_ROWS_PER_WARP];
+    bool valid[LDG_LM_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      rows[r] = m_base + r;
+      valid[r] = rows[r] < row_end;
+    }
+
+    float sum[LDG_LM_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      sum[r] = 0.0f;
+    }
+
+#pragma unroll 4
+    for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+      float4 a1 = *reinterpret_cast<const float4 *>(s_hidden + k);
+      float4 a2 = *reinterpret_cast<const float4 *>(s_hidden + k + 4);
+
+#pragma unroll
+      for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+        if (!valid[r]) {
+          continue;
+        }
+        const __nv_bfloat16 *w_row = weight + rows[r] * HIDDEN_SIZE;
+        uint4 w_u4 =
+            ldg_load_weight_u4(reinterpret_cast<const uint4 *>(w_row + k));
+        __nv_bfloat16 *w_ptr = reinterpret_cast<__nv_bfloat16 *>(&w_u4);
+
+        sum[r] += __bfloat162float(w_ptr[0]) * a1.x +
+                  __bfloat162float(w_ptr[1]) * a1.y +
+                  __bfloat162float(w_ptr[2]) * a1.z +
+                  __bfloat162float(w_ptr[3]) * a1.w +
+                  __bfloat162float(w_ptr[4]) * a2.x +
+                  __bfloat162float(w_ptr[5]) * a2.y +
+                  __bfloat162float(w_ptr[6]) * a2.z +
+                  __bfloat162float(w_ptr[7]) * a2.w;
+      }
+    }
+
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      if (!valid[r]) {
+        continue;
+      }
+      float reduced = ldg_warp_reduce_sum(sum[r]);
+      if (lane_id == 0 && reduced > local_max) {
+        local_max = reduced;
+        local_max_idx = rows[r];
+      }
+    }
+  }
+
+  local_max = __shfl_sync(0xffffffff, local_max, 0);
+  local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+
+  __shared__ float warp_max[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+  __shared__ int warp_idx[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+
+  if (lane_id == 0) {
+    warp_max[warp_id] = local_max;
+    warp_idx[warp_id] = local_max_idx;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float max_val = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE)
+                        ? warp_max[lane_id]
+                        : -INFINITY;
+    int max_idx =
+        (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+      int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+      if (other_val > max_val) {
+        max_val = other_val;
+        max_idx = other_idx;
+      }
+    }
+
+    if (lane_id == 0) {
+      block_max_vals[local_block] = max_val;
+      block_max_idxs[local_block] = max_idx;
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    atomicAdd(counter, 1);
+  }
+
+  if (local_block == 0) {
+    if (threadIdx.x == 0) {
+      volatile unsigned int *vc = (volatile unsigned int *)counter;
+      while (*vc < (unsigned int)num_blocks) {
+      }
+      __threadfence();
+    }
+    __syncthreads();
+
+    __shared__ float s_max_vals[1024];
+    __shared__ int s_max_idxs[1024];
+
+    int tid = threadIdx.x;
+    float local_max2 = -INFINITY;
+    int local_idx2 = -1;
+    for (int i = tid; i < num_blocks; i += blockDim.x) {
+      float val = block_max_vals[i];
+      if (val > local_max2) {
+        local_max2 = val;
+        local_idx2 = block_max_idxs[i];
+      }
+    }
+
+    s_max_vals[tid] = local_max2;
+    s_max_idxs[tid] = local_idx2;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+        if (s_max_vals[tid + s] > s_max_vals[tid]) {
+          s_max_vals[tid] = s_max_vals[tid + s];
+          s_max_idxs[tid] = s_max_idxs[tid + s];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      *output_token = s_max_idxs[0];
+    }
+  }
+
+}
+
 // Persistent (non-cooperative) decode kernel
 // =============================================================================
 
@@ -1323,7 +1506,7 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   }
 }
 
-__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+__device__ void ldg_decode_one(
     const __nv_bfloat16 *__restrict__ embed_weight,
     const LDGLayerWeights *__restrict__ layer_weights,
     const __nv_bfloat16 *__restrict__ final_norm_weight,
@@ -1341,6 +1524,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     int num_layers, int position, int input_token_id, int max_seq_len,
     const int *__restrict__ block_table, int block_size, int num_cache_blocks,
     float attn_scale) {
+
   int cache_len = position + 1;
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
@@ -1438,6 +1622,80 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
       }
     }
   }
+  grid.sync();
+}
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const LDGLayerWeights *__restrict__ layer_weights,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const __nv_bfloat16 *__restrict__ cos_table,
+    const __nv_bfloat16 *__restrict__ sin_table,
+    __nv_bfloat16 *__restrict__ k_cache, __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations, float *__restrict__ g_residual,
+    float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
+    float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_sense,
+    unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
+    int num_layers, int position, int input_token_id, int max_seq_len,
+    const int *__restrict__ block_table, int block_size, int num_cache_blocks,
+    float attn_scale) {
+  ldg_decode_one(
+      embed_weight, layer_weights, final_norm_weight, cos_table, sin_table,
+      k_cache, v_cache, hidden_buffer, g_activations, g_residual, g_q, g_k,
+      g_v, g_attn_out, g_mlp_intermediate, g_normalized, barrier_counter,
+      barrier_sense, kv_flag, attn_flag, num_layers, position, input_token_id,
+      max_seq_len, block_table, block_size, num_cache_blocks, attn_scale);
+}
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_batch(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const LDGLayerWeights *__restrict__ layer_weights,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const __nv_bfloat16 *__restrict__ cos_table,
+    const __nv_bfloat16 *__restrict__ sin_table,
+    __nv_bfloat16 *__restrict__ k_cache, __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations, float *__restrict__ g_residual,
+    float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
+    float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_sense,
+    unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
+    int num_layers, const int64_t *__restrict__ input_token_ids,
+    const int64_t *__restrict__ positions,
+    const int *__restrict__ block_tables, int batch_size,
+    int block_table_stride, int block_size, int num_cache_blocks,
+    float attn_scale) {
+  constexpr int HIDDEN_STRIDE = HIDDEN_SIZE;
+  constexpr int Q_STRIDE = Q_SIZE;
+  constexpr int KV_STRIDE = KV_SIZE;
+  constexpr int MLP_STRIDE = INTERMEDIATE_SIZE;
+
+  for (int seq_id = 0; seq_id < batch_size; ++seq_id) {
+    ldg_decode_one(
+        embed_weight, layer_weights, final_norm_weight, cos_table, sin_table,
+        k_cache, v_cache,
+        hidden_buffer + seq_id * HIDDEN_STRIDE,
+        g_activations + seq_id * HIDDEN_STRIDE,
+        g_residual + seq_id * HIDDEN_STRIDE,
+        g_q + seq_id * Q_STRIDE,
+        g_k + seq_id * KV_STRIDE,
+        g_v + seq_id * KV_STRIDE,
+        g_attn_out + seq_id * Q_STRIDE,
+        g_mlp_intermediate + seq_id * MLP_STRIDE,
+        g_normalized + seq_id * HIDDEN_STRIDE,
+        barrier_counter, barrier_sense, kv_flag, attn_flag, num_layers,
+        static_cast<int>(positions[seq_id]),
+        static_cast<int>(input_token_ids[seq_id]),
+        block_size * num_cache_blocks,
+        block_tables + seq_id * block_table_stride, block_size,
+        num_cache_blocks, attn_scale);
+  }
 }
 
 // Device-side step update: copies LM head output -> next token input,
@@ -1476,7 +1734,7 @@ static void ensure_barrier_alloc() {
     cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
     cudaMalloc(&d_kv_flag, sizeof(unsigned int));
     cudaMalloc(&d_attn_flag, sizeof(unsigned int));
-    cudaMalloc(&d_lm_head_counter, sizeof(unsigned int));
+    cudaMalloc(&d_lm_head_counter, sizeof(unsigned int) * LDG_MAX_BATCH);
     cudaMalloc(&d_mutable_position, sizeof(int));
     cudaMalloc(&d_mutable_token_id, sizeof(int));
     cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
@@ -1485,7 +1743,7 @@ static void ensure_barrier_alloc() {
     cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
     cudaMemset(d_kv_flag, 0, sizeof(unsigned int));
     cudaMemset(d_attn_flag, 0, sizeof(unsigned int));
-    cudaMemset(d_lm_head_counter, 0, sizeof(unsigned int));
+    cudaMemset(d_lm_head_counter, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
   }
 }
 
@@ -1521,6 +1779,44 @@ extern "C" void launch_ldg_decode_direct(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
       (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
       d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+}
+
+extern "C" void launch_ldg_decode_paged_batch(
+    const void *input_token_ids, const void *positions,
+    const void *block_tables, int *output_token_ids,
+    const void *embed_weight, const LDGLayerWeights *layer_weights,
+    const void *final_norm_weight, const void *lm_head_weight,
+    const void *cos_table, const void *sin_table, void *k_cache,
+    void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int batch_size,
+    int block_table_stride, int block_size, int num_cache_blocks,
+    float attn_scale, cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  ldg_decode_kernel_batch<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+      (const __nv_bfloat16 *)embed_weight, layer_weights,
+      (const __nv_bfloat16 *)final_norm_weight,
+      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      (const int64_t *)input_token_ids, (const int64_t *)positions,
+      (const int *)block_tables, batch_size, block_table_stride, block_size,
+      num_cache_blocks, attn_scale);
+
+  cudaMemsetAsync(d_lm_head_counter, 0,
+                  sizeof(unsigned int) * batch_size, stream);
+  ldg_lm_head_fused_batch<<<LDG_LM_NUM_BLOCKS * batch_size,
+                            LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+      (float *)block_max_vals, (int *)block_max_idxs, output_token_ids,
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS, batch_size, HIDDEN_SIZE,
+      LDG_LM_NUM_BLOCKS);
 }
 
 extern "C" void launch_ldg_decode_persistent(

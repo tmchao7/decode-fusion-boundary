@@ -49,7 +49,7 @@ def kernel_flags() -> list[str]:
     """Return tunable kernel flags for the selected GPU family."""
 
     return [
-        f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
+        f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 80)}",
         f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
         f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
         f"-DLDG_LM_BLOCK_SIZE={_env_int('LDG_LM_BLOCK_SIZE', 384)}",
@@ -62,6 +62,7 @@ def kernel_flags() -> list[str]:
         f"-DLDG_PREFETCH_BLOCK_STRIDE={_env_int('LDG_PREFETCH_BLOCK_STRIDE', 1)}",
         f"-DLDG_PREFETCH_GATE={_env_int('LDG_PREFETCH_GATE', 1)}",
         f"-DLDG_PREFETCH_UP={_env_int('LDG_PREFETCH_UP', 1)}",
+        "-DLDG_MAX_BATCH=32",
         "-DLDG_USE_UINT4",
         "-DLDG_ATTENTION_VEC4",
         "-DLDG_WEIGHT_LDCS",

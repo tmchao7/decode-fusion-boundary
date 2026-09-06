@@ -14,12 +14,16 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("position / block_size", source)
         self.assertIn("physical_block * block_size * KV_SIZE", source)
         self.assertIn("const int *__restrict__ block_table", source)
+        self.assertIn("ldg_decode_kernel_batch", source)
+        self.assertIn("ldg_lm_head_fused_batch", source)
 
     def test_paged_operator_is_registered(self):
         source = BINDINGS.read_text(encoding="utf-8")
         self.assertIn('ops.def("decode_paged', source)
         self.assertIn('ops.impl("decode_paged"', source)
         self.assertIn("block_table.data_ptr<int>()", source)
+        self.assertIn('ops.def("decode_paged_batch', source)
+        self.assertIn('ops.impl("decode_paged_batch"', source)
 
 
 if __name__ == "__main__":

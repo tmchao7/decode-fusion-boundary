@@ -9,8 +9,9 @@ The repository currently contains three execution paths:
 
 - `torch-eager`: standard nano-vLLM PyTorch execution;
 - `torch-cudagraph`: standard nano-vLLM CUDA Graph execution;
-- `megakernel`: Qwen3-0.6B BF16 greedy decode on an A100-class GPU, limited to
-  one sequence and `max_model_len <= 2048`.
+- `megakernel`: experimental Qwen3-0.6B BF16 greedy decode on an A100-class
+  GPU, with paged KV support and an initial batch limit of 32 sequences;
+  correctness and performance remain pending server validation.
 
 Megakernel requests that are unsupported or run on V100 fall back to the
 standard backend and are marked as non-comparable in benchmark reports.
