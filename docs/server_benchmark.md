@@ -13,10 +13,17 @@ bash setup_server.sh
 source .venv/bin/activate
 ```
 
-The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. To use another PyTorch CUDA wheel index:
+The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. Ordinary Python packages default to the Tsinghua PyPI mirror; PyTorch remains on its dedicated CUDA index. To use another PyTorch CUDA wheel index:
 
 ```bash
 NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
+bash setup_server.sh
+```
+
+To change only the ordinary Python package mirror:
+
+```bash
+NANOVLLM_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
 bash setup_server.sh
 ```
 
@@ -27,7 +34,7 @@ NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
 python -m tools.verify_server_env --require-megakernel
 ```
 
-If uv reports `invalid peer certificate: UnknownIssuer`, do not disable TLS verification. Set `UV_SYSTEM_CERTS=true` when the enterprise CA is installed in the system trust store, or set `SSL_CERT_FILE=/path/to/company-ca-bundle.pem` to the PEM bundle supplied by the server administrator. If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
+The setup script uses `UV_HTTP_TIMEOUT=300` and `UV_LINK_MODE=copy`; the latter is appropriate when uv's cache and the repository are on different filesystems. If uv reports `invalid peer certificate: UnknownIssuer`, do not disable TLS verification. Set `UV_SYSTEM_CERTS=true` when the enterprise CA is installed in the system trust store, or set `SSL_CERT_FILE=/path/to/company-ca-bundle.pem` to the PEM bundle supplied by the server administrator. If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
 
 ```bash
 module avail cuda
