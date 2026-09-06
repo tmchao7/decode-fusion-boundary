@@ -28,6 +28,10 @@ nano-vLLM scheduler
 Megakernel 直接读取和写入
 ```
 
+## P0：统一 cache contract（已建立测试基线）
+
+`src/nanovllm/backends/megakernel/cache.py` 现在定义了 nano-vLLM KV cache 的 shape、element stride、物理 block 映射和 flat element offset 规则。它只定义契约，不代表 CUDA kernel 已经完成 paged KV 直连；后续 kernel 必须遵守该契约。
+
 ## P0：重复 KV cache 与重复计算
 
 ### 问题 1：Megakernel 固定申请最大长度

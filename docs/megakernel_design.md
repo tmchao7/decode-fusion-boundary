@@ -22,7 +22,9 @@ decode_batch(
 )
 ```
 
-The kernel must write and read the nano-vLLM cache without a temporary contiguous copy. The cache is laid out as:
+The cache contract is implemented and unit-tested in
+`src/nanovllm/backends/megakernel/cache.py`. The kernel must write and read the
+nano-vLLM cache without a temporary contiguous copy. The cache is laid out as:
 
 ```text
 [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]

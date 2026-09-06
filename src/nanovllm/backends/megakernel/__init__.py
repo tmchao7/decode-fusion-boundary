@@ -1,11 +1,13 @@
 """Qwen3-0.6B Megakernel backend and CUDA extension helpers."""
 
 from .backend import Compatibility, MegakernelBackend, cuda_arch_for_capability
+from .cache import PagedKVCacheSpec
 
 __all__ = [
     "Compatibility",
     "Decoder",
     "MegakernelBackend",
+    "PagedKVCacheSpec",
     "cuda_arch_for_capability",
     "generate",
     "load_weights",
