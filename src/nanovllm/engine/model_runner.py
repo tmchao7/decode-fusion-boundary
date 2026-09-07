@@ -14,12 +14,19 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.metrics import nvtx_range
 from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.distributed import build_init_method
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+        init_method: str | None = None,
+    ):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -28,7 +35,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl",
+            init_method or build_init_method(),
+            world_size=self.world_size,
+            rank=rank,
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
