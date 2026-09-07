@@ -36,7 +36,7 @@ static void validate_paged_metadata(const torch::Tensor &block_table,
               " entries, actual=", host_table.numel());
   std::fprintf(stderr,
                "Megakernel paged metadata: position=%ld block_size=%ld "
-               "num_cache_blocks=%ld table_numel=%ld k_cache_ptr=%p\\n",
+               "num_cache_blocks=%ld table_numel=%ld k_cache_ptr=%p\n",
                static_cast<long>(position), static_cast<long>(block_size),
                static_cast<long>(num_cache_blocks),
                static_cast<long>(host_table.numel()), k_cache.data_ptr());
@@ -44,7 +44,7 @@ static void validate_paged_metadata(const torch::Tensor &block_table,
     TORCH_CHECK(values[i] >= 0 && values[i] < num_cache_blocks,
                 "invalid paged physical block: index=", i,
                 " value=", values[i], " num_cache_blocks=", num_cache_blocks);
-    std::fprintf(stderr, "  block_table[%ld]=%d\\n", static_cast<long>(i),
+    std::fprintf(stderr, "  block_table[%ld]=%d\n", static_cast<long>(i),
                  values[i]);
   }
 }
