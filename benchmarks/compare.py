@@ -11,6 +11,7 @@ import argparse
 import os
 import random
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -415,7 +416,11 @@ def main() -> None:
     if invalid:
         parser.error(f"unknown backend(s): {', '.join(sorted(invalid))}")
     if args.baseline not in backends:
-        parser.error("--baseline must be included in --backends")
+        print(
+            f"No baseline backend {args.baseline!r} in this run; "
+            "comparisons will be omitted.",
+            file=sys.stderr,
+        )
 
     experiments = []
     performance_lengths = args.prompt_lengths or workload_payload["performance"]["prompt_lengths"]

@@ -63,12 +63,13 @@ def _check_model(path: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-megakernel", action="store_true")
+    parser.add_argument("--skip-nvcc", action="store_true")
     parser.add_argument("--model", default=os.environ.get("NANOVLLM_MODEL_PATH"))
     args = parser.parse_args()
 
     print(f"python: {sys.version.split()[0]}")
     print(f"executable: {sys.executable}")
-    checks_ok = _print_nvcc()
+    checks_ok = True if args.skip_nvcc else _print_nvcc()
 
     try:
         import torch
