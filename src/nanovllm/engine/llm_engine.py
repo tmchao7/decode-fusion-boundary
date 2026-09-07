@@ -47,6 +47,7 @@ class LLMEngine:
         # Each benchmark backend is created in the same Python process. Release
         # PyTorch's cached CUDA blocks so the next backend sees real free memory.
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         for p in self.ps:
             p.join()
 

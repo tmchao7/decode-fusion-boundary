@@ -1,3 +1,4 @@
+import gc
 import pickle
 import warnings
 
@@ -101,16 +102,28 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        """Compile a small representative path without consuming KV-cache budget.
+
+        The previous warmup used the full ``max_num_batched_tokens`` budget
+        (16,384 tokens by default). FlashAttention/torch.compile can retain a
+        very large temporary allocation from that shape, leaving no room for
+        the actual KV pool. Graph capture happens separately after KV allocation.
+        """
+
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
+        seq_len = min(self.config.max_model_len, 512)
+        seqs = [Sequence([0] * seq_len)]
+        seqs[0].num_scheduled_tokens = seq_len
+        try:
+            self.run(seqs, True)
+            torch.cuda.synchronize()
+        finally:
+            reset_context()
+            del seqs
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config

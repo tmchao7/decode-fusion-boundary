@@ -17,6 +17,11 @@ source .venv/bin/activate
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export NANOVLLM_CUDA_ARCH=sm_80
+export UV_SYSTEM_CERTS=true
+export UV_PYTHON_DOWNLOADS=0
+export UV_LINK_MODE=copy
+export UV_HTTP_TIMEOUT=300
+export NANOVLLM_PYPI_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple/
 
 GPU_SELECTION=""
 GPU_CANDIDATES="/tmp/nanovllm_gpu_candidates.$$"
@@ -37,6 +42,7 @@ fi
 export CUDA_VISIBLE_DEVICES="$GPU_SELECTION"
 echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
 nvidia-smi --id="$GPU_SELECTION"
+mkdir -p results
 
 NANOVLLM_MODEL_PATH="$MODEL" \
 python -m tools.verify_server_env --require-megakernel
