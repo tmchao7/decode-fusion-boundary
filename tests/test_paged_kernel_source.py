@@ -46,6 +46,8 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("int64_t kv_cache_layer_stride", kernel_source)
         self.assertIn("static_cast<int64_t>(layer) * kv_cache_layer_stride", kernel_source)
         self.assertIn("static_cast<int64_t>(physical_block)", kernel_source)
+        self.assertIn("#ifdef LDG_FAST_MATH", kernel_source)
+        self.assertIn("return expf(x);", kernel_source)
         self.assertNotIn("maybe_sync_debug();", source)
         self.assertIn('static void maybe_sync_debug(const char *phase);', source)
 

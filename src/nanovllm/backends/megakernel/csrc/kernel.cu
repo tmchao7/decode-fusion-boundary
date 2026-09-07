@@ -151,11 +151,19 @@ __device__ __forceinline__ float ptx_rcp(float x) {
 }
 
 __device__ __forceinline__ float fast_exp(float x) {
+#ifdef LDG_FAST_MATH
   return ptx_exp2(x * LOG2E);
+#else
+  return expf(x);
+#endif
 }
 
 __device__ __forceinline__ float ldg_silu(float x) {
+#ifdef LDG_FAST_MATH
   return x * ptx_rcp(1.0f + fast_exp(-x));
+#else
+  return x / (1.0f + fast_exp(-x));
+#endif
 }
 
 // 128-bit L1-bypassing weight loads

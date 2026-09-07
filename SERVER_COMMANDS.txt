@@ -36,6 +36,9 @@ export NANOVLLM_CUDA_ARCH="${NANOVLLM_CUDA_ARCH:-sm_80}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$REPO/.torch_extensions}"
 export NANOVLLM_CUDA_DEBUG="${NANOVLLM_CUDA_DEBUG:-0}"
+# Use exact CUDA math for correctness. Set to 1 only for a later performance
+# experiment after token-level correctness has passed.
+export NANOVLLM_CUDA_FAST_MATH="${NANOVLLM_CUDA_FAST_MATH:-0}"
 export TORCH_DISABLE_ADDR2LINE="${TORCH_DISABLE_ADDR2LINE:-1}"
 export UV_SYSTEM_CERTS="${UV_SYSTEM_CERTS:-true}"
 export UV_PYTHON_DOWNLOADS=0

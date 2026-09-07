@@ -67,20 +67,24 @@ def kernel_flags() -> list[str]:
         "-DLDG_ATTENTION_VEC4",
         "-DLDG_WEIGHT_LDCS",
         "-DLDG_MLP_SMEM",
+        *(["-DLDG_FAST_MATH"] if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1" else []),
     ]
 
 
 def cuda_flags() -> list[str]:
     flags = [
         "-O3",
-        "--use_fast_math",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         f"-arch={cuda_arch_for_device()}",
         f"-I{_CSRC}",
     ]
-    # Keep normal builds optimized. Compute Sanitizer needs line mappings to
-    # identify the exact CUDA source line for an invalid access.
+    # Correctness builds use IEEE-oriented libdevice math by default. The
+    # approximate path remains opt-in for later performance experiments.
+    if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1":
+        flags.append("--use_fast_math")
+    # Compute Sanitizer needs line mappings to identify the exact CUDA source
+    # line for an invalid access.
     if os.getenv("NANOVLLM_CUDA_SANITIZE") == "1":
         flags.append("-lineinfo")
     return flags + kernel_flags()

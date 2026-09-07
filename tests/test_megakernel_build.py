@@ -27,6 +27,24 @@ class MegakernelBuildTests(unittest.TestCase):
             self.assertIn("-lineinfo", cuda_flags())
 
     @unittest.skipUnless(cuda_flags is not None, "torch is required for build flag tests")
+    def test_default_build_does_not_enable_fast_math(self):
+        if cuda_flags is None:
+            self.skipTest("torch is required for build flag tests")
+        with patch.dict(os.environ, {"NANOVLLM_CUDA_ARCH": "sm_80"}, clear=False):
+            os.environ.pop("NANOVLLM_CUDA_FAST_MATH", None)
+            self.assertNotIn("--use_fast_math", cuda_flags())
+
+    @unittest.skipUnless(cuda_flags is not None, "torch is required for build flag tests")
+    def test_fast_math_can_be_enabled_explicitly(self):
+        if cuda_flags is None:
+            self.skipTest("torch is required for build flag tests")
+        with patch.dict(
+            os.environ,
+            {"NANOVLLM_CUDA_ARCH": "sm_80", "NANOVLLM_CUDA_FAST_MATH": "1"},
+        ):
+            self.assertIn("--use_fast_math", cuda_flags())
+
+    @unittest.skipUnless(cuda_flags is not None, "torch is required for build flag tests")
     def test_normal_build_does_not_add_sanitizer_flags(self):
         with patch.dict(os.environ, {"NANOVLLM_CUDA_ARCH": "sm_80"}, clear=False):
             os.environ.pop("NANOVLLM_CUDA_SANITIZE", None)
