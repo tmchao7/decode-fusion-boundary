@@ -197,6 +197,7 @@ nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 bloc
 ### 尚未完成的真实验证
 
 - A100 上编译 `decode_paged`；
+- A100 上确认 occupancy-limited grid 不再触发跨 block barrier 死锁；
 - block 边界 `255/256/257` token correctness；
 - prefill 写入 cache 后 Megakernel 直接读取 correctness；
 - 新 token 写回 `slot_mapping` 对应物理位置；

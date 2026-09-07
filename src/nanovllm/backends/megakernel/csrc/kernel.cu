@@ -1747,6 +1747,22 @@ static void ensure_barrier_alloc() {
   }
 }
 
+template <typename Kernel>
+static int ldg_resident_grid_blocks(Kernel kernel, int requested) {
+  int device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  int active_blocks = 0;
+  cudaError_t error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &active_blocks, kernel, LDG_BLOCK_SIZE, 0);
+  if (error != cudaSuccess || active_blocks <= 0) {
+    return 0;
+  }
+  int resident_blocks = active_blocks * prop.multiProcessorCount;
+  return min(requested, resident_blocks);
+}
+
 static inline void ldg_configure_kernel_attributes(); // forward decl
 
 extern "C" void launch_ldg_decode_direct(
@@ -1761,8 +1777,17 @@ extern "C" void launch_ldg_decode_direct(
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_direct, LDG_NUM_BLOCKS);
+  if (grid_blocks < LDG_ATTN_BLOCKS) {
+    fprintf(stderr,
+            "Megakernel direct launch requires at least %d resident blocks; "
+            "occupancy allows %d\n",
+            LDG_ATTN_BLOCKS, grid_blocks);
+    return;
+  }
 
-  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+  ldg_decode_kernel_direct<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
       (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
@@ -1795,8 +1820,17 @@ extern "C" void launch_ldg_decode_paged_batch(
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_batch, LDG_NUM_BLOCKS);
+  if (grid_blocks < LDG_ATTN_BLOCKS) {
+    fprintf(stderr,
+            "Megakernel batch launch requires at least %d resident blocks; "
+            "occupancy allows %d\n",
+            LDG_ATTN_BLOCKS, grid_blocks);
+    return;
+  }
 
-  ldg_decode_kernel_batch<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+  ldg_decode_kernel_batch<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
       (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
@@ -1830,6 +1864,15 @@ extern "C" void launch_ldg_decode_persistent(
     int max_seq_len, float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_persistent, LDG_NUM_BLOCKS);
+  if (grid_blocks < LDG_ATTN_BLOCKS) {
+    fprintf(stderr,
+            "Megakernel persistent launch requires at least %d resident blocks; "
+            "occupancy allows %d\n",
+            LDG_ATTN_BLOCKS, grid_blocks);
+    return;
+  }
 
   // Write mutable params via pinned host memory (barriers reset on-device)
   *h_pinned_position = position;
@@ -1839,7 +1882,7 @@ extern "C" void launch_ldg_decode_persistent(
   cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
                   cudaMemcpyHostToDevice, stream);
 
-  ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+  ldg_decode_kernel_persistent<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
       (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
@@ -1873,6 +1916,15 @@ extern "C" void launch_ldg_generate_nosync(
 
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_persistent, LDG_NUM_BLOCKS);
+  if (grid_blocks < LDG_ATTN_BLOCKS) {
+    fprintf(stderr,
+            "Megakernel generate launch requires at least %d resident blocks; "
+            "occupancy allows %d\n",
+            LDG_ATTN_BLOCKS, grid_blocks);
+    return;
+  }
 
   // Allocate device-side step counter
   static int *d_step_counter = nullptr;
@@ -1895,7 +1947,7 @@ extern "C" void launch_ldg_generate_nosync(
   // Each step: persistent kernel -> LM head phase 1 -> LM head phase 2 ->
   // update
   for (int step = 0; step < num_steps; step++) {
-    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+    ldg_decode_kernel_persistent<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
         (const __nv_bfloat16 *)embed_weight, layer_weights,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,

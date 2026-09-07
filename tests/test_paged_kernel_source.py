@@ -16,6 +16,8 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("const int *__restrict__ block_table", source)
         self.assertIn("ldg_decode_kernel_batch", source)
         self.assertIn("ldg_lm_head_fused_batch", source)
+        self.assertIn("ldg_resident_grid_blocks", source)
+        self.assertIn("cudaOccupancyMaxActiveBlocksPerMultiprocessor", source)
 
     def test_paged_operator_is_registered(self):
         source = BINDINGS.read_text(encoding="utf-8")

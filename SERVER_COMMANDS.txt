@@ -36,6 +36,7 @@ export CUDA_VISIBLE_DEVICES="$GPU_SELECTION"
 echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
 nvidia-smi --id="$GPU_SELECTION"
 export TORCH_EXTENSIONS_DIR="$REPO/.torch_extensions"
+export NANOVLLM_CUDA_DEBUG=1
 
 # 3) Activate the existing uv environment.
 source .venv/bin/activate
@@ -75,7 +76,7 @@ python -m nanovllm.backends.megakernel.build \
 PYTHONPATH=src python -m unittest discover -s tests -v
 
 # 10) Minimal single-sequence correctness test.
-CUDA_LAUNCH_BLOCKING=1 \
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m tools.correctness_smoke \
@@ -88,7 +89,7 @@ python -m tools.correctness_smoke \
   2>&1 | tee results/a100_smoke_single.log
 
 # 11) Paged-KV block-boundary correctness test. Default block size is 256.
-CUDA_LAUNCH_BLOCKING=1 \
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m tools.correctness_smoke \
@@ -101,7 +102,7 @@ python -m tools.correctness_smoke \
   2>&1 | tee results/a100_smoke_boundary.log
 
 # 12) Batch correctness test.
-CUDA_LAUNCH_BLOCKING=1 \
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m tools.correctness_smoke \

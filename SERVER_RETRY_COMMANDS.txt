@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Retry commands after a CUDA memory allocation failure.
-# The previous failure was caused by CUDA allocator memory retained by
-# sequential backend runs in one Python process. The code now clears it after
-# each engine/backend. This file also selects an idle preferred GPU.
+# Retry commands after CUDA memory/deadlock failures.
+# The code now clears allocator memory between backend runs, caps cross-block
+# synchronization by runtime occupancy, and this file adds timeout protection.
 
 export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
 export MODEL=/home/t50063365/models/Qwen3-0.6B
@@ -60,7 +59,8 @@ python -m nanovllm.backends.megakernel.build \
 PYTHONPATH=src python -m unittest discover -s tests -v
 
 # Single-sequence correctness; stops on any mismatch or CUDA error.
-CUDA_LAUNCH_BLOCKING=1 \
+# timeout also protects the shell from a future device-side deadlock.
+timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 python -m tools.correctness_smoke \
   "$MODEL" \
