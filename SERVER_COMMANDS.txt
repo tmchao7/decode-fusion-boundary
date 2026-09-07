@@ -254,13 +254,15 @@ run_sanitize() {
   verify_environment
   export NANOVLLM_CUDA_SANITIZE=1
   build_extension
+  local sanitizer_log=results/a100_compute_sanitizer.log
+  set +e
   PYTHONPATH=src \
     timeout 900s \
     compute-sanitizer --tool memcheck \
       --error-exitcode=1 \
       --target-processes all \
       --show-backtrace yes \
-      --print-limit 100 \
+      --print-limit 500 \
       env CUDA_LAUNCH_BLOCKING=1 \
         TORCH_SHOW_CPP_STACKTRACES=0 \
         NANOVLLM_CUDA_DEBUG=1 \
@@ -272,7 +274,19 @@ run_sanitize() {
           --backends torch-eager,megakernel \
           --require-megakernel \
           --json results/a100_compute_sanitizer.json \
-          2>&1 | tee results/a100_compute_sanitizer.log
+          2>&1 | tee "$sanitizer_log"
+  local sanitizer_status=${PIPESTATUS[0]}
+  set -e
+
+  echo
+  echo "===== FIRST COMPUTE-SANITIZER REPORT ====="
+  if ! grep -n -m 1 -B 5 -A 40 -E \
+      'Invalid __global__|Invalid __shared__|Invalid __local__|Address .* out of bounds|misaligned|Race|illegal memory|unspecified launch' \
+      "$sanitizer_log"; then
+    echo "No detailed sanitizer report marker found; inspect $sanitizer_log"
+  fi
+  echo "===== END FIRST COMPUTE-SANITIZER REPORT ====="
+  return "$sanitizer_status"
 }
 
 case "$RUN_MODE" in
