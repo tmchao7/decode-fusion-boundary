@@ -4,6 +4,10 @@ set -euo pipefail
 # Retry commands after CUDA memory/deadlock failures.
 # The code now clears allocator memory between backend runs, caps cross-block
 # synchronization by runtime occupancy, and this file adds timeout protection.
+# If an earlier run was suspended with Ctrl+Z, clean it first in the same shell:
+# jobs -l
+# fg %<job-id>
+# press Ctrl+C, then verify with: nvidia-smi
 
 export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
 export MODEL=/home/t50063365/models/Qwen3-0.6B
