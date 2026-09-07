@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import multiprocessing as mp
 import os
 import random
+import traceback
 from pathlib import Path
 
 from tools.workloads import load_workloads, select_correctness_workloads
@@ -100,6 +102,63 @@ def run_backend(model: str, name: str, prompts, max_tokens: int):
                 print(f"CUDA cleanup skipped after backend failure: {exc}", flush=True)
 
 
+def serialize_backend_result(result: dict) -> dict:
+    """Keep only JSON/IPC-safe data returned from an isolated backend process."""
+
+    return {
+        "outputs": [item["token_ids"] for item in result["outputs"]],
+        "metrics": result["metrics"],
+    }
+
+
+def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int):
+    """Run one CUDA backend in a fresh process and return JSON-safe data."""
+
+    try:
+        result = run_backend(model, name, prompts, max_tokens)
+        connection.send({"ok": True, "result": serialize_backend_result(result)})
+    except BaseException:
+        connection.send({"ok": False, "error": traceback.format_exc()})
+    finally:
+        connection.close()
+
+
+def run_backend_isolated(model: str, name: str, prompts, max_tokens: int) -> dict:
+    """Run a backend in a clean process so CUDA allocator state cannot leak.
+
+    A backend may reserve most of the GPU for its paged KV pool. Reusing the
+    same Python process for the next backend is unsafe even after ``empty_cache``
+    because CUDA Graphs, module references, and allocator state can survive the
+    Python-level cleanup path. The child process exits after one backend.
+    """
+
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_backend_worker,
+        args=(child, model, name, prompts, max_tokens),
+    )
+    process.start()
+    child.close()
+    process.join()
+    payload = parent.recv() if parent.poll() else None
+    parent.close()
+    if payload is None:
+        raise RuntimeError(
+            f"isolated backend process exited without a result: "
+            f"backend={name}, exitcode={process.exitcode}"
+        )
+    if not payload["ok"]:
+        raise RuntimeError(
+            f"isolated backend failed: backend={name}\n{payload['error']}"
+        )
+    if process.exitcode != 0:
+        raise RuntimeError(
+            f"isolated backend exited with code {process.exitcode}: backend={name}"
+        )
+    return payload["result"]
+
+
 def compare_outputs(reference, actual):
     mismatches = []
     first_mismatch = None
@@ -188,11 +247,9 @@ def main() -> None:
         backend_results = {}
         for backend in backend_names:
             print(f"Running correctness: case={case['id']} backend={backend}", flush=True)
-            result = run_backend(args.model, backend, case["prompts"], args.max_tokens)
-            backend_results[backend] = {
-                "outputs": [item["token_ids"] for item in result["outputs"]],
-                "metrics": result["metrics"],
-            }
+            backend_results[backend] = run_backend_isolated(
+                args.model, backend, case["prompts"], args.max_tokens
+            )
         reference = backend_results["torch-eager"]["outputs"]
         checks = {}
         for backend, result in backend_results.items():
