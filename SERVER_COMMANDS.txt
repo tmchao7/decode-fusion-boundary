@@ -236,12 +236,15 @@ run_profile() {
 run_sanitize() {
   mkdir -p results
   verify_environment
+  export NANOVLLM_CUDA_SANITIZE=1
   build_extension
   PYTHONPATH=src \
     timeout 900s \
     compute-sanitizer --tool memcheck \
       --error-exitcode=1 \
       --target-processes all \
+      --show-backtrace yes \
+      --print-limit 100 \
       env CUDA_LAUNCH_BLOCKING=1 \
         TORCH_SHOW_CPP_STACKTRACES=0 \
         NANOVLLM_CUDA_DEBUG=1 \

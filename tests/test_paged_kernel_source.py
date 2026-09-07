@@ -38,6 +38,9 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn('ops.impl("decode_paged_batch"', source)
         self.assertIn('ldg_check_phase("transformer decode"', kernel_source)
         self.assertIn('ldg_check_phase("LM head"', kernel_source)
+        self.assertIn("cudaPeekAtLastError", kernel_source)
+        self.assertIn("cudaLaunchCooperativeKernel", kernel_source)
+        self.assertIn("cudaDevAttrCooperativeLaunch", kernel_source)
         self.assertNotIn("maybe_sync_debug();", source)
         self.assertIn('static void maybe_sync_debug(const char *phase);', source)
 

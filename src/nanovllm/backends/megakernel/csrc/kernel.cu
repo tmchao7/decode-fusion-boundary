@@ -1725,7 +1725,7 @@ static cudaError_t ldg_reset_decode_state(cudaStream_t stream) {
 }
 
 static bool ldg_check_phase(const char *phase, cudaStream_t stream) {
-  cudaError_t error = cudaGetLastError();
+  cudaError_t error = cudaPeekAtLastError();
   if (error != cudaSuccess) {
     fprintf(stderr, "Megakernel %s launch failed: %s\n", phase,
             cudaGetErrorString(error));
@@ -1738,6 +1738,36 @@ static bool ldg_check_phase(const char *phase, cudaStream_t stream) {
               cudaGetErrorString(error));
       return false;
     }
+  }
+  return true;
+}
+
+#define LDG_ARG(value) reinterpret_cast<void *>(&(value))
+
+template <typename Kernel>
+static bool ldg_launch_cooperative(Kernel kernel, int grid_blocks,
+                                   void **args, cudaStream_t stream) {
+  int supported = 0;
+  cudaError_t error = cudaDeviceGetAttribute(
+      &supported, cudaDevAttrCooperativeLaunch, 0);
+  if (error != cudaSuccess) {
+    fprintf(stderr, "Megakernel cooperative-launch query failed: %s\n",
+            cudaGetErrorString(error));
+    return false;
+  }
+  if (!supported) {
+    fprintf(stderr,
+            "Megakernel requires cooperative launch for cross-block sync, "
+            "but the active CUDA device does not support it\n");
+    return false;
+  }
+  error = cudaLaunchCooperativeKernel(
+      reinterpret_cast<const void *>(kernel), dim3(grid_blocks),
+      dim3(LDG_BLOCK_SIZE), args, 0, stream);
+  if (error != cudaSuccess) {
+    fprintf(stderr, "Megakernel cooperative launch failed: %s\n",
+            cudaGetErrorString(error));
+    return false;
   }
   return true;
 }
@@ -1793,17 +1823,25 @@ extern "C" void launch_ldg_decode_direct(
     return;
   }
 
-  ldg_decode_kernel_direct<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
-      (const __nv_bfloat16 *)embed_weight, layer_weights,
-      (const __nv_bfloat16 *)final_norm_weight,
-      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
-      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
-      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
-      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      position, input_token_id, max_seq_len, block_table, block_size,
-      num_cache_blocks, attn_scale);
+  void *kernel_args[] = {
+      LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+      LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+      LDG_ARG(sin_table),           LDG_ARG(k_cache),
+      LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+      LDG_ARG(g_activations),       LDG_ARG(g_residual),
+      LDG_ARG(g_q),                 LDG_ARG(g_k),
+      LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+      LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+      LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+      LDG_ARG(num_layers),          LDG_ARG(position),
+      LDG_ARG(input_token_id),      LDG_ARG(max_seq_len),
+      LDG_ARG(block_table),         LDG_ARG(block_size),
+      LDG_ARG(num_cache_blocks),    LDG_ARG(attn_scale),
+  };
+  if (!ldg_launch_cooperative(ldg_decode_kernel_direct, grid_blocks,
+                              kernel_args, stream))
+    return;
   if (!ldg_check_phase("transformer decode", stream))
     return;
 
@@ -1846,18 +1884,26 @@ extern "C" void launch_ldg_decode_paged_batch(
     return;
   }
 
-  ldg_decode_kernel_batch<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
-      (const __nv_bfloat16 *)embed_weight, layer_weights,
-      (const __nv_bfloat16 *)final_norm_weight,
-      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
-      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
-      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
-      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      (const int64_t *)input_token_ids, (const int64_t *)positions,
-      (const int *)block_tables, batch_size, block_table_stride, block_size,
-      num_cache_blocks, attn_scale);
+  void *kernel_args[] = {
+      LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+      LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+      LDG_ARG(sin_table),           LDG_ARG(k_cache),
+      LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+      LDG_ARG(g_activations),       LDG_ARG(g_residual),
+      LDG_ARG(g_q),                 LDG_ARG(g_k),
+      LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+      LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+      LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+      LDG_ARG(num_layers),          LDG_ARG(input_token_ids),
+      LDG_ARG(positions),            LDG_ARG(block_tables),
+      LDG_ARG(batch_size),           LDG_ARG(block_table_stride),
+      LDG_ARG(block_size),            LDG_ARG(num_cache_blocks),
+      LDG_ARG(attn_scale),
+  };
+  if (!ldg_launch_cooperative(ldg_decode_kernel_batch, grid_blocks,
+                              kernel_args, stream))
+    return;
   if (!ldg_check_phase("transformer decode", stream))
     return;
 
@@ -1908,16 +1954,24 @@ extern "C" void launch_ldg_decode_persistent(
   cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
                   cudaMemcpyHostToDevice, stream);
 
-  ldg_decode_kernel_persistent<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
-      (const __nv_bfloat16 *)embed_weight, layer_weights,
-      (const __nv_bfloat16 *)final_norm_weight,
-      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
-      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
-      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
-      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+  void *kernel_args[] = {
+      LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+      LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+      LDG_ARG(sin_table),           LDG_ARG(k_cache),
+      LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+      LDG_ARG(g_activations),       LDG_ARG(g_residual),
+      LDG_ARG(g_q),                 LDG_ARG(g_k),
+      LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+      LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+      LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+      LDG_ARG(num_layers),          LDG_ARG(d_mutable_position),
+      LDG_ARG(d_mutable_token_id),  LDG_ARG(max_seq_len),
+      LDG_ARG(attn_scale),
+  };
+  if (!ldg_launch_cooperative(ldg_decode_kernel_persistent, grid_blocks,
+                              kernel_args, stream))
+    return;
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
@@ -1979,16 +2033,24 @@ extern "C" void launch_ldg_generate_nosync(
   // Each step: persistent kernel -> LM head phase 1 -> LM head phase 2 ->
   // update
   for (int step = 0; step < num_steps; step++) {
-    ldg_decode_kernel_persistent<<<grid_blocks, LDG_BLOCK_SIZE, 0, stream>>>(
-        (const __nv_bfloat16 *)embed_weight, layer_weights,
-        (const __nv_bfloat16 *)final_norm_weight,
-        (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
-        (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
-        (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
-        (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
-        (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-        d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-        d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+    void *kernel_args[] = {
+        LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+        LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+        LDG_ARG(sin_table),           LDG_ARG(k_cache),
+        LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+        LDG_ARG(g_activations),       LDG_ARG(g_residual),
+        LDG_ARG(g_q),                 LDG_ARG(g_k),
+        LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+        LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+        LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+        LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+        LDG_ARG(num_layers),          LDG_ARG(d_mutable_position),
+        LDG_ARG(d_mutable_token_id),  LDG_ARG(max_seq_len),
+        LDG_ARG(attn_scale),
+    };
+    if (!ldg_launch_cooperative(ldg_decode_kernel_persistent, grid_blocks,
+                                kernel_args, stream))
+      return;
 
     cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
     ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
@@ -2003,6 +2065,8 @@ extern "C" void launch_ldg_generate_nosync(
   }
 }
 
+// Cross-block synchronization in the decode kernels is valid only when the
+// whole grid is launched cooperatively and all blocks are resident together.
 static inline void ldg_configure_kernel_attributes() {
   static bool configured = false;
   if (configured) {
@@ -2019,3 +2083,5 @@ static inline void ldg_configure_kernel_attributes() {
                        cudaFuncAttributePreferredSharedMemoryCarveout,
                        cudaSharedmemCarveoutMaxL1);
 }
+
+#undef LDG_ARG
