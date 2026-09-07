@@ -21,6 +21,34 @@
 
 static void maybe_sync_debug(const char *phase);
 
+static void validate_paged_metadata(const torch::Tensor &block_table,
+                                    const torch::Tensor &k_cache,
+                                    int64_t position, int64_t block_size,
+                                    int64_t num_cache_blocks) {
+  if (std::getenv("NANOVLLM_CUDA_DEBUG") == nullptr)
+    return;
+
+  auto host_table = block_table.to(torch::kCPU).contiguous();
+  const int *values = host_table.data_ptr<int>();
+  const int64_t required = position / block_size + 1;
+  TORCH_CHECK(required <= host_table.numel(),
+              "paged block table is too short: required=", required,
+              " entries, actual=", host_table.numel());
+  std::fprintf(stderr,
+               "Megakernel paged metadata: position=%ld block_size=%ld "
+               "num_cache_blocks=%ld table_numel=%ld k_cache_ptr=%p\\n",
+               static_cast<long>(position), static_cast<long>(block_size),
+               static_cast<long>(num_cache_blocks),
+               static_cast<long>(host_table.numel()), k_cache.data_ptr());
+  for (int64_t i = 0; i < required; ++i) {
+    TORCH_CHECK(values[i] >= 0 && values[i] < num_cache_blocks,
+                "invalid paged physical block: index=", i,
+                " value=", values[i], " num_cache_blocks=", num_cache_blocks);
+    std::fprintf(stderr, "  block_table[%ld]=%d\\n", static_cast<long>(i),
+                 values[i]);
+  }
+}
+
 struct LDGLayerWeights {
   const void *input_layernorm_weight;
   const void *q_proj_weight;
@@ -146,6 +174,8 @@ void decode_paged(
               "paged KV cache shape does not match Qwen3-0.6B metadata");
   TORCH_CHECK(block_table.numel() >= (position / block_size) + 1,
               "block_table is too short for the requested position");
+  validate_paged_metadata(block_table, k_cache, position, block_size,
+                          num_cache_blocks);
 
   launch_ldg_decode_direct(
       static_cast<int>(input_token_id),
@@ -211,6 +241,24 @@ void decode_paged_batch(
               "paged KV cache shape does not match Qwen3-0.6B metadata");
   TORCH_CHECK(block_size > 0 && num_cache_blocks > 0,
               "block_size and num_cache_blocks must be positive");
+  if (std::getenv("NANOVLLM_CUDA_DEBUG") != nullptr) {
+    auto host_tables = block_tables.to(torch::kCPU).contiguous();
+    auto host_positions = positions.to(torch::kCPU).contiguous();
+    const int *tables = host_tables.data_ptr<int>();
+    const int64_t *pos = host_positions.data_ptr<int64_t>();
+    for (int64_t row = 0; row < block_tables.size(0); ++row) {
+      int64_t required = pos[row] / block_size + 1;
+      TORCH_CHECK(required <= block_tables.size(1),
+                  "paged batch block table is too short for row=", row);
+      for (int64_t col = 0; col < required; ++col) {
+        int value = tables[row * block_tables.size(1) + col];
+        TORCH_CHECK(value >= 0 && value < num_cache_blocks,
+                    "invalid paged batch physical block: row=", row,
+                    " col=", col, " value=", value,
+                    " num_cache_blocks=", num_cache_blocks);
+      }
+    }
+  }
 
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   launch_ldg_decode_paged_batch(

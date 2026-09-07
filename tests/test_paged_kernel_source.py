@@ -41,6 +41,8 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("cudaPeekAtLastError", kernel_source)
         self.assertIn("cudaLaunchCooperativeKernel", kernel_source)
         self.assertIn("cudaDevAttrCooperativeLaunch", kernel_source)
+        self.assertIn("validate_paged_metadata", source)
+        self.assertIn("invalid paged physical block", source)
         self.assertNotIn("maybe_sync_debug();", source)
         self.assertIn('static void maybe_sync_debug(const char *phase);', source)
 
