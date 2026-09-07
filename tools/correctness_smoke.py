@@ -272,7 +272,9 @@ def main() -> None:
                 )
             if mismatches:
                 raise SystemExit(
-                    f"correctness failed for {backend}/{case['id']}: requests {mismatches}"
+                    f"correctness failed for {backend}/{case['id']}: "
+                    f"requests {mismatches}; first_mismatch={first_mismatch}; "
+                    f"reference_outputs={reference}; actual_outputs={result['outputs']}"
                 )
         results.append(
             {
