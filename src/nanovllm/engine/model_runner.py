@@ -122,8 +122,18 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        available_for_kv = total * config.gpu_memory_utilization - used - peak + current
+        config.num_kvcache_blocks = int(available_for_kv) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(
+                "Insufficient free GPU memory for KV cache: "
+                f"GPU total={total / 2**30:.2f} GiB, "
+                f"free={free / 2**30:.2f} GiB, "
+                f"model/current allocation={used / 2**30:.2f} GiB, "
+                f"peak allocation={peak / 2**30:.2f} GiB, "
+                f"requested utilization={config.gpu_memory_utilization:.2f}. "
+                "Select an idle GPU with CUDA_VISIBLE_DEVICES or stop other GPU jobs."
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

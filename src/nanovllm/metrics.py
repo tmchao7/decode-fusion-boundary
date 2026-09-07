@@ -48,6 +48,8 @@ class CudaEventTimer:
 
     def __init__(self):
         self.enabled = False
+        self.started = False
+        self.stopped = False
         self.start_event = None
         self.end_event = None
         try:
@@ -63,16 +65,22 @@ class CudaEventTimer:
     def start(self) -> None:
         if self.enabled:
             self.start_event.record()
+            self.started = True
+            self.stopped = False
 
     def stop(self) -> None:
-        if self.enabled:
+        if self.enabled and self.started:
             self.end_event.record()
+            self.stopped = True
 
     def elapsed_seconds(self) -> float | None:
-        if not self.enabled:
+        if not self.enabled or not self.started or not self.stopped:
             return None
-        self.end_event.synchronize()
-        return self.start_event.elapsed_time(self.end_event) / 1000.0
+        try:
+            self.end_event.synchronize()
+            return self.start_event.elapsed_time(self.end_event) / 1000.0
+        except (RuntimeError, ValueError):
+            return None
 
 
 @dataclass

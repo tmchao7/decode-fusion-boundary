@@ -1,0 +1,54 @@
+# Retry commands after the first A100 correctness attempt.
+# The previous log showed two separate issues:
+# 1) the CUDA-event unit test did not handle an unrecorded event;
+# 2) the selected GPU had insufficient free memory for nano-vLLM's KV pool.
+
+export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
+export MODEL=/home/t50063365/models/Qwen3-0.6B
+cd "$REPO"
+
+git fetch origin
+git switch codex/paged-kv-megakernel-integration
+git pull --ff-only
+git log -1 --oneline
+
+source .venv/bin/activate
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
+export NANOVLLM_CUDA_ARCH=sm_80
+export CUDA_VISIBLE_DEVICES=0
+
+# Inspect GPU 0 before running. Do not kill unknown processes blindly.
+nvidia-smi --id=0
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader
+
+# Re-run local tests. The CUDA event test should now pass even with CUDA enabled.
+PYTHONPATH=src python -m unittest discover -s tests -v
+
+# Re-run the single-sequence correctness test on only GPU 0.
+CUDA_LAUNCH_BLOCKING=1 \
+TORCH_SHOW_CPP_STACKTRACES=1 \
+NANOVLLM_CUDA_ARCH=sm_80 \
+CUDA_VISIBLE_DEVICES=0 \
+python -m tools.correctness_smoke \
+  "$MODEL" \
+  --prompt-lengths 8,32 \
+  --batch-sizes 1 \
+  --max-tokens 8 \
+  --require-megakernel \
+  --json results/a100_smoke_single_retry.json \
+  2>&1 | tee results/a100_smoke_single_retry.log
+
+# Only after the single-sequence test passes, run boundary correctness.
+CUDA_LAUNCH_BLOCKING=1 \
+TORCH_SHOW_CPP_STACKTRACES=1 \
+NANOVLLM_CUDA_ARCH=sm_80 \
+CUDA_VISIBLE_DEVICES=0 \
+python -m tools.correctness_smoke \
+  "$MODEL" \
+  --prompt-lengths 255,256,257,512 \
+  --batch-sizes 1 \
+  --max-tokens 8 \
+  --require-megakernel \
+  --json results/a100_smoke_boundary_retry.json \
+  2>&1 | tee results/a100_smoke_boundary_retry.log
