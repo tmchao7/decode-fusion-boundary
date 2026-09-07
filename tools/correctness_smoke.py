@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -88,6 +89,9 @@ def run_backend(model: str, name: str, prompts, max_tokens: int):
         return result
     finally:
         llm.exit()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def compare_outputs(reference, actual):
@@ -177,6 +181,7 @@ def main() -> None:
     for case in cases:
         backend_results = {}
         for backend in backend_names:
+            print(f"Running correctness: case={case['id']} backend={backend}", flush=True)
             result = run_backend(args.model, backend, case["prompts"], args.max_tokens)
             backend_results[backend] = {
                 "outputs": [item["token_ids"] for item in result["outputs"]],

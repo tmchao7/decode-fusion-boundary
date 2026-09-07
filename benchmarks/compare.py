@@ -8,6 +8,7 @@ requests separately. CUDA profiling stays outside latency measurements.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import random
 import subprocess
@@ -247,6 +248,9 @@ def run_case(
 
     finally:
         llm.exit()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def mark_correctness(experiments: list[dict[str, Any]]) -> None:

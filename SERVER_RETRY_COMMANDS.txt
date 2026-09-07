@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Retry after a KV-cache allocation failure. This file uses only the preferred
-# physical GPUs 5, 6, 1, 3 and stops at the first failing command.
+# Retry commands after a CUDA memory allocation failure.
+# The previous failure was caused by CUDA allocator memory retained by
+# sequential backend runs in one Python process. The code now clears it after
+# each engine/backend. This file also selects an idle preferred GPU.
+
 export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
 export MODEL=/home/t50063365/models/Qwen3-0.6B
 cd "$REPO"
@@ -16,15 +19,16 @@ export TOKENIZERS_PARALLELISM=false
 export NANOVLLM_CUDA_ARCH=sm_80
 
 GPU_SELECTION=""
+GPU_CANDIDATES="/tmp/nanovllm_gpu_candidates.$$"
+trap 'rm -f "$GPU_CANDIDATES"' EXIT
 for candidate in 5 6 1 3; do
   free_mb="$(nvidia-smi --id="$candidate" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')"
   if [ -n "$free_mb" ]; then
-    printf '%s %s\n' "$free_mb" "$candidate" >> /tmp/nanovllm_gpu_candidates.$$
+    printf '%s %s\n' "$free_mb" "$candidate" >> "$GPU_CANDIDATES"
   fi
 done
-if [ -f /tmp/nanovllm_gpu_candidates.$$ ]; then
-  GPU_SELECTION="$(sort -nr /tmp/nanovllm_gpu_candidates.$$ | awk 'NR == 1 {print $2}')"
-  rm -f /tmp/nanovllm_gpu_candidates.$$
+if [ -f "$GPU_CANDIDATES" ]; then
+  GPU_SELECTION="$(sort -nr "$GPU_CANDIDATES" | awk 'NR == 1 {print $2}')"
 fi
 if [ -z "$GPU_SELECTION" ]; then
   echo "ERROR: none of preferred GPUs 5,6,1,3 is visible." >&2
@@ -34,14 +38,12 @@ export CUDA_VISIBLE_DEVICES="$GPU_SELECTION"
 echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
 nvidia-smi --id="$GPU_SELECTION"
 
-# Verify model and environment on the selected GPU.
 NANOVLLM_MODEL_PATH="$MODEL" \
 python -m tools.verify_server_env --require-megakernel
 
-# Re-run tests. CUDA Event tests are safe even when events are unrecorded.
 PYTHONPATH=src python -m unittest discover -s tests -v
 
-# Re-run single-sequence correctness.
+# Single-sequence correctness; stops on any mismatch or CUDA error.
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 python -m tools.correctness_smoke \
@@ -53,7 +55,7 @@ python -m tools.correctness_smoke \
   --json results/a100_smoke_single_retry.json \
   2>&1 | tee results/a100_smoke_single_retry.log
 
-# Re-run block-boundary correctness only after the previous command passes.
+# Block-boundary correctness; only reached if the previous command passed.
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 python -m tools.correctness_smoke \

@@ -1,6 +1,7 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
+import torch
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -43,6 +44,9 @@ class LLMEngine:
         self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
+        # Each benchmark backend is created in the same Python process. Release
+        # PyTorch's cached CUDA blocks so the next backend sees real free memory.
+        torch.cuda.empty_cache()
         for p in self.ps:
             p.join()
 
