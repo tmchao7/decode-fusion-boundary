@@ -18,14 +18,26 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("ldg_lm_head_fused_batch", source)
         self.assertIn("ldg_resident_grid_blocks", source)
         self.assertIn("cudaOccupancyMaxActiveBlocksPerMultiprocessor", source)
+        self.assertIn("ldg_reset_decode_state", source)
+        self.assertIn("AtomicGridSync grid", source)
+        self.assertIn("(unsigned int)gridDim.x,\n                      0", source)
+        self.assertNotIn(
+            """if (block_id == 0 && threadIdx.x == 0) {
+    *barrier_counter = 0;
+    *barrier_sense = 0;""",
+            source,
+        )
 
     def test_paged_operator_is_registered(self):
         source = BINDINGS.read_text(encoding="utf-8")
+        kernel_source = KERNEL.read_text(encoding="utf-8")
         self.assertIn('ops.def("decode_paged', source)
         self.assertIn('ops.impl("decode_paged"', source)
         self.assertIn("block_table.data_ptr<int>()", source)
         self.assertIn('ops.def("decode_paged_batch', source)
         self.assertIn('ops.impl("decode_paged_batch"', source)
+        self.assertIn('ldg_check_phase("transformer decode"', kernel_source)
+        self.assertIn('ldg_check_phase("LM head"', kernel_source)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import atexit
 from dataclasses import fields
 from time import perf_counter
+import warnings
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -47,12 +48,20 @@ class LLMEngine:
         if self._exited:
             return
         self._exited = True
-        self.model_runner.call("exit")
+        try:
+            self.model_runner.call("exit")
+        except Exception as exc:
+            # Preserve the original inference exception. CUDA cleanup can fail
+            # again after a device-side fault and must not replace it.
+            warnings.warn(f"nano-vLLM cleanup warning: {exc}", RuntimeWarning)
         del self.model_runner
         # Each benchmark backend is created in the same Python process. Release
         # PyTorch's cached CUDA blocks so the next backend sees real free memory.
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        except Exception as exc:
+            warnings.warn(f"nano-vLLM CUDA cache cleanup warning: {exc}", RuntimeWarning)
         for p in self.ps:
             p.join()
 

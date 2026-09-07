@@ -23,6 +23,12 @@ decode_paged 直接读取/写回同一份 cache
 旧的 private contiguous cache 和 prompt replay 只保留在 reference 代码中，
 不应再被 nano-vLLM 集成路径使用。A100 上的 CUDA correctness 仍需服务器验证。
 
+最近服务器暴露的非法显存访问已完成第一轮根因修复：Megakernel 的跨 block
+barrier/flag 改为由 host 在同一 CUDA stream 上初始化，移除了 block 0 在 kernel
+内部进行全局重置的竞态；同时增加了 transformer decode 与 LM head 的分阶段
+CUDA 错误检查。该修复仍必须通过服务器重编译和 token-level correctness，暂不
+标记为“已关闭”。
+
 理想数据流应为：
 
 ```text

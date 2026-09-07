@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
@@ -1409,32 +1410,9 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
 
-  // Reset barrier counters + flags on-device
-  if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
-    atomicExch(kv_flag, 0u);
-    atomicExch(attn_flag, 0u);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-    unsigned int arrived = atomicAdd(barrier_counter, 1);
-    if (arrived == (unsigned int)num_blocks - 1) {
-      *barrier_counter = 0;
-      asm volatile("fence.acq_rel.gpu;" ::: "memory");
-      atomicAdd(barrier_sense, 1);
-    } else {
-      volatile unsigned int *vg = (volatile unsigned int *)barrier_sense;
-      while (*vg == 0) {
-      }
-    }
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-  }
-  __syncthreads();
-
+  // Host-side stream reset precedes this kernel launch.
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
-                      1};
+                      0};
 
   // First layer reads embed row directly (no separate embed + barrier needed)
   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
@@ -1530,31 +1508,11 @@ __device__ void ldg_decode_one(
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
 
-  if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
-    atomicExch(kv_flag, 0u);
-    atomicExch(attn_flag, 0u);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-    unsigned int arrived = atomicAdd(barrier_counter, 1);
-    if (arrived == (unsigned int)num_blocks - 1) {
-      *barrier_counter = 0;
-      asm volatile("fence.acq_rel.gpu;" ::: "memory");
-      atomicAdd(barrier_sense, 1);
-    } else {
-      volatile unsigned int *vg = (volatile unsigned int *)barrier_sense;
-      while (*vg == 0) {
-      }
-    }
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-  }
-  __syncthreads();
-
+  // The host resets barrier_counter/barrier_sense/flags on the launch stream
+  // before this kernel starts. Do not reset them from block 0: block scheduling
+  // order is unspecified and other blocks may arrive first.
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
-                      1};
+                      0};
 
   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
 
@@ -1748,6 +1706,42 @@ static void ensure_barrier_alloc() {
   }
 }
 
+static cudaError_t ldg_reset_decode_state(cudaStream_t stream) {
+  cudaError_t error = cudaMemsetAsync(d_barrier_counter, 0,
+                                      sizeof(unsigned int), stream);
+  if (error != cudaSuccess)
+    return error;
+  error = cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
+  if (error != cudaSuccess)
+    return error;
+  error = cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
+  if (error != cudaSuccess)
+    return error;
+  error = cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
+  if (error != cudaSuccess)
+    return error;
+  return cudaMemsetAsync(d_lm_head_counter, 0,
+                         sizeof(unsigned int) * LDG_MAX_BATCH, stream);
+}
+
+static bool ldg_check_phase(const char *phase, cudaStream_t stream) {
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    fprintf(stderr, "Megakernel %s launch failed: %s\n", phase,
+            cudaGetErrorString(error));
+    return false;
+  }
+  if (std::getenv("NANOVLLM_CUDA_DEBUG") != nullptr) {
+    error = cudaStreamSynchronize(stream);
+    if (error != cudaSuccess) {
+      fprintf(stderr, "Megakernel %s failed: %s\n", phase,
+              cudaGetErrorString(error));
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename Kernel>
 static int ldg_resident_grid_blocks(Kernel kernel, int requested) {
   int device = 0;
@@ -1766,6 +1760,11 @@ static int ldg_resident_grid_blocks(Kernel kernel, int requested) {
 
 static inline void ldg_configure_kernel_attributes(); // forward decl
 
+// Decode state is reset by the host on the same stream immediately before each
+// launch. It must not be reset by block 0 inside the kernel: CUDA provides no
+// ordering guarantee that block 0 starts before the other resident blocks.
+static cudaError_t ldg_reset_decode_state(cudaStream_t stream);
+
 extern "C" void launch_ldg_decode_direct(
     int input_token_id, int *output_token_id, const void *embed_weight,
     const LDGLayerWeights *layer_weights, const void *final_norm_weight,
@@ -1778,6 +1777,12 @@ extern "C" void launch_ldg_decode_direct(
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  cudaError_t reset_error = ldg_reset_decode_state(stream);
+  if (reset_error != cudaSuccess) {
+    fprintf(stderr, "Megakernel decode-state reset failed: %s\n",
+            cudaGetErrorString(reset_error));
+    return;
+  }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_direct, LDG_NUM_BLOCKS);
   if (grid_blocks < LDG_ATTN_BLOCKS) {
@@ -1799,12 +1804,16 @@ extern "C" void launch_ldg_decode_direct(
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
       position, input_token_id, max_seq_len, block_table, block_size,
       num_cache_blocks, attn_scale);
+  if (!ldg_check_phase("transformer decode", stream))
+    return;
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
       (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
       d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+  if (!ldg_check_phase("LM head", stream))
+    return;
 }
 
 extern "C" void launch_ldg_decode_paged_batch(
@@ -1821,6 +1830,12 @@ extern "C" void launch_ldg_decode_paged_batch(
     float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  cudaError_t reset_error = ldg_reset_decode_state(stream);
+  if (reset_error != cudaSuccess) {
+    fprintf(stderr, "Megakernel decode-state reset failed: %s\n",
+            cudaGetErrorString(reset_error));
+    return;
+  }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_batch, LDG_NUM_BLOCKS);
   if (grid_blocks < LDG_ATTN_BLOCKS) {
@@ -1843,6 +1858,8 @@ extern "C" void launch_ldg_decode_paged_batch(
       (const int64_t *)input_token_ids, (const int64_t *)positions,
       (const int *)block_tables, batch_size, block_table_stride, block_size,
       num_cache_blocks, attn_scale);
+  if (!ldg_check_phase("transformer decode", stream))
+    return;
 
   cudaMemsetAsync(d_lm_head_counter, 0,
                   sizeof(unsigned int) * batch_size, stream);
@@ -1852,6 +1869,8 @@ extern "C" void launch_ldg_decode_paged_batch(
       (float *)block_max_vals, (int *)block_max_idxs, output_token_ids,
       d_lm_head_counter, LDG_LM_NUM_BLOCKS, batch_size, HIDDEN_SIZE,
       LDG_LM_NUM_BLOCKS);
+  if (!ldg_check_phase("LM head", stream))
+    return;
 }
 
 extern "C" void launch_ldg_decode_persistent(
@@ -1865,6 +1884,12 @@ extern "C" void launch_ldg_decode_persistent(
     int max_seq_len, float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  cudaError_t reset_error = ldg_reset_decode_state(stream);
+  if (reset_error != cudaSuccess) {
+    fprintf(stderr, "Megakernel decode-state reset failed: %s\n",
+            cudaGetErrorString(reset_error));
+    return;
+  }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_persistent, LDG_NUM_BLOCKS);
   if (grid_blocks < LDG_ATTN_BLOCKS) {
@@ -1917,6 +1942,12 @@ extern "C" void launch_ldg_generate_nosync(
 
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
+  cudaError_t reset_error = ldg_reset_decode_state(stream);
+  if (reset_error != cudaSuccess) {
+    fprintf(stderr, "Megakernel decode-state reset failed: %s\n",
+            cudaGetErrorString(reset_error));
+    return;
+  }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_persistent, LDG_NUM_BLOCKS);
   if (grid_blocks < LDG_ATTN_BLOCKS) {

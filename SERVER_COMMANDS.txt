@@ -14,6 +14,7 @@ set -euo pipefail
 #   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean A100 Megakernel rebuild
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # controlled A/B benchmark
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
+#   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
 # The file is intentionally the only checked-in server command file. Update this
@@ -34,7 +35,8 @@ export TOKENIZERS_PARALLELISM=false
 export NANOVLLM_CUDA_ARCH="${NANOVLLM_CUDA_ARCH:-sm_80}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$REPO/.torch_extensions}"
-export NANOVLLM_CUDA_DEBUG="${NANOVLLM_CUDA_DEBUG:-1}"
+export NANOVLLM_CUDA_DEBUG="${NANOVLLM_CUDA_DEBUG:-0}"
+export TORCH_DISABLE_ADDR2LINE="${TORCH_DISABLE_ADDR2LINE:-1}"
 export UV_SYSTEM_CERTS="${UV_SYSTEM_CERTS:-true}"
 export UV_PYTHON_DOWNLOADS=0
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
@@ -87,6 +89,8 @@ PY
 
 build_extension() {
   mkdir -p results
+  # Never reuse an extension compiled before the current kernel source change.
+  rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
   python -m nanovllm.backends.megakernel.build \
     2>&1 | tee results/a100_build.log
   echo "Megakernel build: OK"
@@ -95,6 +99,7 @@ build_extension() {
 run_correctness() {
   mkdir -p results
   verify_environment
+  build_extension
   verify_extension_import
 
   PYTHONPATH=src python -m unittest discover -s tests -v
@@ -228,6 +233,29 @@ run_profile() {
       --warmup 1 --runs 1
 }
 
+run_sanitize() {
+  mkdir -p results
+  verify_environment
+  build_extension
+  PYTHONPATH=src \
+    timeout 900s \
+    compute-sanitizer --tool memcheck \
+      --error-exitcode=1 \
+      --target-processes all \
+      env CUDA_LAUNCH_BLOCKING=1 \
+        TORCH_SHOW_CPP_STACKTRACES=0 \
+        NANOVLLM_CUDA_DEBUG=1 \
+        python -m tools.correctness_smoke \
+          "$MODEL" \
+          --prompt-lengths 8 \
+          --batch-sizes 1 \
+          --max-tokens 2 \
+          --backends torch-eager,megakernel \
+          --require-megakernel \
+          --json results/a100_compute_sanitizer.json \
+          2>&1 | tee results/a100_compute_sanitizer.log
+}
+
 case "$RUN_MODE" in
   model)
     run_model_download
@@ -255,16 +283,19 @@ case "$RUN_MODE" in
     select_gpu
     run_profile
     ;;
+  sanitize)
+    select_gpu
+    run_sanitize
+    ;;
   all)
     select_gpu
     verify_environment
-    build_extension
     run_correctness
     run_benchmark
     ;;
   *)
     echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
-    echo "Use: model, verify, build, correctness, benchmark, profile, or all." >&2
+    echo "Use: model, verify, build, correctness, benchmark, profile, sanitize, or all." >&2
     exit 2
     ;;
 esac

@@ -50,6 +50,7 @@ class ModelRunner:
         self.megakernel = None
         self.last_backend_used = "torch"
         self.last_fallback_reason = None
+        self._cuda_poisoned = False
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -78,7 +79,11 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        # A device-side kernel fault poisons the CUDA stream. Synchronizing
+        # again during cleanup would mask the original exception with a second
+        # "illegal memory access" and make diagnosis harder.
+        if not self._cuda_poisoned:
+            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -291,9 +296,10 @@ class ModelRunner:
                     # cache may have been updated. Do not silently produce
                     # incorrect tokens by falling back after that point.
                     if self.megakernel.decoder is not None:
+                        self._cuda_poisoned = True
                         raise RuntimeError(
-                            "Megakernel decode failed after initialization; "
-                            "restart with decode_backend=\"torch\""
+                            "Megakernel decode failed after initialization: "
+                            f"{exc}; restart with decode_backend=\"torch\""
                         ) from exc
                     self.megakernel.disable(str(exc))
                     self.last_fallback_reason = str(exc)
