@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>

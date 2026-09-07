@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Rebuild only after the kernel compilation fix.
+# Run on the A100 server. This file does not run inference.
+
+export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
+export MODEL=/home/t50063365/models/Qwen3-0.6B
+cd "$REPO"
+
+git fetch origin
+git switch codex/paged-kv-megakernel-integration
+git pull --ff-only
+source .venv/bin/activate
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
+export NANOVLLM_CUDA_ARCH=sm_80
+export TORCH_CUDA_ARCH_LIST=8.0
+export CUDA_VISIBLE_DEVICES=6
+export TORCH_EXTENSIONS_DIR="$REPO/.torch_extensions"
+export UV_SYSTEM_CERTS=true
+export UV_PYTHON_DOWNLOADS=0
+export UV_LINK_MODE=copy
+export UV_HTTP_TIMEOUT=300
+export NANOVLLM_PYPI_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple/
+
+mkdir -p results
+nvidia-smi --id=6
+rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
+
+# Compile only. Do not continue to correctness until this succeeds.
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m nanovllm.backends.megakernel.build \
+  2>&1 | tee results/a100_build_retry.log
+
+# This should be the final line after a successful build.
+echo "Megakernel build retry: OK"
