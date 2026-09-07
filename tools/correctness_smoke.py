@@ -88,10 +88,16 @@ def run_backend(model: str, name: str, prompts, max_tokens: int):
             torch.cuda.synchronize()
         return result
     finally:
+        # If a Megakernel device fault occurred, CUDA is poisoned for this
+        # process. Avoid a second empty_cache() failure masking the original
+        # transformer/LM-head error and terminate this isolated backend run.
         llm.exit()
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception as exc:
+                print(f"CUDA cleanup skipped after backend failure: {exc}", flush=True)
 
 
 def compare_outputs(reference, actual):

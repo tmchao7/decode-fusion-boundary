@@ -94,14 +94,14 @@ void decode(torch::Tensor output_token, int64_t input_token_id,
       static_cast<int>(max_seq_len), nullptr, static_cast<int>(max_seq_len), 1,
       static_cast<float>(attn_scale),
       c10::cuda::getCurrentCUDAStream().stream());
+  maybe_sync_debug("decode");
 }
 
-static void maybe_sync_debug() {
+static void maybe_sync_debug(const char *phase) {
   if (std::getenv("NANOVLLM_CUDA_DEBUG") != nullptr) {
     auto error = cudaDeviceSynchronize();
-    TORCH_CHECK(error == cudaSuccess,
-                "Megakernel CUDA execution failed: ",
-                cudaGetErrorString(error));
+    TORCH_CHECK(error == cudaSuccess, "Megakernel ", phase,
+                " failed: ", cudaGetErrorString(error));
   }
 }
 
@@ -159,7 +159,6 @@ void decode_paged(
       static_cast<int>(block_size * num_cache_blocks), block_table.data_ptr<int>(),
       static_cast<int>(block_size), static_cast<int>(num_cache_blocks),
       static_cast<float>(attn_scale), c10::cuda::getCurrentCUDAStream().stream());
-  maybe_sync_debug();
 }
 
 void decode_paged_batch(
@@ -225,7 +224,6 @@ void decode_paged_batch(
       static_cast<int>(num_layers), static_cast<int>(input_token_ids.numel()),
       static_cast<int>(block_tables.size(1)), static_cast<int>(block_size),
       static_cast<int>(num_cache_blocks), static_cast<float>(attn_scale), stream);
-  maybe_sync_debug();
 }
 
 extern "C" void launch_ldg_generate_nosync(

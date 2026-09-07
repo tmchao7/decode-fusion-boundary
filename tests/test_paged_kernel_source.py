@@ -38,6 +38,7 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn('ops.impl("decode_paged_batch"', source)
         self.assertIn('ldg_check_phase("transformer decode"', kernel_source)
         self.assertIn('ldg_check_phase("LM head"', kernel_source)
+        self.assertNotIn("maybe_sync_debug();", source)
 
 
 if __name__ == "__main__":
