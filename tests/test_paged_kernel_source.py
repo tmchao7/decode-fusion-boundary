@@ -39,6 +39,7 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn('ldg_check_phase("transformer decode"', kernel_source)
         self.assertIn('ldg_check_phase("LM head"', kernel_source)
         self.assertNotIn("maybe_sync_debug();", source)
+        self.assertIn('static void maybe_sync_debug(const char *phase);', source)
 
 
 if __name__ == "__main__":

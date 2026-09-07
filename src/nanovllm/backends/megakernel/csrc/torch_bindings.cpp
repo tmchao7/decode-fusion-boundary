@@ -19,6 +19,8 @@
     return PyModule_Create(&module);                                           \
   }
 
+static void maybe_sync_debug(const char *phase);
+
 struct LDGLayerWeights {
   const void *input_layernorm_weight;
   const void *q_proj_weight;
