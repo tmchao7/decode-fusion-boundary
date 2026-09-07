@@ -1421,7 +1421,6 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   int input_token_id = *d_token_id;
   int cache_len = position + 1;
   int block_id = blockIdx.x;
-  int num_blocks = gridDim.x;
 
   // Host-side stream reset precedes this kernel launch.
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
@@ -1521,13 +1520,22 @@ __device__ void ldg_decode_one(
 
   int cache_len = position + 1;
   int block_id = blockIdx.x;
-  int num_blocks = gridDim.x;
 
-  // The host resets barrier_counter/barrier_sense/flags on the launch stream
-  // before this kernel starts. Do not reset them from block 0: block scheduling
-  // order is unspecified and other blocks may arrive first.
+  // The host resets the counter before the launch. For batch decode, this
+  // function is called once per sequence, so seed the local generation from
+  // the current global generation rather than restarting at zero.
+  unsigned int initial_generation = *barrier_sense;
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
-                      0};
+                      initial_generation};
+
+  // Flags are per-sequence state. Reset them only after the previous sequence
+  // has completed its final grid barrier; this block-0 write is followed by a
+  // grid barrier and never races with a counter reset.
+  if (block_id == 0 && threadIdx.x == 0) {
+    atomicExch(kv_flag, 0u);
+    atomicExch(attn_flag, 0u);
+  }
+  grid.sync();
 
   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
 

@@ -31,6 +31,12 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        # Megakernel owns the decode path; capturing a second CUDA-Graph is
+        # unnecessary overhead. Unsupported Megakernel requests still use the
+        # eager torch path through this flag.
+        self.use_cudagraph = (
+            not self.enforce_eager and config.decode_backend != "megakernel"
+        )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -57,7 +63,7 @@ class ModelRunner:
         if config.decode_backend == "megakernel":
             self.megakernel = MegakernelBackend(config, self.model)
             self.megakernel.set_kv_cache(self.kv_cache)
-        if not self.enforce_eager:
+        if self.use_cudagraph:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -77,7 +83,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if self.use_cudagraph:
             del self.graphs, self.graph_pool
         # A device-side kernel fault poisons the CUDA stream. Synchronizing
         # again during cleanup would mask the original exception with a second
@@ -249,7 +255,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or not self.use_cudagraph or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
