@@ -35,6 +35,7 @@ fi
 export CUDA_VISIBLE_DEVICES="$GPU_SELECTION"
 echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
 nvidia-smi --id="$GPU_SELECTION"
+export TORCH_EXTENSIONS_DIR="$REPO/.torch_extensions"
 
 # 3) Activate the existing uv environment.
 source .venv/bin/activate

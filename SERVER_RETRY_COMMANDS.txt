@@ -17,6 +17,8 @@ source .venv/bin/activate
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export NANOVLLM_CUDA_ARCH=sm_80
+export TORCH_CUDA_ARCH_LIST=8.0
+export NANOVLLM_CUDA_DEBUG=1
 export UV_SYSTEM_CERTS=true
 export UV_PYTHON_DOWNLOADS=0
 export UV_LINK_MODE=copy
@@ -44,8 +46,16 @@ echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
 nvidia-smi --id="$GPU_SELECTION"
 mkdir -p results
 
+# Force a clean rebuild so an old cached .so cannot be reused.
+export TORCH_EXTENSIONS_DIR="$REPO/.torch_extensions"
+rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
+
 NANOVLLM_MODEL_PATH="$MODEL" \
 python -m tools.verify_server_env --require-megakernel
+
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m nanovllm.backends.megakernel.build \
+  2>&1 | tee results/a100_build_retry.log
 
 PYTHONPATH=src python -m unittest discover -s tests -v
 

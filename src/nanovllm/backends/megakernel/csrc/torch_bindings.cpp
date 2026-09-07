@@ -1,4 +1,5 @@
 #include <Python.h>
+#include <cstdlib>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
@@ -95,6 +96,15 @@ void decode(torch::Tensor output_token, int64_t input_token_id,
       c10::cuda::getCurrentCUDAStream().stream());
 }
 
+static void maybe_sync_debug() {
+  if (std::getenv("NANOVLLM_CUDA_DEBUG") != nullptr) {
+    auto error = cudaDeviceSynchronize();
+    TORCH_CHECK(error == cudaSuccess,
+                "Megakernel CUDA execution failed: ",
+                cudaGetErrorString(error));
+  }
+}
+
 void decode_paged(
     torch::Tensor output_token, int64_t input_token_id,
     torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
@@ -121,6 +131,19 @@ void decode_paged(
   TORCH_CHECK(block_size > 0 && num_cache_blocks > 0,
               "block_size and num_cache_blocks must be positive");
   TORCH_CHECK(position >= 0, "position must be non-negative");
+  TORCH_CHECK(output_token.is_cuda() && output_token.scalar_type() == torch::kInt32 &&
+                  output_token.numel() >= 1,
+              "output_token must be a CUDA int32 tensor with one element");
+  TORCH_CHECK(k_cache.dim() == 5 && v_cache.dim() == 5 &&
+                  k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                  k_cache.sizes() == v_cache.sizes(),
+              "paged KV cache views must be matching contiguous 5D tensors");
+  TORCH_CHECK(k_cache.size(0) == num_layers && k_cache.size(1) == num_cache_blocks &&
+                  k_cache.size(2) == block_size && k_cache.size(3) == 8 &&
+                  k_cache.size(4) == 128,
+              "paged KV cache shape does not match Qwen3-0.6B metadata");
+  TORCH_CHECK(block_table.numel() >= (position / block_size) + 1,
+              "block_table is too short for the requested position");
 
   launch_ldg_decode_direct(
       static_cast<int>(input_token_id),
@@ -136,6 +159,7 @@ void decode_paged(
       static_cast<int>(block_size * num_cache_blocks), block_table.data_ptr<int>(),
       static_cast<int>(block_size), static_cast<int>(num_cache_blocks),
       static_cast<float>(attn_scale), c10::cuda::getCurrentCUDAStream().stream());
+  maybe_sync_debug();
 }
 
 void decode_paged_batch(
@@ -177,8 +201,13 @@ void decode_paged_batch(
                   positions.is_contiguous(),
               "batch metadata tensors must be contiguous");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda() && k_cache.dim() == 5 &&
+                  k_cache.is_contiguous() && v_cache.is_contiguous() &&
                   v_cache.sizes() == k_cache.sizes(),
-              "paged KV cache views must be matching CUDA 5D tensors");
+              "paged KV cache views must be matching contiguous CUDA 5D tensors");
+  TORCH_CHECK(k_cache.size(0) == num_layers && k_cache.size(1) == num_cache_blocks &&
+                  k_cache.size(2) == block_size && k_cache.size(3) == 8 &&
+                  k_cache.size(4) == 128,
+              "paged KV cache shape does not match Qwen3-0.6B metadata");
   TORCH_CHECK(block_size > 0 && num_cache_blocks > 0,
               "block_size and num_cache_blocks must be positive");
 
@@ -196,6 +225,7 @@ void decode_paged_batch(
       static_cast<int>(num_layers), static_cast<int>(input_token_ids.numel()),
       static_cast<int>(block_tables.size(1)), static_cast<int>(block_size),
       static_cast<int>(num_cache_blocks), static_cast<float>(attn_scale), stream);
+  maybe_sync_debug();
 }
 
 extern "C" void launch_ldg_generate_nosync(
