@@ -104,8 +104,9 @@ run_correctness() {
 
   PYTHONPATH=src python -m unittest discover -s tests -v
 
-  # Each GPU run is bounded so a future device-side deadlock does not leave the
-  # server shell stuck indefinitely. The command stops on the first failure.
+  # Keep CUDA backends in separate Python processes. A failed CUDA kernel
+  # poisons the process context; otherwise a prior CUDA-Graph/eager run can
+  # make the first Megakernel API call report a stale illegal-access error.
   timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
@@ -114,9 +115,22 @@ run_correctness() {
       --prompt-lengths 8,32 \
       --batch-sizes 1 \
       --max-tokens 8 \
+      --backends torch-eager,torch-cudagraph \
+      --json results/a100_correctness_single_baseline.json \
+      2>&1 | tee results/a100_correctness_single_baseline.log
+
+  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 8,32 \
+      --batch-sizes 1 \
+      --max-tokens 8 \
+      --backends torch-eager,megakernel \
       --require-megakernel \
-      --json results/a100_correctness_single.json \
-      2>&1 | tee results/a100_correctness_single.log
+      --json results/a100_correctness_single_megakernel.json \
+      2>&1 | tee results/a100_correctness_single_megakernel.log
 
   timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
@@ -126,6 +140,7 @@ run_correctness() {
       --prompt-lengths 255,256,257,512 \
       --batch-sizes 1 \
       --max-tokens 8 \
+      --backends torch-eager,megakernel \
       --require-megakernel \
       --json results/a100_correctness_boundary.json \
       2>&1 | tee results/a100_correctness_boundary.log
@@ -138,6 +153,7 @@ run_correctness() {
       --prompt-lengths 32,128,255,256,257,512 \
       --batch-sizes 1,2 \
       --max-tokens 8 \
+      --backends torch-eager,megakernel \
       --require-megakernel \
       --json results/a100_correctness_batch2.json \
       2>&1 | tee results/a100_correctness_batch2.log
