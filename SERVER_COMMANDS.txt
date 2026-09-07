@@ -1,69 +1,55 @@
 # Megakernel-vLLM A100 server commands
 # Run these commands on the server, one section at a time.
-# Current server paths:
+# The uv environment is already configured; this file does not recreate it.
+
 export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
 export MODEL=/home/t50063365/models/Qwen3-0.6B
-
-# 1) Enter the repository and fetch the latest integration branch.
 cd "$REPO"
+
+# 1) Fetch the latest integration branch.
 git fetch origin
 git switch codex/paged-kv-megakernel-integration
 git pull --ff-only
 git log -1 --oneline
 
-# 2) Check the system driver and CUDA compiler.
-nvidia-smi
-nvcc --version
+# 2) Activate the existing uv environment.
+source .venv/bin/activate
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
 
-# If nvcc is not found, stop and load the CUDA module first:
-# module avail cuda
-# module load cuda/<server-version>
-
-# 3) Install uv if needed.
-if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-uv --version
-
-# 4) Configure certificates, cache behavior, timeout, and Huawei Cloud PyPI mirror.
-# The mirror is used for ordinary Python packages, torch, and nvidia-* wheels.
-# The official PyTorch CUDA index remains a fallback inside setup_server.sh.
+# 3) Use Huawei Cloud for Python packages and the system CA store.
 export UV_SYSTEM_CERTS=true
 export UV_PYTHON_DOWNLOADS=0
 export UV_LINK_MODE=copy
 export UV_HTTP_TIMEOUT=300
 export NANOVLLM_PYPI_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple/
-
-# If the server proxy CA is not installed system-wide, uncomment this line:
+# If the proxy CA is not installed system-wide, uncomment:
 # export SSL_CERT_FILE=/PATH/TO/company-ca-bundle.pem
 
-# 5) Remove a failed old environment if this is a fresh retry.
-# This only removes the local virtual environment, not the repository or model.
-rm -rf .venv
+# 4) Check the A100 driver and CUDA toolkit.
+nvidia-smi
+nvcc --version
 
-# 6) Create the uv environment and install dependencies.
-# This reuses existing server Python 3.10/3.11/3.12 and will not download CPython.
-bash setup_server.sh
-source .venv/bin/activate
-export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
-export TOKENIZERS_PARALLELISM=false
+# 5) Download and validate the required model.
+# For the complete model download procedure, use:
+# cat MODEL_DOWNLOAD_COMMANDS.txt
+# Then execute that file section by section.
 
-# 7) Verify the environment and local Qwen3-0.6B configuration.
+# 6) Verify environment and Qwen3-0.6B model configuration.
 export NANOVLLM_CUDA_ARCH=sm_80
 NANOVLLM_MODEL_PATH="$MODEL" \
 python -m tools.verify_server_env --require-megakernel
 
-# 8) Compile the packaged Megakernel CUDA extension.
+# 7) Compile the packaged Megakernel CUDA extension.
 mkdir -p results
 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m nanovllm.backends.megakernel.build \
   2>&1 | tee results/a100_build.log
 
-# 9) Run Python tests before GPU correctness tests.
+# 8) Run Python tests before GPU correctness tests.
 PYTHONPATH=src python -m unittest discover -s tests -v
 
-# 10) Minimal single-sequence correctness test.
+# 9) Minimal single-sequence correctness test.
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
@@ -76,7 +62,7 @@ python -m tools.correctness_smoke \
   --json results/a100_smoke_single.json \
   2>&1 | tee results/a100_smoke_single.log
 
-# 11) Paged-KV block-boundary correctness test. Default block size is 256.
+# 10) Paged-KV block-boundary correctness test. Default block size is 256.
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
@@ -89,7 +75,7 @@ python -m tools.correctness_smoke \
   --json results/a100_smoke_boundary.json \
   2>&1 | tee results/a100_smoke_boundary.log
 
-# 12) Batch correctness test.
+# 11) Batch correctness test.
 CUDA_LAUNCH_BLOCKING=1 \
 TORCH_SHOW_CPP_STACKTRACES=1 \
 NANOVLLM_CUDA_ARCH=sm_80 \
@@ -102,7 +88,7 @@ python -m tools.correctness_smoke \
   --json results/a100_smoke_batch.json \
   2>&1 | tee results/a100_smoke_batch.log
 
-# 13) Full controlled A/B benchmark. Run only after steps 10-12 pass.
+# 12) Full controlled A/B benchmark. Run only after steps 9-11 pass.
 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m benchmarks.compare \
   "$MODEL" \
@@ -118,12 +104,12 @@ python -m benchmarks.compare \
   --markdown results/a100_performance.md \
   2>&1 | tee results/a100_performance.log
 
-# 14) Generate plots from the benchmark JSON.
+# 13) Generate plots.
 python -m tools.plot_metrics \
   results/a100_performance.json \
   --output-dir results/a100_plots
 
-# 15) Optional short Nsight Systems profile.
+# 14) Optional short Nsight Systems profile.
 NANOVLLM_CUDA_ARCH=sm_80 \
 nsys profile --trace=cuda,nvtx --sample=none \
   --output=results/a100_megakernel_nsys \
@@ -137,7 +123,7 @@ nsys profile --trace=cuda,nvtx --sample=none \
     --warmup 1 \
     --runs 1
 
-# 16) Optional short Nsight Compute profile.
+# 15) Optional short Nsight Compute profile.
 NANOVLLM_CUDA_ARCH=sm_80 \
 ncu --set full --target-processes all \
   --export results/a100_megakernel_ncu \
