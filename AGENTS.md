@@ -29,6 +29,12 @@ Use a local Hugging Face model directory (for example, `~/huggingface/Qwen3-0.6B
 
 Use four spaces, standard Python formatting, and readable type annotations where they clarify interfaces. Keep modules focused and prefer the existing layout over introducing new top-level packages. Use `snake_case` for functions, variables, and modules; `PascalCase` for classes; and uppercase names for constants. Match the current import grouping (standard library, third-party packages, then local modules). No repository formatter or linter is configured, so keep diffs small and manually formatted.
 
+## Server Command File Rule
+
+Every command intended for execution on the remote A100/V100 server must first be written to a repository `.txt` command file, normally `SERVER_COMMANDS.txt` or a dedicated file such as `MODEL_DOWNLOAD_COMMANDS.txt`. Before giving the command to the user, commit and push the file. The command file must use literal Bash syntax, include the required repository/model paths and environment variables, and state which steps are safe to run only after earlier checks pass. Do not rely on chat-only command blocks.
+
+After the user runs `git pull` on the server, they should be able to execute the committed command file directly or copy its sections without Markdown escaping. Keep server-generated results, logs, model weights, and profiler reports ignored by Git.
+
 ## Testing Guidelines
 
 The repository uses focused `unittest` checks under `tests/`; there is no coverage threshold. Run `PYTHONPATH=src python -m unittest discover -s tests -v` for backend/config/metrics logic. For runtime changes, also run `python -m compileall src/nanovllm tools` and validate on the target GPU with `examples/basic_generation.py` or `python -m benchmarks.compare MODEL`; include model, CUDA, GPU, JSON, and Markdown results with performance reports.
