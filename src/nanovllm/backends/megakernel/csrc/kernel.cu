@@ -321,28 +321,33 @@ ldg_prefetch_weights_l2(const __nv_bfloat16 *__restrict__ weights,
 
 __device__ inline __nv_bfloat16 *ldg_kv_ptr(
     __nv_bfloat16 *__restrict__ cache, int kv_head, int position,
-    int max_seq_len, const int *__restrict__ block_table, int block_size) {
+    int64_t max_seq_len, const int *__restrict__ block_table,
+    int64_t block_size) {
   if (block_table == nullptr) {
-    return cache + kv_head * max_seq_len * HEAD_DIM + position * HEAD_DIM;
+    int64_t offset = static_cast<int64_t>(kv_head) * max_seq_len * HEAD_DIM +
+                     static_cast<int64_t>(position) * HEAD_DIM;
+    return cache + offset;
   }
-  int logical_block = position / block_size;
-  int block_offset = position % block_size;
+  int64_t logical_block = static_cast<int64_t>(position) / block_size;
+  int64_t block_offset = static_cast<int64_t>(position) % block_size;
   int physical_block = block_table[logical_block];
-  return cache + physical_block * block_size * KV_SIZE
-      + block_offset * KV_SIZE + kv_head * HEAD_DIM;
+  int64_t offset = static_cast<int64_t>(physical_block) * block_size * KV_SIZE +
+                   block_offset * KV_SIZE +
+                   static_cast<int64_t>(kv_head) * HEAD_DIM;
+  return cache + offset;
 }
 
 __device__ void ldg_attention(
     auto &grid, float *__restrict__ q, float *__restrict__ k,
     const float *__restrict__ v, __nv_bfloat16 *__restrict__ k_cache,
     __nv_bfloat16 *__restrict__ v_cache, float *__restrict__ attn_out,
-    int cache_len, int max_seq_len, float attn_scale,
+    int cache_len, int64_t max_seq_len, float attn_scale,
     // QK norm parameters (fused to eliminate a grid.sync)
     const __nv_bfloat16 *__restrict__ q_norm_weight,
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const __nv_bfloat16 *__restrict__ cos_table,
     const __nv_bfloat16 *__restrict__ sin_table, int position,
-    const int *__restrict__ block_table, int block_size,
+    const int *__restrict__ block_table, int64_t block_size,
     // Weights to prefetch during attention (for blocks not doing attention)
     const __nv_bfloat16 *__restrict__ o_weight,
     const __nv_bfloat16 *__restrict__ gate_weight,
@@ -1421,8 +1426,10 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
   for (int layer = 0; layer < num_layers; layer++) {
     const LDGLayerWeights &w = layer_weights[layer];
-    __nv_bfloat16 *layer_k_cache = k_cache + layer * kv_cache_layer_stride;
-    __nv_bfloat16 *layer_v_cache = v_cache + layer * kv_cache_layer_stride;
+    __nv_bfloat16 *layer_k_cache =
+        k_cache + static_cast<int64_t>(layer) * kv_cache_layer_stride;
+    __nv_bfloat16 *layer_v_cache =
+        v_cache + static_cast<int64_t>(layer) * kv_cache_layer_stride;
 
     // Layer 0: read directly from embedding table. Other layers: from
     // hidden_buffer.
@@ -1516,9 +1523,14 @@ __device__ void ldg_decode_one(
 
   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
 
-  int kv_cache_layer_stride =
-      block_table ? num_cache_blocks * block_size * KV_SIZE
-                  : NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+  // The paged KV layer stride can exceed INT32_MAX on an 80 GB A100
+  // (2516 blocks * 256 tokens * 1024 elements ~= 660M elements per layer).
+  // Keep all cache offsets 64-bit; an int overflow here points later layers
+  // several GiB before the allocation and causes illegal global writes.
+  int64_t kv_cache_layer_stride =
+      block_table
+          ? static_cast<int64_t>(num_cache_blocks) * block_size * KV_SIZE
+          : static_cast<int64_t>(NUM_KV_HEADS) * max_seq_len * HEAD_DIM;
 
   for (int layer = 0; layer < num_layers; layer++) {
     const LDGLayerWeights &w = layer_weights[layer];

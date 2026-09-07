@@ -11,8 +11,8 @@ class PagedKernelSourceTests(unittest.TestCase):
     def test_kernel_contains_paged_address_mapping(self):
         source = KERNEL.read_text(encoding="utf-8")
         self.assertIn("ldg_kv_ptr", source)
-        self.assertIn("position / block_size", source)
-        self.assertIn("physical_block * block_size * KV_SIZE", source)
+        self.assertIn("logical_block = static_cast<int64_t>(position) / block_size", source)
+        self.assertIn("static_cast<int64_t>(physical_block) * block_size * KV_SIZE", source)
         self.assertIn("const int *__restrict__ block_table", source)
         self.assertIn("ldg_decode_kernel_batch", source)
         self.assertIn("ldg_lm_head_fused_batch", source)
@@ -43,6 +43,9 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn("cudaDevAttrCooperativeLaunch", kernel_source)
         self.assertIn("validate_paged_metadata", source)
         self.assertIn("invalid paged physical block", source)
+        self.assertIn("int64_t kv_cache_layer_stride", kernel_source)
+        self.assertIn("static_cast<int64_t>(layer) * kv_cache_layer_stride", kernel_source)
+        self.assertIn("static_cast<int64_t>(physical_block)", kernel_source)
         self.assertNotIn("maybe_sync_debug();", source)
         self.assertIn('static void maybe_sync_debug(const char *phase);', source)
 
