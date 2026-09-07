@@ -3,6 +3,10 @@ set -euo pipefail
 
 # Megakernel-vLLM A100 server commands
 # Run this file on the server. It stops immediately when a required step fails.
+# If an earlier run was suspended with Ctrl+Z, clean it first in the same shell:
+# jobs -l
+# fg %<job-id>
+# press Ctrl+C, then verify with: nvidia-smi
 # The uv environment is already configured; this file does not recreate it.
 
 export REPO=/home/t50063365/workspace/repos/MegaKernel-vLLM
