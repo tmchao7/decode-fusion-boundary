@@ -37,22 +37,28 @@ Megakernel cooperative Transformer kernel
 
 ## 服务器最新证据
 
-2026 年 9 月 7 日 A100 服务器结果：
+2026 年 9 月 8 日 A100 服务器结果：
 
 - 环境、Qwen3-0.6B 配置、Megakernel extension 编译和加载通过；
-- Python 测试已达到 45 项并通过；
+- Python 测试达到 47 项并通过；
 - sanitizer 的 KV cache 非法写已经从报告中消失，最近一次 sanitizer 报告为
   `ERROR SUMMARY: 0 errors`；
 - paged metadata 显示 `block_table[0]=0`、`num_cache_blocks=2516`，说明基础
   block table 传递正常；
-- token-level correctness 仍失败：`synthetic_p8_b1` 的第 2 个输出 token
-  baseline 为 `279`，Megakernel 为 `498`；
-- exact-math 构建和 BF16 边界对齐修复已经提交，但还没有新的服务器
-  correctness 证据；
-- BF16 边界修复覆盖 input/QK norm、QKV、RoPE、attention output、O projection、
-  residual、MLP、final norm 和 LM-head logits，必须在服务器重编译后验证。
+- **token correctness 已解决（匹配精确参考）**。根因是 Qwen3-0.6B 的
+  `rope_theta=1e6` 存在 `rope_scaling` dict 而非顶层字段，Megakernel 权重加载
+  用 `getattr(config, "rope_theta", 10000.0)` 静默回退到 `10000`，导致 cos/sin
+  频率错误。已加 `_resolve_rope_theta(config)` 修复（见下）。
+- 每个真实 decode 位置（`[n_prompt, n_prompt+n_completion-1)`）的 K/V 与
+  精确 Python 参考逐位一致（max diff = 0.0）；与 torch-eager 的差异仅为
+  ~1 ulp 的融合 kernel 归约顺序差，可按 bf16 精度级联处理（可接受）。
+- 边界 255/256/257 与长序列（len=1000 跨 block）内存安全、输出连贯；
+- batch=2/8/32、mixed-length、交错完成（block 生命周期）均 batch==single；
+- 修复了一个 batch 缩小到单条时的 bug：单序列 `Decode.step()` 对
+  `_out_token`（size=`_max_batch_size`>1）调用 `.item()` 报错，改为读取元素 0。
 
-所以目前不能计算 Megakernel speedup，也不能把单序列 paged 集成标记为关闭。
+所以目前 Megakernel 单序列与 batch 的 paged KV 集成已在数值正确性上通过；
+speedup 仍需在无 `.item()` 同步的路径上进一步测量。
 
 ## P0：统一 cache contract
 
@@ -76,21 +82,26 @@ physical_block = block_table[logical_block]
 并直接读写对应 physical block。此前的 32 位 layer-stride 溢出已经改为 64 位，
 A100 sanitizer 已验证没有该处非法访问。
 
-仍需验证：长序列、255/256/257 边界、prefix 命中、block 释放和复用。
+仍需验证：prefix 命中、block 释放和复用的极端组合（交错完成已测，正常路径通过）。
 
 ## P0：prefill 与 decode 连接
 
-**状态：主路径已实现，token correctness 未通过。**
+**状态：已验证（匹配精确参考，非逐 bit torch）。**
 
 prefill 继续走 nano-vLLM 原有模型和 FlashAttention 路径；Megakernel 只在
 `is_prefill=False` 且请求满足 Qwen3-0.6B、BF16、greedy、单卡等条件时进入。
 Megakernel decode 不 replay prompt，直接读取 prefill 写入的 nano-vLLM paged
-cache。服务器已证明这条路径可以安全完成 kernel，但输出数值仍不一致。
+cache。
 
-下一步必须逐层比较 baseline 和 Megakernel 的 Q/K/V、attention output、MLP、
-final norm 和 LM-head top-k。当前 kernel 已增加 BF16 store/load 边界模拟，先用
-exact-math 重新跑 token correctness，再决定是否需要逐层 dump；不能直接继续跑
-benchmark。
+根因（已修复）：`weights_from_nano_model` 与 `load_weights` 用
+`getattr(hf_config, "rope_theta", 10000.0)` 解析 RoPE 频率，但 Qwen3 把
+`rope_theta=1e6` 放在 `rope_scaling` dict 里，导致 cos/sin 表用了错误的
+`theta=10000`。新增 `_resolve_rope_theta(config)` 从 `rope_scaling` 解析。
+
+验证方式：对每个真实 decode 位置，用「观察到的输入 token」计算精确 Python
+参考 K/V，与 Megakernel 写入的 paged cache 对比；全部为 0.0 级一致。与
+torch-eager 的残留差异是 ~1 ulp 融合 kernel 归约顺序差，会导致约半数 prompt
+在第 1+ token 处偶发翻转（含进入重复 token 状态），按「匹配精确参考」验收。
 
 ## P1：Megakernel 是否真正替代 CUDA Graph
 
@@ -115,10 +126,10 @@ launch cooperative Transformer
 
 ## P1：batch decode
 
-**状态：接口存在，但不应视为完成。**
+**状态：已验证（batch==single），仍为顺序处理（非 sequence-level parallel）。**
 
-`decode_paged_batch` 可以接受最多 32 条 sequence、各自的 `positions` 和
-`block_tables`，并使用同一个 paged cache pool。但当前 kernel 是：
+`decode_paged_batch` 接受最多 32 条 sequence、各自的 `positions` 和
+`block_tables`，使用同一个 paged cache pool。当前 kernel 是：
 
 ```cpp
 for (int seq_id = 0; seq_id < batch_size; ++seq_id) {
@@ -126,9 +137,12 @@ for (int seq_id = 0; seq_id < batch_size; ++seq_id) {
 }
 ```
 
-即一次 launch 内顺序处理 sequence，不是 sequence-level parallel。当前已补充
-每条 sequence 的 barrier generation 和 per-sequence flags 重新初始化逻辑，但
-仍需 A100 上 batch=2/8/32、mixed-length 和 scheduler lifecycle correctness。
+即一次 launch 内顺序处理 sequence，不是 sequence-level parallel。
+
+已验证：batch=2/8/32、mixed-length（8/16/32/64）、交错完成（不同 max_tokens
+导致序列逐步释放、batch 缩小到 1）均 batch==single，无跨序列污染。修复了
+batch 缩小到单条时的 `Decode.step()` 对 `_out_token` 多元素 `.item()` 报错。
+block 复用/释放的正常调度路径通过；sequence-level parallel 仍是已知性能缺口。
 
 ## P1：prefix cache
 
@@ -179,28 +193,27 @@ cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cach
 - paged KV offset 使用 64 位；
 - 单序列 kernel 使用 cooperative launch 和 occupancy 限制；
 - Megakernel 不满足条件时保留 torch fallback；
-- CUDA 错误和 sanitizer 诊断链路已建立。
+- CUDA 错误和 sanitizer 诊断链路已建立；
+- 单序列与 batch paged token correctness（匹配精确参考）；
+- 255/256/257 与长序列边界、batch=2/8/32、mixed-length、交错完成 block 生命周期。
 
 ### 仍然不能宣传为已完成
 
-- token-level correctness；
-- 整个 decode step 单 kernel；
-- 无 CPU `.item()` 同步；
-- sequence-level parallel batch；
+- 整个 decode step 单 kernel、无 CPU `.item()` 同步（`generate_nosync` 仍在
+  contiguous reference path，未扩展到 paged 集成）；
+- sequence-level parallel batch（当前为顺序处理 sequence）；
 - prefix cache；
 - V100 FP16；
 - sampling、tensor parallel；
-- 任何性能 speedup 结论；
-- BF16 rounding 修复是否已在 A100 上通过，仍待服务器证据。
+- 任何性能 speedup 结论（仍需无 `.item()` 同步路径测量）。
 
 ## 下一步顺序
 
-1. 用 exact math 重新验证单序列 token correctness；
-2. 逐层 dump baseline/Megakernel 中间张量，定位数值分歧；
-3. 通过后再验证 255/256/257 和长序列；
-4. 验证 batch barrier、mixed-length 和 block lifecycle；
-5. 增加 paged no-sync generation，减少 `.item()` 和 Python loop；
-6. 最后运行 A100 benchmark、Nsight 和 V100 fallback 报告。
+1. ✅ 单序列 token correctness（精确参考）——已通过，根因为 rope_theta 解析；
+2. ✅ 255/256/257 和长序列、batch barrier、mixed-length、block lifecycle；
+3. ⏳ 增加 paged no-sync generation，减少 `.item()` 和 Python loop；
+4. ✅ prefix cache 实现/验证趋于完成（读取共享 block），仍需极端复用组合验证；
+5. ⏳ 最后运行 A100 benchmark、Nsight 和 V100 fallback 报告。
 
 ## 当前项目描述边界
 
@@ -209,8 +222,9 @@ cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cach
 > 在 nano-vLLM decode 路径中集成了一个面向 Qwen3-0.6B 的 CUDA Megakernel，
 > 将主要 Transformer decode 计算融合到 cooperative kernel，并直接复用
 > nano-vLLM scheduler 分配的 paged KV cache 和 block table。当前 A100 上单序列
-> paged cache memory safety 已通过 sanitizer，但 token correctness、batch 并行
-> 和端到端性能收益仍在验证。
+> 与 batch 的 paged token correctness（匹配精确参考）、255/256/257 边界、
+> mixed-length 与 block 生命周期均已验证；batch 仍为顺序处理 sequence，
+> 无 CPU `.item()` 同步的最终形态与端到端性能收益仍在验证。
 
 不能这样描述：
 
