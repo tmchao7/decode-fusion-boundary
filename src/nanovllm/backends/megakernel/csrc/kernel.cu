@@ -166,6 +166,13 @@ __device__ __forceinline__ float ldg_silu(float x) {
 #endif
 }
 
+// PyTorch's Qwen3 BF16 path rounds at each tensor boundary (RMSNorm, linear,
+// RoPE, attention, and residual). Keep the kernel's accumulators in FP32, but
+// explicitly model the BF16 store/load boundary before the next operation.
+__device__ __forceinline__ float ldg_round_bf16(float x) {
+  return __bfloat162float(__float2bfloat16(x));
+}
+
 // 128-bit L1-bypassing weight loads
 __device__ __forceinline__ uint4 ldg_load_weight_u4(const uint4 *ptr) {
   uint4 out;
@@ -242,11 +249,11 @@ ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
 
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
       float w0 = __bfloat162float(__ldg(norm_weight + i));
-      s_norm[i] = s_norm[i] * rstd * w0;
+      s_norm[i] = ldg_round_bf16(ldg_round_bf16(s_norm[i] * rstd) * w0);
       int i1 = i + LDG_BLOCK_SIZE;
       if (i1 < HIDDEN_SIZE) {
         float w1 = __bfloat162float(__ldg(norm_weight + i1));
-        s_norm[i1] = s_norm[i1] * rstd * w1;
+        s_norm[i1] = ldg_round_bf16(ldg_round_bf16(s_norm[i1] * rstd) * w1);
       }
     }
     __syncthreads();
@@ -297,7 +304,7 @@ ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
 
       sum = ldg_warp_reduce_sum(sum);
       if (lane_id == 0) {
-        *output_ptr = sum;
+        *output_ptr = ldg_round_bf16(sum);
       }
     }
   }
@@ -398,7 +405,9 @@ __device__ void ldg_attention(
       float kl[HEAD_DIM / WARP_SIZE];
 #pragma unroll
       for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
-        kl[j] = k_head[i] * sc * __bfloat162float(__ldg(k_norm_weight + i));
+        kl[j] = ldg_round_bf16(
+            ldg_round_bf16(k_head[i] * sc) *
+            __bfloat162float(__ldg(k_norm_weight + i)));
 #pragma unroll
       for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
         float cv = __bfloat162float(__ldg(cos_pos + i));
@@ -429,7 +438,9 @@ __device__ void ldg_attention(
       float ql[HEAD_DIM / WARP_SIZE];
 #pragma unroll
       for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
-        ql[j] = qh[i] * sc * __bfloat162float(__ldg(q_norm_weight + i));
+        ql[j] = ldg_round_bf16(
+            ldg_round_bf16(qh[i] * sc) *
+            __bfloat162float(__ldg(q_norm_weight + i)));
 #pragma unroll
       for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
         float cv = __bfloat162float(__ldg(cos_pos + i));
@@ -437,8 +448,9 @@ __device__ void ldg_attention(
         int po = (i < HEAD_DIM / 2) ? HEAD_DIM / 2 : -HEAD_DIM / 2;
         int pi = i + po, pj = pi / WARP_SIZE;
         float pv = __shfl_sync(0xffffffff, ql[pj], pi % WARP_SIZE);
-        qh[i] =
-            (i < HEAD_DIM / 2) ? ql[j] * cv - pv * sv : pv * sv + ql[j] * cv;
+        qh[i] = ldg_round_bf16(
+            (i < HEAD_DIM / 2) ? ql[j] * cv - pv * sv
+                               : pv * sv + ql[j] * cv);
       }
     }
   }
@@ -614,10 +626,10 @@ __device__ void ldg_attention(
 
       // Write final normalized output
       int base = lane_id * 4;
-      out_head[base + 0] = final_out[0] / total_sum_exp;
-      out_head[base + 1] = final_out[1] / total_sum_exp;
-      out_head[base + 2] = final_out[2] / total_sum_exp;
-      out_head[base + 3] = final_out[3] / total_sum_exp;
+      out_head[base + 0] = ldg_round_bf16(final_out[0] / total_sum_exp);
+      out_head[base + 1] = ldg_round_bf16(final_out[1] / total_sum_exp);
+      out_head[base + 2] = ldg_round_bf16(final_out[2] / total_sum_exp);
+      out_head[base + 3] = ldg_round_bf16(final_out[3] / total_sum_exp);
     }
     __syncthreads();
   }
@@ -734,7 +746,7 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
       sum = ldg_warp_reduce_sum(sum);
       if (lane_id == 0) {
-        g_activations[m] = sum + g_residual[m];
+        g_activations[m] = ldg_round_bf16(sum) + g_residual[m];
       }
     }
   }
@@ -762,10 +774,10 @@ __device__ void ldg_o_proj_postnorm_mlp(
     // Block 0 saves residual for later use
     if (block_id == 0) {
       for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
-        g_residual[i] = s_act[i];
+        g_residual[i] = ldg_round_bf16(s_act[i]);
         int i1 = i + LDG_BLOCK_SIZE;
         if (i1 < HIDDEN_SIZE) {
-          g_residual[i1] = s_act[i1];
+          g_residual[i1] = ldg_round_bf16(s_act[i1]);
         }
       }
     }
@@ -789,11 +801,11 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
       float w0 = __bfloat162float(__ldg(post_norm_weight + i));
-      s_act[i] = s_act[i] * rstd * w0;
+      s_act[i] = ldg_round_bf16(ldg_round_bf16(s_act[i] * rstd) * w0);
       int i1 = i + LDG_BLOCK_SIZE;
       if (i1 < HIDDEN_SIZE) {
         float w1 = __bfloat162float(__ldg(post_norm_weight + i1));
-        s_act[i1] = s_act[i1] * rstd * w1;
+        s_act[i1] = ldg_round_bf16(ldg_round_bf16(s_act[i1] * rstd) * w1);
       }
     }
     __syncthreads();
@@ -846,7 +858,10 @@ __device__ void ldg_o_proj_postnorm_mlp(
       up_sum = ldg_warp_reduce_sum(up_sum);
 
       if (lane_id == 0) {
-        g_mlp_intermediate[m] = ldg_silu(gate_sum) * up_sum;
+        float gate_bf16 = ldg_round_bf16(gate_sum);
+        float up_bf16 = ldg_round_bf16(up_sum);
+        float silu_bf16 = ldg_round_bf16(ldg_silu(gate_bf16));
+        g_mlp_intermediate[m] = ldg_round_bf16(silu_bf16 * up_bf16);
       }
     }
   }
@@ -889,7 +904,8 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
       sum = ldg_warp_reduce_sum(sum);
       if (lane_id == 0) {
-        hidden_out[m] = __float2bfloat16(sum + g_residual[m]);
+        hidden_out[m] = __float2bfloat16(
+            ldg_round_bf16(sum) + g_residual[m]);
       }
     }
   }
@@ -968,7 +984,7 @@ __global__ void ldg_lm_head_phase1(const float *__restrict__ hidden,
       if (!valid[r]) {
         continue;
       }
-      float reduced = ldg_warp_reduce_sum(sum[r]);
+      float reduced = ldg_round_bf16(ldg_warp_reduce_sum(sum[r]));
       if (lane_id == 0 && reduced > local_max) {
         local_max = reduced;
         local_max_idx = rows[r];
@@ -1124,7 +1140,7 @@ __global__ void ldg_lm_head_fused(const float *__restrict__ hidden,
       if (!valid[r]) {
         continue;
       }
-      float reduced = ldg_warp_reduce_sum(sum[r]);
+      float reduced = ldg_round_bf16(ldg_warp_reduce_sum(sum[r]));
       if (lane_id == 0 && reduced > local_max) {
         local_max = reduced;
         local_max_idx = rows[r];
@@ -1303,7 +1319,7 @@ __global__ void ldg_lm_head_fused_batch(
       if (!valid[r]) {
         continue;
       }
-      float reduced = ldg_warp_reduce_sum(sum[r]);
+      float reduced = ldg_round_bf16(ldg_warp_reduce_sum(sum[r]));
       if (lane_id == 0 && reduced > local_max) {
         local_max = reduced;
         local_max_idx = rows[r];
@@ -1489,11 +1505,13 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     float rstd = smem_reduce[0];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
       float wt0 = __bfloat162float(__ldg(final_norm_weight + i));
-      g_normalized[i] = g_activations[i] * rstd * wt0;
+      g_normalized[i] = ldg_round_bf16(
+          ldg_round_bf16(g_activations[i] * rstd) * wt0);
       int i1 = i + LDG_BLOCK_SIZE;
       if (i1 < HIDDEN_SIZE) {
         float wt1 = __bfloat162float(__ldg(final_norm_weight + i1));
-        g_normalized[i1] = g_activations[i1] * rstd * wt1;
+        g_normalized[i1] = ldg_round_bf16(
+            ldg_round_bf16(g_activations[i1] * rstd) * wt1);
       }
     }
   }
@@ -1601,11 +1619,13 @@ __device__ void ldg_decode_one(
     float rstd = smem_reduce[0];
     for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
       float wt0 = __bfloat162float(__ldg(final_norm_weight + i));
-      g_normalized[i] = g_activations[i] * rstd * wt0;
+      g_normalized[i] = ldg_round_bf16(
+          ldg_round_bf16(g_activations[i] * rstd) * wt0);
       int i1 = i + LDG_BLOCK_SIZE;
       if (i1 < HIDDEN_SIZE) {
         float wt1 = __bfloat162float(__ldg(final_norm_weight + i1));
-        g_normalized[i1] = g_activations[i1] * rstd * wt1;
+        g_normalized[i1] = ldg_round_bf16(
+            ldg_round_bf16(g_activations[i1] * rstd) * wt1);
       }
     }
   }

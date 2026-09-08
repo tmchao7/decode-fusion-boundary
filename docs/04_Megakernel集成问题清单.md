@@ -1,6 +1,6 @@
 # Megakernel 与 nano-vLLM 集成问题清单
 
-> 更新日期：2026-09-07
+> 更新日期：2026-09-08
 >
 > 本文档只记录当前代码和服务器证据，不把“已经写了接口”误记为“已经完成”。
 > 状态含义：**已验证**=有代码和实际服务器证据；**部分完成**=主路径已写但仍有
@@ -47,7 +47,10 @@ Megakernel cooperative Transformer kernel
   block table 传递正常；
 - token-level correctness 仍失败：`synthetic_p8_b1` 的第 2 个输出 token
   baseline 为 `279`，Megakernel 为 `498`；
-- exact-math 构建已提交，但还没有新的服务器 correctness 证据。
+- exact-math 构建和 BF16 边界对齐修复已经提交，但还没有新的服务器
+  correctness 证据；
+- BF16 边界修复覆盖 input/QK norm、QKV、RoPE、attention output、O projection、
+  residual、MLP、final norm 和 LM-head logits，必须在服务器重编译后验证。
 
 所以目前不能计算 Megakernel speedup，也不能把单序列 paged 集成标记为关闭。
 
@@ -85,7 +88,9 @@ Megakernel decode 不 replay prompt，直接读取 prefill 写入的 nano-vLLM p
 cache。服务器已证明这条路径可以安全完成 kernel，但输出数值仍不一致。
 
 下一步必须逐层比较 baseline 和 Megakernel 的 Q/K/V、attention output、MLP、
-final norm 和 LM-head top-k，而不是直接继续跑 benchmark。
+final norm 和 LM-head top-k。当前 kernel 已增加 BF16 store/load 边界模拟，先用
+exact-math 重新跑 token correctness，再决定是否需要逐层 dump；不能直接继续跑
+benchmark。
 
 ## P1：Megakernel 是否真正替代 CUDA Graph
 
@@ -185,7 +190,8 @@ cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cach
 - prefix cache；
 - V100 FP16；
 - sampling、tensor parallel；
-- 任何性能 speedup 结论。
+- 任何性能 speedup 结论；
+- BF16 rounding 修复是否已在 A100 上通过，仍待服务器证据。
 
 ## 下一步顺序
 
