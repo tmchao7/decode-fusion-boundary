@@ -187,7 +187,8 @@ __device__ __forceinline__ uint4 ldg_load_weight_u4(const uint4 *ptr) {
 // =============================================================================
 
 __device__ void
-ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
+ldg_matvec_qkv(auto &grid, int block_id, int num_blocks,
+               const __nv_bfloat16 *__restrict__ input,
                const __nv_bfloat16 *__restrict__ norm_weight,
                const __nv_bfloat16 *__restrict__ q_weight,
                const __nv_bfloat16 *__restrict__ k_weight,
@@ -195,8 +196,6 @@ ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
                float *__restrict__ g_normalized, float *__restrict__ g_residual,
                float *__restrict__ q_out, float *__restrict__ k_out,
                float *__restrict__ v_out) {
-  int block_id = blockIdx.x;
-  int num_blocks = gridDim.x;
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
   __shared__ __align__(16) float s_norm[HIDDEN_SIZE];
@@ -353,7 +352,8 @@ __device__ inline __nv_bfloat16 *ldg_kv_ptr(
 }
 
 __device__ void ldg_attention(
-    auto &grid, float *__restrict__ q, float *__restrict__ k,
+    auto &grid, int block_id, int num_blocks, float *__restrict__ q,
+    float *__restrict__ k,
     const float *__restrict__ v, __nv_bfloat16 *__restrict__ k_cache,
     __nv_bfloat16 *__restrict__ v_cache, float *__restrict__ attn_out,
     int cache_len, int64_t max_seq_len, float attn_scale,
@@ -375,8 +375,6 @@ __device__ void ldg_attention(
     unsigned int *__restrict__ attn_flag =
         nullptr, // attention blocks signal completion
     int layer_idx = 0) {
-  int block_id = blockIdx.x;
-  int num_blocks = gridDim.x;
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
 
@@ -692,7 +690,8 @@ __device__ void ldg_attention(
 // =============================================================================
 
 __device__ void ldg_o_proj_postnorm_mlp(
-    auto &grid, const __nv_bfloat16 *__restrict__ o_weight,
+    auto &grid, int block_id, int num_blocks,
+    const __nv_bfloat16 *__restrict__ o_weight,
     const __nv_bfloat16 *__restrict__ post_norm_weight,
     const __nv_bfloat16 *__restrict__ gate_weight,
     const __nv_bfloat16 *__restrict__ up_weight,
@@ -700,8 +699,6 @@ __device__ void ldg_o_proj_postnorm_mlp(
     const float *__restrict__ attn_out, float *__restrict__ g_residual,
     float *__restrict__ g_activations, float *__restrict__ g_mlp_intermediate,
     __nv_bfloat16 *__restrict__ hidden_out) {
-  int block_id = blockIdx.x;
-  int num_blocks = gridDim.x;
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
   __shared__ __align__(16) float s_attn[Q_SIZE];
@@ -1458,20 +1455,22 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     // hidden_buffer.
     const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
 
-    ldg_matvec_qkv(grid, layer_input, w.input_layernorm_weight, w.q_proj_weight,
-                   w.k_proj_weight, w.v_proj_weight, g_activations, g_residual,
-                   g_q, g_k, g_v);
+    ldg_matvec_qkv(grid, block_id, gridDim.x, layer_input,
+                   w.input_layernorm_weight, w.q_proj_weight, w.k_proj_weight,
+                   w.v_proj_weight, g_activations, g_residual, g_q, g_k, g_v);
 
-    ldg_attention(grid, g_q, g_k, g_v, layer_k_cache, layer_v_cache, g_attn_out,
-                  cache_len, max_seq_len, attn_scale, w.q_norm_weight,
-                  w.k_norm_weight, cos_table, sin_table, position, nullptr,
-                  max_seq_len, w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
-                  w.down_proj_weight, kv_flag, attn_flag, layer);
+    ldg_attention(grid, block_id, gridDim.x, g_q, g_k, g_v, layer_k_cache,
+                  layer_v_cache, g_attn_out, cache_len, max_seq_len, attn_scale,
+                  w.q_norm_weight, w.k_norm_weight, cos_table, sin_table,
+                  position, nullptr, max_seq_len, w.o_proj_weight,
+                  w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+                  kv_flag, attn_flag, layer);
 
-    ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
-                            w.gate_proj_weight, w.up_proj_weight,
-                            w.down_proj_weight, g_attn_out, g_residual,
-                            g_activations, g_mlp_intermediate, hidden_buffer);
+    ldg_o_proj_postnorm_mlp(grid, block_id, gridDim.x, w.o_proj_weight,
+                            w.post_attn_layernorm_weight, w.gate_proj_weight,
+                            w.up_proj_weight, w.down_proj_weight, g_attn_out,
+                            g_residual, g_activations, g_mlp_intermediate,
+                            hidden_buffer);
   }
 
   // Final RMSNorm
@@ -1534,16 +1533,15 @@ __device__ void ldg_decode_one(
     unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
     int num_layers, int position, int input_token_id, int max_seq_len,
     const int *__restrict__ block_table, int block_size, int num_cache_blocks,
-    float attn_scale) {
+    float attn_scale, int block_id, int num_blocks) {
 
   int cache_len = position + 1;
-  int block_id = blockIdx.x;
 
   // The host resets the counter before the launch. For batch decode, this
   // function is called once per sequence, so seed the local generation from
   // the current global generation rather than restarting at zero.
   unsigned int initial_generation = *barrier_sense;
-  AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
+  AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)num_blocks,
                       initial_generation};
 
   // Flags are per-sequence state. Reset them only after the previous sequence
@@ -1573,20 +1571,22 @@ __device__ void ldg_decode_one(
 
     const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
 
-    ldg_matvec_qkv(grid, layer_input, w.input_layernorm_weight, w.q_proj_weight,
-                   w.k_proj_weight, w.v_proj_weight, g_activations, g_residual,
-                   g_q, g_k, g_v);
+    ldg_matvec_qkv(grid, block_id, num_blocks, layer_input,
+                   w.input_layernorm_weight, w.q_proj_weight, w.k_proj_weight,
+                   w.v_proj_weight, g_activations, g_residual, g_q, g_k, g_v);
 
-    ldg_attention(grid, g_q, g_k, g_v, layer_k_cache, layer_v_cache, g_attn_out,
-                  cache_len, max_seq_len, attn_scale, w.q_norm_weight,
-                  w.k_norm_weight, cos_table, sin_table, position, block_table,
-                  block_size, w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
-                  w.down_proj_weight, kv_flag, attn_flag, layer);
+    ldg_attention(grid, block_id, num_blocks, g_q, g_k, g_v, layer_k_cache,
+                  layer_v_cache, g_attn_out, cache_len, max_seq_len, attn_scale,
+                  w.q_norm_weight, w.k_norm_weight, cos_table, sin_table,
+                  position, block_table, block_size, w.o_proj_weight,
+                  w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+                  kv_flag, attn_flag, layer);
 
-    ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
-                            w.gate_proj_weight, w.up_proj_weight,
-                            w.down_proj_weight, g_attn_out, g_residual,
-                            g_activations, g_mlp_intermediate, hidden_buffer);
+    ldg_o_proj_postnorm_mlp(grid, block_id, num_blocks, w.o_proj_weight,
+                            w.post_attn_layernorm_weight, w.gate_proj_weight,
+                            w.up_proj_weight, w.down_proj_weight, g_attn_out,
+                            g_residual, g_activations, g_mlp_intermediate,
+                            hidden_buffer);
   }
 
   if (block_id == 0) {
@@ -1655,7 +1655,8 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
       k_cache, v_cache, hidden_buffer, g_activations, g_residual, g_q, g_k,
       g_v, g_attn_out, g_mlp_intermediate, g_normalized, barrier_counter,
       barrier_sense, kv_flag, attn_flag, num_layers, position, input_token_id,
-      max_seq_len, block_table, block_size, num_cache_blocks, attn_scale);
+      max_seq_len, block_table, block_size, num_cache_blocks, attn_scale,
+      blockIdx.x, gridDim.x);
 }
 
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_batch(
@@ -1677,32 +1678,35 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_batch(
     const int64_t *__restrict__ positions,
     const int *__restrict__ block_tables, int batch_size,
     int block_table_stride, int block_size, int num_cache_blocks,
-    float attn_scale) {
+    int blocks_per_seq, float attn_scale) {
   constexpr int HIDDEN_STRIDE = HIDDEN_SIZE;
   constexpr int Q_STRIDE = Q_SIZE;
   constexpr int KV_STRIDE = KV_SIZE;
   constexpr int MLP_STRIDE = INTERMEDIATE_SIZE;
 
-  for (int seq_id = 0; seq_id < batch_size; ++seq_id) {
-    ldg_decode_one(
-        embed_weight, layer_weights, final_norm_weight, cos_table, sin_table,
-        k_cache, v_cache,
-        hidden_buffer + seq_id * HIDDEN_STRIDE,
-        g_activations + seq_id * HIDDEN_STRIDE,
-        g_residual + seq_id * HIDDEN_STRIDE,
-        g_q + seq_id * Q_STRIDE,
-        g_k + seq_id * KV_STRIDE,
-        g_v + seq_id * KV_STRIDE,
-        g_attn_out + seq_id * Q_STRIDE,
-        g_mlp_intermediate + seq_id * MLP_STRIDE,
-        g_normalized + seq_id * HIDDEN_STRIDE,
-        barrier_counter, barrier_sense, kv_flag, attn_flag, num_layers,
-        static_cast<int>(positions[seq_id]),
-        static_cast<int>(input_token_ids[seq_id]),
-        block_size * num_cache_blocks,
-        block_tables + seq_id * block_table_stride, block_size,
-        num_cache_blocks, attn_scale);
-  }
+  // Parallel batch: partition the cooperative grid into disjoint per-sequence
+  // block groups. Each block belongs to exactly one sequence (seq_id), which
+  // syncs only within its own `blocks_per_seq` group using per-sequence
+  // barrier/flags. This replaces the previous serial `for (seq_id...)` loop
+  // with genuine sequence-level concurrency.
+  int seq_id = blockIdx.x / blocks_per_seq;
+  int local_block = blockIdx.x % blocks_per_seq;
+  if (seq_id >= batch_size)
+    return;
+
+  ldg_decode_one(
+      embed_weight, layer_weights, final_norm_weight, cos_table, sin_table,
+      k_cache, v_cache, hidden_buffer + seq_id * HIDDEN_STRIDE,
+      g_activations + seq_id * HIDDEN_STRIDE,
+      g_residual + seq_id * HIDDEN_STRIDE, g_q + seq_id * Q_STRIDE,
+      g_k + seq_id * KV_STRIDE, g_v + seq_id * KV_STRIDE,
+      g_attn_out + seq_id * Q_STRIDE, g_mlp_intermediate + seq_id * MLP_STRIDE,
+      g_normalized + seq_id * HIDDEN_STRIDE, barrier_counter + seq_id,
+      barrier_sense + seq_id, kv_flag + seq_id, attn_flag + seq_id, num_layers,
+      static_cast<int>(positions[seq_id]),
+      static_cast<int>(input_token_ids[seq_id]), block_size * num_cache_blocks,
+      block_tables + seq_id * block_table_stride, block_size, num_cache_blocks,
+      attn_scale, local_block, blocks_per_seq);
 }
 
 // Device-side step update: copies LM head output -> next token input,
@@ -1735,37 +1739,43 @@ static int *d_mutable_token_id = nullptr;
 int *h_pinned_position = nullptr;
 int *h_pinned_token_id = nullptr;
 
+// barrier/flags are per-sequence so parallel batch (one cooperative grid
+// partitioned into disjoint per-sequence block groups) can sync each sequence
+// independently using its own counter/sense generation and flag cells.
 static void ensure_barrier_alloc() {
   if (!d_barrier_counter) {
-    cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
-    cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
-    cudaMalloc(&d_kv_flag, sizeof(unsigned int));
-    cudaMalloc(&d_attn_flag, sizeof(unsigned int));
+    cudaMalloc(&d_barrier_counter, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMalloc(&d_barrier_sense, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMalloc(&d_kv_flag, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMalloc(&d_attn_flag, sizeof(unsigned int) * LDG_MAX_BATCH);
     cudaMalloc(&d_lm_head_counter, sizeof(unsigned int) * LDG_MAX_BATCH);
     cudaMalloc(&d_mutable_position, sizeof(int));
     cudaMalloc(&d_mutable_token_id, sizeof(int));
     cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
     cudaHostAlloc(&h_pinned_token_id, sizeof(int), cudaHostAllocDefault);
-    cudaMemset(d_barrier_counter, 0, sizeof(unsigned int));
-    cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
-    cudaMemset(d_kv_flag, 0, sizeof(unsigned int));
-    cudaMemset(d_attn_flag, 0, sizeof(unsigned int));
+    cudaMemset(d_barrier_counter, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMemset(d_barrier_sense, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMemset(d_kv_flag, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
+    cudaMemset(d_attn_flag, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
     cudaMemset(d_lm_head_counter, 0, sizeof(unsigned int) * LDG_MAX_BATCH);
   }
 }
 
 static cudaError_t ldg_reset_decode_state(cudaStream_t stream) {
   cudaError_t error = cudaMemsetAsync(d_barrier_counter, 0,
-                                      sizeof(unsigned int), stream);
+                                      sizeof(unsigned int) * LDG_MAX_BATCH, stream);
   if (error != cudaSuccess)
     return error;
-  error = cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
+  error = cudaMemsetAsync(d_barrier_sense, 0,
+                          sizeof(unsigned int) * LDG_MAX_BATCH, stream);
   if (error != cudaSuccess)
     return error;
-  error = cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
+  error = cudaMemsetAsync(d_kv_flag, 0,
+                          sizeof(unsigned int) * LDG_MAX_BATCH, stream);
   if (error != cudaSuccess)
     return error;
-  error = cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
+  error = cudaMemsetAsync(d_attn_flag, 0,
+                          sizeof(unsigned int) * LDG_MAX_BATCH, stream);
   if (error != cudaSuccess)
     return error;
   return cudaMemsetAsync(d_lm_head_counter, 0,
@@ -1924,13 +1934,18 @@ extern "C" void launch_ldg_decode_paged_batch(
   }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_batch, LDG_NUM_BLOCKS);
-  if (grid_blocks < LDG_ATTN_BLOCKS) {
+  // Partition the cooperative grid into per-sequence groups. Each sequence
+  // needs at least LDG_ATTN_BLOCKS blocks for its attention; we must also use
+  // a multiple of batch_size so every sequence gets an equal group.
+  int blocks_per_seq = grid_blocks / batch_size;
+  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
     fprintf(stderr,
-            "Megakernel batch launch requires at least %d resident blocks; "
-            "occupancy allows %d\n",
-            LDG_ATTN_BLOCKS, grid_blocks);
+            "Megakernel parallel batch needs >= %d blocks per sequence "
+            "(occupancy allows %d total for %d seqs)\n",
+            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
     return;
   }
+  grid_blocks = blocks_per_seq * batch_size;
 
   void *kernel_args[] = {
       LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
@@ -1947,7 +1962,7 @@ extern "C" void launch_ldg_decode_paged_batch(
       LDG_ARG(positions),            LDG_ARG(block_tables),
       LDG_ARG(batch_size),           LDG_ARG(block_table_stride),
       LDG_ARG(block_size),            LDG_ARG(num_cache_blocks),
-      LDG_ARG(attn_scale),
+      LDG_ARG(blocks_per_seq),        LDG_ARG(attn_scale),
   };
   if (!ldg_launch_cooperative(ldg_decode_kernel_batch, grid_blocks,
                               kernel_args, stream))

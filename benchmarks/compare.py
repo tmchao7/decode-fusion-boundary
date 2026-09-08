@@ -146,8 +146,11 @@ def run_case(
 ) -> dict[str, Any]:
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"unknown backend: {backend_name}")
-    if backend_name == "megakernel" and batch_size != 1:
-        raise ValueError("Megakernel benchmark cases must use batch_size=1")
+    # The megakernel batch is sequence-level parallel (one cooperative grid
+    # partitioned per sequence), but each sequence needs >= LDG_ATTN_BLOCKS
+    # blocks; the default 80-block grid caps parallel batch near 8-10.
+    if backend_name == "megakernel" and batch_size > 10:
+        raise ValueError("Megakernel parallel batch is bounded by the 80-block grid")
 
     backend_config = BACKEND_CONFIGS[backend_name]
     llm = LLM(
