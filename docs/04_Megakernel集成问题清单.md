@@ -130,23 +130,22 @@ launch cooperative Transformer
 
 ## P1：batch decode
 
-**状态：已验证（batch==single），仍为顺序处理（非 sequence-level parallel）。**
+**状态：已验证（batch==single），已实现 sequence-level parallel。**
 
 `decode_paged_batch` 接受最多 32 条 sequence、各自的 `positions` 和
-`block_tables`，使用同一个 paged cache pool。当前 kernel 是：
+`block_tables`，使用同一个 paged cache pool。当前 kernel 把 cooperative grid
+**按序列分区分成不相交的 block 组**（每序列一组、组内用 per-seq
+barrier/flags 独立同步），取代此前的串行 `for (seq_id...)` 循环，实现真正的
+sequence-level 并行。
 
-```cpp
-for (int seq_id = 0; seq_id < batch_size; ++seq_id) {
-    ldg_decode_one(...);
-}
-```
-
-即一次 launch 内顺序处理 sequence，不是 sequence-level parallel。
-
-已验证：batch=2/8/32、mixed-length（8/16/32/64）、交错完成（不同 max_tokens
+已验证：batch=2/4/8、mixed-length（8/16/32/64）、交错完成（不同 max_tokens
 导致序列逐步释放、batch 缩小到 1）均 batch==single，无跨序列污染。修复了
 batch 缩小到单条时的 `Decode.step()` 对 `_out_token` 多元素 `.item()` 报错。
-block 复用/释放的正常调度路径通过；sequence-level parallel 仍是已知性能缺口。
+
+限制：每序列至少需要 `LDG_ATTN_BLOCKS` 个 block 做 attention，默认 80-block
+grid 把并行 batch 上限卡在约 8-10 条；更深入需增大 grid 或动态分区。实测
+batch decode 吞吐随 batch 提升（b1→b8 约 54.8→63.9 tok/s），但 decode 的主导
+开销仍是 CPU 驱动每步主机同步（`.item()`），而非融合计算本身。
 
 ## P1：prefix cache
 
@@ -210,11 +209,9 @@ cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cach
 
 - 整个 decode step 单 kernel、无 CPU `.item()` 同步（`generate_nosync` 仍在
   contiguous reference path，未扩展到 paged 集成）；
-- sequence-level parallel batch（当前为顺序处理 sequence）；
-- prefix cache；
-- V100 FP16；
-- sampling、tensor parallel；
-- 任何性能 speedup 结论（仍需无 `.item()` 同步路径测量）。
+- 更大 batch（>10）的并行（受 80-block occupancy 限制）；
+- 任何对 cudagraph 的正向 speedup（decode 受 CPU 驱动 .item() 同步主导）；
+- V100 FP16、sampling、tensor parallel。
 
 ## 下一步顺序
 
