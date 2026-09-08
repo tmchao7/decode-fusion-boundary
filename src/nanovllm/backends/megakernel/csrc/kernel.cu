@@ -1709,6 +1709,38 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_batch(
       attn_scale, local_block, blocks_per_seq);
 }
 
+// Persistent paged decode: reads the mutable position/token from device memory
+// so N steps can be queued back-to-back with no host sync (the no-sync path).
+// Paged KV write/read uses the (fixed across the span) device block table.
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent_paged(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const LDGLayerWeights *__restrict__ layer_weights,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const __nv_bfloat16 *__restrict__ cos_table,
+    const __nv_bfloat16 *__restrict__ sin_table,
+    __nv_bfloat16 *__restrict__ k_cache, __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations, float *__restrict__ g_residual,
+    float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
+    float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_sense,
+    unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
+    int num_layers, const int *__restrict__ d_position,
+    const int *__restrict__ d_token_id, const int *__restrict__ block_table,
+    int block_size, int num_cache_blocks, float attn_scale) {
+  int position = *d_position;
+  int input_token_id = *d_token_id;
+  ldg_decode_one(
+      embed_weight, layer_weights, final_norm_weight, cos_table, sin_table,
+      k_cache, v_cache, hidden_buffer, g_activations, g_residual, g_q, g_k,
+      g_v, g_attn_out, g_mlp_intermediate, g_normalized, barrier_counter,
+      barrier_sense, kv_flag, attn_flag, num_layers, position, input_token_id,
+      block_size * num_cache_blocks, block_table, block_size, num_cache_blocks,
+      attn_scale, blockIdx.x, gridDim.x);
+}
+
 // Device-side step update: copies LM head output -> next token input,
 // increments position, logs output token. Uses device-side step counter
 // so the kernel arg is fixed (graph-compatible).
@@ -1805,13 +1837,20 @@ static bool ldg_check_phase(const char *phase, cudaStream_t stream) {
 template <typename Kernel>
 static bool ldg_launch_cooperative(Kernel kernel, int grid_blocks,
                                    void **args, cudaStream_t stream) {
-  int supported = 0;
-  cudaError_t error = cudaDeviceGetAttribute(
-      &supported, cudaDevAttrCooperativeLaunch, 0);
-  if (error != cudaSuccess) {
-    fprintf(stderr, "Megakernel cooperative-launch query failed: %s\n",
-            cudaGetErrorString(error));
-    return false;
+  // Cooperative-launch support is a device property; query it once and cache
+  // instead of issuing cudaDeviceGetAttribute on every step of a no-sync
+  // generation loop (host-side launch latency dominates the per-token cost).
+  static int supported = -1;
+  if (supported < 0) {
+    int value = 0;
+    cudaError_t error = cudaDeviceGetAttribute(
+        &value, cudaDevAttrCooperativeLaunch, 0);
+    if (error != cudaSuccess) {
+      fprintf(stderr, "Megakernel cooperative-launch query failed: %s\n",
+              cudaGetErrorString(error));
+      return false;
+    }
+    supported = value;
   }
   if (!supported) {
     fprintf(stderr,
@@ -1819,7 +1858,7 @@ static bool ldg_launch_cooperative(Kernel kernel, int grid_blocks,
             "but the active CUDA device does not support it\n");
     return false;
   }
-  error = cudaLaunchCooperativeKernel(
+  cudaError_t error = cudaLaunchCooperativeKernel(
       reinterpret_cast<const void *>(kernel), dim3(grid_blocks),
       dim3(LDG_BLOCK_SIZE), args, 0, stream);
   if (error != cudaSuccess) {
@@ -2122,6 +2161,90 @@ extern "C" void launch_ldg_generate_nosync(
         d_lm_head_counter, LDG_LM_NUM_BLOCKS);
 
     // Update step: feed output token back, increment position, log result
+    ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
+                                         d_mutable_position, output_log,
+                                         d_step_counter);
+  }
+}
+
+// N-step paged generate with NO per-step CPU sync, mirroring the contiguous
+// generate_nosync but writing/reading the nano-vLLM paged KV cache via the
+// (fixed over the span) device block table. Requires all blocks for the
+// generation span to be pre-allocated in the block table.
+extern "C" void launch_ldg_generate_nosync_paged(
+    int first_token_id, int num_steps, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, const int *block_table,
+    int *output_log, // device int[num_steps]: all generated tokens
+    int num_layers, int start_position, int block_size, int num_cache_blocks,
+    float attn_scale, cudaStream_t stream) {
+
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+  cudaError_t reset_error = ldg_reset_decode_state(stream);
+  if (reset_error != cudaSuccess) {
+    fprintf(stderr, "Megakernel paged decode-state reset failed: %s\n",
+            cudaGetErrorString(reset_error));
+    return;
+  }
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_persistent_paged, LDG_NUM_BLOCKS);
+  if (grid_blocks < LDG_ATTN_BLOCKS) {
+    fprintf(stderr,
+            "Megakernel paged generate launch requires at least %d resident "
+            "blocks; occupancy allows %d\n",
+            LDG_ATTN_BLOCKS, grid_blocks);
+    return;
+  }
+
+  static int *d_step_counter = nullptr;
+  static int *d_output_token = nullptr;
+  if (!d_step_counter) {
+    cudaMalloc(&d_step_counter, sizeof(int));
+    cudaMalloc(&d_output_token, sizeof(int));
+  }
+  cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+
+  // Set initial position and token_id on device
+  *h_pinned_position = start_position;
+  *h_pinned_token_id = first_token_id;
+  cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+
+  // Launch all N steps back-to-back with NO CPU sync between them.
+  for (int step = 0; step < num_steps; step++) {
+    void *kernel_args[] = {
+        LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+        LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+        LDG_ARG(sin_table),           LDG_ARG(k_cache),
+        LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+        LDG_ARG(g_activations),       LDG_ARG(g_residual),
+        LDG_ARG(g_q),                 LDG_ARG(g_k),
+        LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+        LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+        LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+        LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+        LDG_ARG(num_layers),          LDG_ARG(d_mutable_position),
+        LDG_ARG(d_mutable_token_id),  LDG_ARG(block_table),
+        LDG_ARG(block_size),          LDG_ARG(num_cache_blocks),
+        LDG_ARG(attn_scale),
+    };
+    if (!ldg_launch_cooperative(ldg_decode_kernel_persistent_paged,
+                                grid_blocks, kernel_args, stream))
+      return;
+
+    cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
+    ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+        (float *)block_max_vals, (int *)block_max_idxs, d_output_token,
+        d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
                                          d_mutable_position, output_log,
                                          d_step_counter);

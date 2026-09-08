@@ -19,6 +19,7 @@ VOCAB_SIZE = 151936
 _decode = torch.ops.nanovllm_megakernel_C.decode
 _decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
 _decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
+_generate_nosync_paged = torch.ops.nanovllm_megakernel_C.generate_nosync_paged
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
 
@@ -458,6 +459,56 @@ class Decoder:
         if eos in out:
             out = out[: out.index(eos)]
         return self.tokenizer.decode(out, skip_special_tokens=True)
+
+    def generate_paged(
+        self,
+        first_token_id: int,
+        start_position: int,
+        block_table,
+        num_tokens: int,
+    ) -> list[int]:
+        """Generate ``num_tokens`` on-device with NO per-step CPU sync.
+
+        All ``block_table`` blocks for positions
+        ``[start_position, start_position + num_tokens)`` must already be
+        allocated (the block table is fixed over the span). Returns the full
+        token list after a single host sync.
+        """
+        if not self._paged:
+            raise RuntimeError("generate_paged() requires paged KV cache mode")
+        if not isinstance(block_table, torch.Tensor):
+            block_table = torch.tensor(block_table, dtype=torch.int32, device="cuda")
+        block_table = block_table.to(torch.int32).contiguous()
+        output_ids = _generate_nosync_paged(
+            first_token_id,
+            num_tokens,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            block_table,
+            NUM_LAYERS,
+            start_position,
+            self._block_size,
+            self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return output_ids.cpu().tolist()
 
 
 def generate(prompt: str, max_tokens: int = 100, verbose: bool = True) -> str:
