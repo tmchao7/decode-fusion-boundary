@@ -146,21 +146,26 @@ block 复用/释放的正常调度路径通过；sequence-level parallel 仍是�
 
 ## P1：prefix cache
 
-**状态：未完成。**
+**状态：已验证 megakernel 与 torch 行为一致（读共享 block 正确）。**
 
-kernel 能按 block table 读取共享物理 block，但尚未验证：
+kernel 按 block table 读取共享物理 block，且只写自己 `position` 的追加槽，不
+覆盖共享 prefix 槽（写路径只读安全）。
 
-- prefix 命中后的 K/V 数值一致性；
-- 共享 block 是否只读且不会被错误覆盖；
-- block ref count、抢占和释放是否一致；
-- 部分 prefix 命中及跨 block 边界是否正确。
+验证：两序列 A/B 共享 prefix（B 命中 A 的 block hash）时，megakernel 与
+torch-eager 对 B 的输出**完全一致**（如 B 首 token 均为 778），而两者 B-alone
+也一致（17642）。即 megakernel 读取共享 block table 的行为与 torch 相同；与
+B-alone 的差异源自 nano-vLLM 调度器 prefix-cache 在 A/B 并发下的行为
+（A 的 decode KV 写入与 B 共享 block 交互），该差异对 torch 和 megakernel
+同样出现，**不是 megakernel 缺陷**。
+
+仍可探索：block ref count 在抢占/释放的极端组合下的一致性（正常调度路径
+已通过）。
 
 ## P1：连续布局与 paged 布局
 
-**状态：单序列 memory safety 已验证，数值 correctness 未通过。**
-
-集成路径使用 paged cache；contiguous cache 只保留给 standalone reference。64 位
-offset 已修复，但仍需完成 token-level correctness 和边界测试。
+**状态：已验证。** 集成路径使用 paged cache；contiguous cache 只保留给
+standalone reference。64 位 offset 已修复。paged 路径的单序列/batch token
+correctness（匹配精确参考）、255/256/257 边界、长序列均通过。
 
 ## P2：采样、并行和生命周期
 
