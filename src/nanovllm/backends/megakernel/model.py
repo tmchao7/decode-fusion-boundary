@@ -22,6 +22,25 @@ _decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
 
+def _resolve_rope_theta(config, default: float = 10000.0) -> float:
+    """Resolve the RoPE base frequency from a HuggingFace/transformers config.
+
+    Qwen3-0.6B stores ``rope_theta`` inside the ``rope_scaling`` dict (as
+    ``rope_scaling={"rope_theta": 1000000, "rope_type": "default"}``) rather
+    than as a top-level attribute.  nano-vLLM's Qwen3 model handles this in
+    ``Qwen3Attention.__init__``; the Megakernel weight loader must do the
+    same or the cos/sin tables will use the wrong frequency.
+    """
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", default)
+        else:
+            rope_theta = default
+    return float(rope_theta)
+
+
 def _rope_tables(rope_theta: float = 10000.0):
     inv_freq = 1.0 / (
         rope_theta ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
@@ -66,7 +85,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     state = model.state_dict()
 
     cos_table, sin_table = _rope_tables(
-        getattr(model.config, "rope_theta", 10000.0)
+        _resolve_rope_theta(model.config)
     )
 
     # Per-layer weight list (11 tensors per layer, flattened)
@@ -145,7 +164,7 @@ def weights_from_nano_model(model, hf_config):
         )
 
     cos_table, sin_table = _rope_tables(
-        getattr(hf_config, "rope_theta", 10000.0)
+        _resolve_rope_theta(hf_config)
     )
     embed_weight = qwen.embed_tokens.weight
     return dict(

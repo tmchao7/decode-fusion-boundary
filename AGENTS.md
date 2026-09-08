@@ -39,6 +39,31 @@ After the user runs `git pull --ff-only` on the server, they should be able to r
 
 The repository uses focused `unittest` checks under `tests/`; there is no coverage threshold. Run `PYTHONPATH=src python -m unittest discover -s tests -v` for backend/config/metrics logic. For runtime changes, also run `python -m compileall src/nanovllm tools` and validate on the target GPU with `examples/basic_generation.py` or `python -m benchmarks.compare MODEL`; include model, CUDA, GPU, JSON, and Markdown results with performance reports.
 
+## Debugging Lessons (learned from real incidents)
+
+When a correctness/numerical divergence looks deep (RoPE, attention, KV math all
+verify fine), **first go back to the most basic parameter/config settings** before
+instrumenting kernel internals. More than once the real root cause was a trivial
+config-resolution bug, not the fused math.
+
+- **Qwen3 `rope_theta` lives in `rope_scaling`, not as a top-level config field.**
+  Qwen3-0.6B stores it as `rope_scaling={"rope_theta": 1000000, "rope_type": "default"}`.
+  `getattr(config, "rope_theta", 10000.0)` silently falls back to the default
+  `10000.0`, producing wrong cos/sin tables. nano-vLLM's `models/qwen3.py`
+  (`Qwen3Attention.__init__`) resolves it via `rope_scaling.get("rope_theta", ...)`;
+  the Megakernel weight loader (`backends/megakernel/model.py`) must do the same.
+  Fixed by adding `_resolve_rope_theta(config)` there.
+- Because Qwen3 `rope_theta=1e6` with `head_dim=128` keeps low-frequency indexes
+  near identity (cos≈1, sin≈0), a wrong theta/position shows up as *asymmetric*
+  element errors: elements paired with a large-cos index blow up, pairs with
+  small-sin stay near-correct. Verify the cos/sin table + a single RoPE application
+  directly (see `tools/diag_rope.py`, `tools/diag_pos_search.py`) before suspecting
+  RMSNorm/attention/matvec.
+- The `cache_len` contract for decode attention must match the torch-eager path:
+  nano-vLLM stores the current K/V then calls `flash_attn_with_kvcache` with
+  `cache_seqlens=len(seq)=position+1`, so the query attends to `[0, position]`
+  inclusive. Keep `cache_len = position + 1` for both paged and contiguous paths.
+
 ## Commit & Pull Request Guidelines
 
 Recent commits use concise, imperative, lowercase subjects, often with a scope such as `fix(scheduler): ...`. Follow that style and keep each commit focused. Pull requests should explain the problem and approach, list validation commands and GPU/model configuration, call out performance or numerical changes, and include relevant logs or screenshots. Avoid unrelated refactors and generated artifacts.
