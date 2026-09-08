@@ -14,6 +14,23 @@ from typing import Any
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
 MAX_BATCH_SIZE = 32
 
+# Fixed-shape contract baked into the fused CUDA kernel (kernel.cu). This is
+# the single Python-side source of truth for what the kernel was compiled for;
+# compatibility() guards that the loaded nano-vLLM model matches it. If these
+# ever change, kernel.cu's constexpr block (HIDDEN_SIZE, NUM_*_HEADS, HEAD_DIM,
+# NUM_LAYERS at the launch site, LDG_VOCAB_SIZE) must change in lockstep.
+QWEN3_CONTRACT = {
+    "model_type": "qwen3",
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "vocab_size": 151936,
+    "max_model_len": 2048,
+    "head_dim": 128,
+}
+
 
 @dataclass(frozen=True)
 class Compatibility:
@@ -74,22 +91,19 @@ class MegakernelBackend:
                 return Compatibility(False, "Megakernel v1 supports greedy sampling only")
 
         hf_config = _get_attr(config, "hf_config")
-        expected = {
-            "model_type": "qwen3",
-            "hidden_size": 1024,
-            "intermediate_size": 3072,
-            "num_hidden_layers": 28,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 8,
-            "vocab_size": 151936,
-        }
-        for name, value in expected.items():
-            if _get_attr(hf_config, name) != value:
+        for name, expected in QWEN3_CONTRACT.items():
+            if name == "max_model_len":
+                actual = _get_attr(config, "max_model_len", 2048)
+            else:
+                actual = (
+                    _get_attr(hf_config, "head_dim", None)
+                    if name == "head_dim"
+                    else _get_attr(hf_config, name)
+                )
+                if name == "head_dim" and actual is None:
+                    actual = hf_config.hidden_size // hf_config.num_attention_heads
+            if actual != expected:
                 return Compatibility(False, f"unsupported Qwen config: {name}")
-
-        max_model_len = _get_attr(config, "max_model_len", 2048)
-        if max_model_len > 2048:
-            return Compatibility(False, "Megakernel v1 supports max_model_len <= 2048")
         return Compatibility(True)
 
     def set_kv_cache(self, kv_cache) -> None:
@@ -101,6 +115,63 @@ class MegakernelBackend:
 
     def disable(self, reason: str) -> None:
         self.disabled_reason = reason
+
+    @property
+    def ready(self) -> bool:
+        return self.decoder is not None
+
+    def ensure_ready(self) -> None:
+        """Build the decoder eagerly so the first decode has no cold-start spike.
+
+        Called at ModelRunner startup after the KV cache is attached. On any
+        failure the caller should ``disable()`` so the torch path remains the
+        integration fallback.
+        """
+        self._ensure_decoder()
+
+    def _validate_cache_layout(self) -> None:
+        """Validate nano-vLLM's paged cache against the kernel's offset contract.
+
+        The fused kernel (``ldg_kv_ptr``) computes flat element offsets assuming
+        a single contiguous ``[layers, blocks, block_size, kv_heads, head_dim]``
+        K/V view per cache with layer stride ``num_blocks * block_stride``.
+        ``PagedKVCacheSpec`` is the canonical description of that layout; check
+        the actual attached tensors against it so any layout drift surfaces at
+        init instead of producing silently-wrong attention.
+        """
+        from nanovllm.backends.megakernel.cache import PagedKVCacheSpec
+
+        kv = self.kv_cache
+        hf = self.config.hf_config
+        head_dim = getattr(hf, "head_dim", None) or (
+            hf.hidden_size // hf.num_attention_heads
+        )
+        spec = PagedKVCacheSpec(
+            num_layers=hf.num_hidden_layers,
+            num_blocks=kv.shape[2],
+            block_size=self.config.kvcache_block_size,
+            num_kv_heads=kv.shape[4],
+            head_dim=kv.shape[5],
+            dtype_itemsize=kv.element_size(),
+        )
+        expected = spec.shape  # (2, layers, blocks, bs, kv_heads, head_dim)
+        if tuple(kv.shape) != expected:
+            raise RuntimeError(
+                f"paged KV cache shape {tuple(kv.shape)} does not match the "
+                f"megakernel contract {expected}"
+            )
+        if not (kv[0].is_contiguous() and kv[1].is_contiguous()):
+            raise RuntimeError(
+                "paged KV cache views must be contiguous for the megakernel "
+                "layer-stride offset math"
+            )
+        if kv[0].size(0) * spec.layer_stride != kv[0].numel():
+            raise RuntimeError(
+                "paged KV cache layer stride does not match the megakernel "
+                "offset contract"
+            )
+        if head_dim != QWEN3_CONTRACT["head_dim"]:
+            raise RuntimeError("Qwen head_dim differs from the megakernel contract")
 
     def _ensure_decoder(self):
         if self.disabled_reason:
@@ -121,6 +192,8 @@ class MegakernelBackend:
                 "Megakernel v1 requires an A100-class BF16 GPU (sm_80+); "
                 f"detected sm_{capability[0]}{capability[1]}"
             )
+
+        self._validate_cache_layout()
 
         from .build import get_extension
 

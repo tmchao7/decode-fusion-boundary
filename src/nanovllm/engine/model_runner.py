@@ -63,6 +63,19 @@ class ModelRunner:
         if config.decode_backend == "megakernel":
             self.megakernel = MegakernelBackend(config, self.model)
             self.megakernel.set_kv_cache(self.kv_cache)
+            # Build the decoder (pack weights, allocate scratch) eagerly so the
+            # first decode token has no cold-start spike. On failure disable the
+            # megakernel and let the torch path remain the fallback.
+            try:
+                self.megakernel.ensure_ready()
+            except Exception as exc:  # noqa: BLE001 - fall back gracefully
+                warnings.warn(
+                    "Megakernel disabled at startup; using the standard "
+                    f"backend: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.megakernel.disable(str(exc))
         if self.use_cudagraph:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -278,22 +291,28 @@ class ModelRunner:
         # The first Megakernel milestone is intentionally a single-sequence,
         # greedy decode path. Unsupported requests fall back to the existing
         # PyTorch/eager/CUDA-Graph implementation below.
-        if self.megakernel is not None:
+        if self.megakernel is not None and not self.megakernel.disabled_reason:
             decision = MegakernelBackend.compatibility(
                 self.config, seqs, is_prefill
             )
             if not decision.supported and not is_prefill:
                 self.last_fallback_reason = decision.reason
             if decision.supported:
-                input_ids, positions = self.prepare_decode(seqs)
-                context = get_context()
                 try:
                     with nvtx_range("megakernel_decode"):
                         if len(seqs) == 1:
+                            # Single-seq decode reads seq.last_token/len(seq)
+                            # itself; only the block table (device tensor) is
+                            # required, so skip the full prepare_decode() which
+                            # would otherwise build unused CUDA tensors each step.
+                            block_tables = self.prepare_block_tables(seqs)
+                            set_context(False, block_tables=block_tables)
                             token_ids = self.megakernel.decode(
-                                seqs[0], context.block_tables[0]
+                                seqs[0], block_tables[0]
                             )
                         else:
+                            input_ids, positions = self.prepare_decode(seqs)
+                            context = get_context()
                             token_ids = self.megakernel.decode_batch(
                                 input_ids, positions, context.block_tables
                             )
