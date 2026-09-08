@@ -58,7 +58,11 @@ Megakernel cooperative Transformer kernel
   `_out_token`（size=`_max_batch_size`>1）调用 `.item()` 报错，改为读取元素 0。
 
 所以目前 Megakernel 单序列与 batch 的 paged KV 集成已在数值正确性上通过；
-speedup 仍需在无 `.item()` 同步的路径上进一步测量。
+但 **A/B benchmark 显示 decode 比 torch-cudagraph 慢 ~13-15x**（decode_tok_s
+≈0.07x，tpot_ms 约 -1300%）。根因是 Megakernel 仍走 CPU 驱动调度 + 每 token
+`.item()` 主机同步，而 cudagraph 对单 token decode 的 graph replay 开销极低。
+因此 speedup 需要先落地无 `.item()` 同步（device 侧调度）和 sequence-level
+并行 batch，再谈性能。
 
 ## P0：统一 cache contract
 
