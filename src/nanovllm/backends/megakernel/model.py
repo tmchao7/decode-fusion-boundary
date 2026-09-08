@@ -326,7 +326,10 @@ class Decoder:
                 self._num_cache_blocks,
                 self._attn_scale,
             )
-            return self._out_token.item()
+            # Single-sequence decode writes only element 0 of _out_token, which
+            # is sized to _max_batch_size (and can be > 1). Index element 0 so
+            # .item() works even after a multi-sequence batch shrinks to one.
+            return int(self._out_token[0].item())
         _decode(
             self._out_token,
             token_id,
@@ -355,7 +358,7 @@ class Decoder:
             self._attn_scale,
         )
         self._position += 1
-        return self._out_token.item()
+        return int(self._out_token[0].item())
 
     def step_batch(self, input_token_ids, positions, block_tables) -> list[int]:
         """Decode one token for each sequence using one paged batch operator."""
