@@ -22,6 +22,7 @@ _decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
 _decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
 _decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
 _generate_nosync_paged = torch.ops.nanovllm_megakernel_C.generate_nosync_paged
+_generate_nosync_paged_batch = torch.ops.nanovllm_megakernel_C.generate_nosync_paged_batch
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
 
@@ -546,6 +547,67 @@ class Decoder:
             self._attn_scale,
         )
         return output_ids.cpu().tolist()
+
+    def generate_paged_batch(
+        self,
+        input_token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_steps: int,
+        eos_token: int = -1,
+    ) -> list[list[int]]:
+        """Generate up to ``max_steps`` tokens for a batch with NO per-step sync.
+
+        Uses the WMMA tensor-core batch kernel in a no-sync loop with device-side
+        EOS. ``input_token_ids``/``positions`` are int64 CUDA tensors (mutated on
+        device); ``block_tables`` is fixed over the burst (R4). Returns
+        ``[seq][tokens]`` (de-truncated at EOS for each sequence).
+        """
+        if not self._paged:
+            raise RuntimeError("generate_paged_batch() requires paged KV cache mode")
+        batch_size = int(input_token_ids.numel())
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(
+                f"generate_paged_batch batch size 1-{self._max_batch_size}"
+            )
+        output = _generate_nosync_paged_batch(
+            input_token_ids.contiguous(),
+            positions.contiguous(),
+            block_tables.contiguous(),
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            NUM_LAYERS,
+            max_steps,
+            eos_token,
+            self._block_size,
+            self._num_cache_blocks,
+            self._attn_scale,
+        )
+        out = output.cpu().tolist()  # [batch][max_steps]
+        # Truncate each sequence at its EOS (if any) to match scheduler semantics.
+        result = []
+        for row in out:
+            if eos_token in row:
+                row = row[: row.index(eos_token)]
+            result.append(row)
+        return result
 
 
 def generate(prompt: str, max_tokens: int = 100, verbose: bool = True) -> str:

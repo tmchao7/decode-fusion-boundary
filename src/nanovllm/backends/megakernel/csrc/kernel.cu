@@ -1935,6 +1935,37 @@ __global__ void ldg_update_step(const int *__restrict__ lm_output,
   *d_step_counter = step + 1;
 }
 
+// Batch version of ldg_update_step: per-sequence token/position advance with
+// device-side EOS. Inactive sequences freeze (don't advance), so a completed
+// sequence re-decodes a frozen position in later burst steps (wasted compute,
+// but the cooperative WMMA grid can't shrink mid-burst without deadlock).
+// output_log is [batch_size * max_steps] int32 (row-major by seq).
+__global__ void ldg_update_step_batch(
+    const int *__restrict__ lm_output,   // [batch_size] int32
+    int64_t *__restrict__ d_positions,   // [batch_size]
+    int64_t *__restrict__ d_tokens,      // [batch_size]
+    int *__restrict__ output_log,        // [batch_size * max_steps]
+    int *__restrict__ d_active,          // [batch_size]
+    int eos_token, int batch_size, int max_steps,
+    int *__restrict__ d_step_counter) {
+  int step = *d_step_counter;
+  if (threadIdx.x == 0) {
+    for (int s = 0; s < batch_size; s++) {
+      if (!d_active[s])
+        continue;
+      int tok = lm_output[s];
+      output_log[s * max_steps + step] = tok;
+      if (tok == eos_token) {
+        d_active[s] = 0;
+      } else {
+        d_tokens[s] = tok;
+        d_positions[s] = d_positions[s] + 1;
+      }
+    }
+    *d_step_counter = step + 1;
+  }
+}
+
 // =============================================================================
 // Launch functions
 // =============================================================================
@@ -2485,6 +2516,89 @@ extern "C" void launch_ldg_generate_nosync_paged(
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
                                          d_mutable_position, output_log,
                                          d_step_counter);
+  }
+}
+
+// N-step BATCH paged generate with NO per-step CPU sync. Loops over
+// launch_ldg_decode_batch_wmma's WMMA batch kernel + batch LM head + batch
+// device-side update. Positions/tokens are int64 device arrays mutated by
+// ldg_update_step_batch; block tables are fixed across the burst (R4). Each
+// seq's output is row s of output_log[batch_size * max_steps]; EOS stops a seq.
+extern "C" void launch_ldg_generate_nosync_paged_batch(
+    const void *input_token_ids, const void *positions,
+    const void *block_tables, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int *output_log, // device int[batch*max_steps]
+    int num_layers, int batch_size, int block_table_stride, int block_size,
+    int num_cache_blocks, int max_steps, int eos_token, float attn_scale,
+    cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+  if (ldg_reset_decode_state(stream) != cudaSuccess) {
+    fprintf(stderr, "Megakernel WMMA batch no-sync reset failed\n");
+    return;
+  }
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_batch_wmma, LDG_NUM_BLOCKS);
+  int blocks_per_seq = grid_blocks / batch_size;
+  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
+    fprintf(stderr, "Megakernel WMMA batch no-sync needs >= %d blocks/seq (occupancy %d for %d seqs)\n",
+            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
+    return;
+  }
+  grid_blocks = blocks_per_seq * batch_size;
+
+  static int *d_step_counter = nullptr;
+  static int *d_lm_output = nullptr;
+  static int *d_active = nullptr;
+  if (!d_step_counter) {
+    cudaMalloc(&d_step_counter, sizeof(int));
+    cudaMalloc(&d_lm_output, sizeof(int) * LDG_MAX_BATCH);
+    cudaMalloc(&d_active, sizeof(int) * LDG_MAX_BATCH);
+  }
+  cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+  cudaMemsetAsync(d_active, 1, sizeof(int) * batch_size, stream);
+
+  for (int step = 0; step < max_steps; step++) {
+    ldg_reset_decode_state(stream);
+    void *kernel_args[] = {
+        LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+        LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+        LDG_ARG(sin_table),           LDG_ARG(k_cache),
+        LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+        LDG_ARG(g_activations),       LDG_ARG(g_residual),
+        LDG_ARG(g_q),                 LDG_ARG(g_k),
+        LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+        LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+        LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+        LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+        LDG_ARG(num_layers),          LDG_ARG(input_token_ids),
+        LDG_ARG(positions),            LDG_ARG(block_tables),
+        LDG_ARG(batch_size),           LDG_ARG(block_table_stride),
+        LDG_ARG(block_size),            LDG_ARG(num_cache_blocks),
+        LDG_ARG(blocks_per_seq),        LDG_ARG(attn_scale),
+    };
+    if (!ldg_launch_cooperative(ldg_decode_kernel_batch_wmma, grid_blocks,
+                                kernel_args, stream))
+      return;
+
+    cudaMemsetAsync(d_lm_head_counter, 0,
+                    sizeof(unsigned int) * batch_size, stream);
+    ldg_lm_head_fused_batch<<<LDG_LM_NUM_BLOCKS * batch_size,
+                              LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+        (float *)block_max_vals, (int *)block_max_idxs, d_lm_output,
+        d_lm_head_counter, LDG_LM_NUM_BLOCKS, batch_size, HIDDEN_SIZE,
+        LDG_LM_NUM_BLOCKS);
+
+    ldg_update_step_batch<<<1, 1, 0, stream>>>(
+        d_lm_output, (int64_t *)positions, (int64_t *)input_token_ids,
+        output_log, d_active, eos_token, batch_size, max_steps,
+        d_step_counter);
   }
 }
 

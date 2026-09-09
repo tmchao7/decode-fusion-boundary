@@ -438,6 +438,74 @@ torch::Tensor generate_nosync_paged(
   return output_log;
 }
 
+extern "C" void launch_ldg_generate_nosync_paged_batch(
+    const void *input_token_ids, const void *positions,
+    const void *block_tables, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int *output_log, int num_layers, int batch_size,
+    int block_table_stride, int block_size, int num_cache_blocks,
+    int max_steps, int eos_token, float attn_scale, cudaStream_t stream);
+
+torch::Tensor generate_nosync_paged_batch(
+    torch::Tensor input_token_ids, torch::Tensor positions,
+    torch::Tensor block_tables, torch::Tensor embed_weight,
+    torch::Tensor layer_weights_packed, torch::Tensor final_norm_weight,
+    torch::Tensor lm_head_weight, torch::Tensor cos_table,
+    torch::Tensor sin_table, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor hidden_buffer, torch::Tensor activations,
+    torch::Tensor residual, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor attn_out, torch::Tensor mlp_intermediate,
+    torch::Tensor normalized, torch::Tensor block_max_vals,
+    torch::Tensor block_max_idxs, int64_t num_layers, int64_t max_steps,
+    int64_t eos_token, int64_t block_size, int64_t num_cache_blocks,
+    double attn_scale) {
+  TORCH_CHECK(input_token_ids.is_cuda() && input_token_ids.is_contiguous() &&
+                  input_token_ids.scalar_type() == torch::kInt64 &&
+                  input_token_ids.dim() == 1 && input_token_ids.numel() > 0 &&
+                  input_token_ids.numel() <= 32,
+              "input_token_ids must be a contiguous 1D int64 CUDA tensor 1-32");
+  TORCH_CHECK(positions.is_cuda() && positions.is_contiguous() &&
+                  positions.scalar_type() == torch::kInt64 &&
+                  input_token_ids.numel() == positions.numel(),
+              "positions must match input_token_ids");
+  TORCH_CHECK(block_tables.is_cuda() && block_tables.is_contiguous() &&
+                  block_tables.dim() == 2 &&
+                  block_tables.size(0) == input_token_ids.numel(),
+              "block_tables must be a contiguous int32 2D CUDA tensor");
+  TORCH_CHECK(max_steps > 0, "max_steps must be positive");
+
+  int batch_size = static_cast<int>(input_token_ids.numel());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  auto output_log = torch::empty(
+      {batch_size, max_steps}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+  // Reset positions/tokens in place (the launcher mutates them via the batch
+  // update kernel), then run the whole burst without host sync.
+  // (The caller owns these buffers; the launcher updates them on device.)
+  launch_ldg_generate_nosync_paged_batch(
+      input_token_ids.data_ptr(), positions.data_ptr(),
+      block_tables.data_ptr(), embed_weight.data_ptr(),
+      reinterpret_cast<const LDGLayerWeights *>(layer_weights_packed.data_ptr()),
+      final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+      cos_table.data_ptr(), sin_table.data_ptr(), k_cache.data_ptr(),
+      v_cache.data_ptr(), hidden_buffer.data_ptr(), activations.data_ptr(),
+      residual.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+      attn_out.data_ptr(), mlp_intermediate.data_ptr(), normalized.data_ptr(),
+      block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+      static_cast<int *>(output_log.data_ptr()),
+      static_cast<int>(num_layers), batch_size,
+      static_cast<int>(block_tables.size(1)), static_cast<int>(block_size),
+      static_cast<int>(num_cache_blocks), static_cast<int>(max_steps),
+      static_cast<int>(eos_token), static_cast<float>(attn_scale), stream);
+
+  cudaStreamSynchronize(stream);
+  return output_log;
+}
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("decode(Tensor output_token, int input_token_id, "
           "Tensor embed_weight, Tensor layer_weights_packed, "
@@ -511,6 +579,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int num_layers, int start_position, int block_size, "
           "int num_cache_blocks, float attn_scale) -> Tensor");
   ops.impl("generate_nosync_paged", torch::kCUDA, &generate_nosync_paged);
+
+  ops.def("generate_nosync_paged_batch(Tensor input_token_ids, Tensor positions, "
+          "Tensor block_tables, Tensor embed_weight, "
+          "Tensor layer_weights_packed, Tensor final_norm_weight, "
+          "Tensor lm_head_weight, Tensor cos_table, Tensor sin_table, "
+          "Tensor k_cache, Tensor v_cache, "
+          "Tensor hidden_buffer, Tensor activations, Tensor residual, "
+          "Tensor q, Tensor k, Tensor v, Tensor attn_out, "
+          "Tensor mlp_intermediate, Tensor normalized, "
+          "Tensor block_max_vals, Tensor block_max_idxs, "
+          "int num_layers, int max_steps, int eos_token, "
+          "int block_size, int num_cache_blocks, float attn_scale) -> Tensor");
+  ops.impl("generate_nosync_paged_batch", torch::kCUDA, &generate_nosync_paged_batch);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
