@@ -415,44 +415,21 @@ class Decoder:
         return self._out_token[:batch_size].cpu().tolist()
 
     def decode_paged_batch_wmma(
-        self, input_token_ids: list[int], positions: list[int],
+        self, input_token_ids, positions: torch.Tensor,
         block_tables: torch.Tensor,
     ) -> list[int]:
-        """Paged batch decode using WMMA tensor-core GEMMs."""
-        batch_size = len(input_token_ids)
+        """Paged batch decode using WMMA tensor-core GEMMs.
+
+        ``input_token_ids`` and ``positions`` are int64 CUDA tensors (aligned with
+        ``step_batch``); this avoids the per-call host->device upload.
+        """
+        batch_size = int(input_token_ids.numel())
         if batch_size <= 0 or batch_size > self._max_batch_size:
             raise ValueError(f"wmma batch size 1-{self._max_batch_size}")
         _decode_paged_batch_wmma(
             self._out_token[:batch_size],
-            torch.tensor(input_token_ids, dtype=torch.int64, device="cuda"),
-            torch.tensor(positions, dtype=torch.int64, device="cuda"),
-            block_tables.contiguous(),
-            self._embed_weight, self._layer_weights_packed,
-            self._final_norm_weight, self._lm_head_weight,
-            self._cos_table, self._sin_table,
-            self._k_cache, self._v_cache,
-            self._hidden, self._act, self._res,
-            self._q, self._k, self._v,
-            self._attn_out, self._mlp_inter, self._norm_out,
-            self._bmax_vals, self._bmax_idxs,
-            NUM_LAYERS, self._block_size, self._num_cache_blocks,
-            self._attn_scale,
-        )
-        return self._out_token[:batch_size].cpu().tolist()
-
-
-    def decode_paged_batch_wmma(
-        self, input_token_ids: list[int], positions: list[int],
-        block_tables: torch.Tensor,
-    ) -> list[int]:
-        """Paged batch decode using WMMA tensor-core GEMMs."""
-        batch_size = len(input_token_ids)
-        if batch_size <= 0 or batch_size > self._max_batch_size:
-            raise ValueError(f"wmma batch size 1-{self._max_batch_size}")
-        _decode_paged_batch_wmma(
-            self._out_token[:batch_size],
-            torch.tensor(input_token_ids, dtype=torch.int64, device="cuda"),
-            torch.tensor(positions, dtype=torch.int64, device="cuda"),
+            input_token_ids,
+            positions,
             block_tables.contiguous(),
             self._embed_weight, self._layer_weights_packed,
             self._final_norm_weight, self._lm_head_weight,

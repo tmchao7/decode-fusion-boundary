@@ -214,9 +214,20 @@ class MegakernelBackend:
         )
 
     def decode_batch(self, input_ids, positions, block_tables) -> list[int]:
-        """Decode one token for each scheduler-selected sequence."""
+        """Decode one token for each scheduler-selected sequence.
+
+        Uses the WMMA tensor-core batch kernel when
+        ``config.megakernel_batch_kernel == "wmma"`` (A/B switch); otherwise the
+        scalar batch kernel.
+        """
 
         self._ensure_decoder()
+        if (
+            getattr(self.config, "megakernel_batch_kernel", "scalar") == "wmma"
+        ):
+            return self.decoder.decode_paged_batch_wmma(
+                input_ids, positions, block_tables
+            )
         return self.decoder.step_batch(input_ids, positions, block_tables)
 
     def decode(self, seq, block_table) -> list[int]:
