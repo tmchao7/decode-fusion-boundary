@@ -107,6 +107,25 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def allocate_burst(self, seq: Sequence, num_new_tokens: int) -> int:
+        """Pre-allocate the blocks a decode burst of ``num_new_tokens`` will need.
+
+        A no-sync megakernel burst generates K tokens with a **fixed** block
+        table, so the blocks for the whole span must be reserved up front rather
+        than appended one step at a time (``may_append``). Returns how many
+        blocks were appended.
+
+        Blocks appended past an early EOS are left unused and clean; the normal
+        ``deallocate`` path frees them when the sequence finishes.
+        """
+        target = (
+            len(seq) + num_new_tokens + self.block_size - 1
+        ) // self.block_size
+        missing = target - len(seq.block_table)
+        for _ in range(missing):
+            seq.block_table.append(self._allocate_block())
+        return missing
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

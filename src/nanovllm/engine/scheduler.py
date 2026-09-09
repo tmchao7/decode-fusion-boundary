@@ -80,6 +80,31 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def schedule_burst(self, burst_cap: int = 64) -> tuple[list[Sequence], int]:
+        """Select running sequences for a fixed-table no-sync megakernel burst.
+
+        Pre-allocates each sequence's decode blocks for up to ``min(max_tokens -
+        num_completion_tokens, burst_cap)`` new tokens so the block table stays
+        fixed for the whole burst. Returns ``(seqs, max_steps)`` where
+        ``max_steps`` is the largest per-seq token budget.
+        """
+        seqs = []
+        max_steps = 0
+        for _ in range(min(len(self.running), self.max_num_seqs)):
+            seq = self.running[0]
+            budget = min(
+                seq.max_tokens - seq.num_completion_tokens, burst_cap
+            )
+            if budget <= 0:
+                break
+            self.block_manager.allocate_burst(seq, budget)
+            seq.is_prefill = False
+            seqs.append(seq)
+            if budget > max_steps:
+                max_steps = budget
+            self.running.append(self.running.popleft())
+        return seqs, max_steps
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
