@@ -109,7 +109,8 @@ torch-eager 的残留差异是 ~1 ulp 融合 kernel 归约顺序差，会导致�
 
 ## P1：Megakernel 是否真正替代 CUDA Graph
 
-**状态：已实现 paged no-sync 生成，E2E 与 cudagraph 持平（微优）。**
+**状态：已实现 paged no-sync 生成（消除每 token `.item()` 同步），
+Megakernel E2E 由 ~15x 慢于 cudagraph 缩到 ~1.3-1.5x。**
 
 当前 `ModelRunner` 只在标准 torch backend 下 capture CUDA Graph；Megakernel
 backend 不无条件 capture。新增 `Decoder.generate_paged()`（`generate_nosync_paged`
@@ -117,18 +118,21 @@ op）：持久 paged kernel 从 device 读 position/token、写/读 paged KV cac
 `ldg_update_step` 在 device 上把 argmax → 下一 token + position，N 步 back-to-back
 排队，最后一次性同步——**零每 token `.item()` 同步**。
 
-实测（A100, 单序列 200 tokens, E2E 墙上时间/token）：
-- Megakernel `.item()` 路径：~25 ms/token
-- Megakernel **no-sync**：~2.8 ms/token
+实测（A100, 单序列 200 tokens, E2E 墙上时间/token, 干净 GPU）：
+- Megakernel `.item()` 路径：~29 ms/token
+- Megakernel **no-sync**：~3-4.5 ms/token（~7-12x 提升）
 - torch-cudagraph：~2.8 ms/token
 
-即 no-sync 把 Megakernel 从 ~15x 慢于 cudagraph 拉到**持平/微优**（纯 GPU 内核
-Megakernel 1.86ms 仍慢于 cudagraph 0.96ms，但其零 host 同步弥补并反超）。
+no-sync 消除了主机同步（从 15x 慢 → 1.3-1.5x 慢），但纯 GPU 内核 Megakernel
+1.86ms 仍慢于 cudagraph 0.96ms（无 tensor-core + 自研 attention），且
+cooperative launch 每步不重叠（~1.5ms/步非重叠驱动开销）。要反超需：把 LM head
+融合进 cooperative kernel 并在单 launch 内循环多 token（彻底去掉每步 cooperative
+launch 开销），以及/或引入 tensor-core matvec。
 正确性：`generate_paged` 输出与逐 token step 参考逐一一致（多 prompt 验证）。
 
 注意：`generate_paged` 需要生成区间内的 block 已预分配（block table 固定），
 目前作为独立 no-sync 能力使用，尚未接入 CPU 驱动的连续调度路径（EOS/动态
-block 仍由 scheduler 处理）。
+block 仍由 scheduler 处理）。可用 `tools/bench_nosync.py` 复现对比。
 
 ## P1：batch decode
 
@@ -210,11 +214,13 @@ cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cach
 
 ### 仍然不能宣传为已完成
 
-- 整个 decode step 单 kernel（仍是 persistent decode kernel + LM head 两个内核）；
+- 整个 decode step 单 kernel（仍是 persistent decode kernel + LM head 两个内核，
+  且每 token 一次 cooperative launch，launch 开销未完全消除）；
+- 对 cudagraph 的决定性正向 speedup（no-sync 已把 Megakernel 从 15x 慢缩到
+  ~1.3-1.5x 慢；纯 GPU 内核慢于 cudagraph，需 tensor-core + 单 launch 循环）；
 - paged no-sync 接入连续 CPU 调度路径（EOS/动态 block 由 scheduler 处理，
   no-sync 目前为预分配 block 的独立能力）；
 - 更大 batch（>10）的并行（受 80-block occupancy 限制）；
-- 纯 GPU 内核时间仍慢于 cudagraph（1.86 vs 0.96 ms/token，无 tensor-core）；
 - V100 FP16、sampling、tensor parallel。
 
 ## 下一步顺序
