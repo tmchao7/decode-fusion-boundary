@@ -19,6 +19,8 @@ VOCAB_SIZE = 151936
 _decode = torch.ops.nanovllm_megakernel_C.decode
 _decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
 _decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
+_decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
+_decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
 _generate_nosync_paged = torch.ops.nanovllm_megakernel_C.generate_nosync_paged
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
@@ -407,6 +409,60 @@ class Decoder:
             self._attn_scale,
         )
         return self._out_token[:batch_size].cpu().tolist()
+
+    def decode_paged_batch_wmma(
+        self, input_token_ids: list[int], positions: list[int],
+        block_tables: torch.Tensor,
+    ) -> list[int]:
+        """Paged batch decode using WMMA tensor-core GEMMs."""
+        batch_size = len(input_token_ids)
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(f"wmma batch size 1-{self._max_batch_size}")
+        _decode_paged_batch_wmma(
+            self._out_token[:batch_size],
+            torch.tensor(input_token_ids, dtype=torch.int64, device="cuda"),
+            torch.tensor(positions, dtype=torch.int64, device="cuda"),
+            block_tables.contiguous(),
+            self._embed_weight, self._layer_weights_packed,
+            self._final_norm_weight, self._lm_head_weight,
+            self._cos_table, self._sin_table,
+            self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res,
+            self._q, self._k, self._v,
+            self._attn_out, self._mlp_inter, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._block_size, self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return self._out_token[:batch_size].cpu().tolist()
+
+
+    def decode_paged_batch_wmma(
+        self, input_token_ids: list[int], positions: list[int],
+        block_tables: torch.Tensor,
+    ) -> list[int]:
+        """Paged batch decode using WMMA tensor-core GEMMs."""
+        batch_size = len(input_token_ids)
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(f"wmma batch size 1-{self._max_batch_size}")
+        _decode_paged_batch_wmma(
+            self._out_token[:batch_size],
+            torch.tensor(input_token_ids, dtype=torch.int64, device="cuda"),
+            torch.tensor(positions, dtype=torch.int64, device="cuda"),
+            block_tables.contiguous(),
+            self._embed_weight, self._layer_weights_packed,
+            self._final_norm_weight, self._lm_head_weight,
+            self._cos_table, self._sin_table,
+            self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res,
+            self._q, self._k, self._v,
+            self._attn_out, self._mlp_inter, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._block_size, self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return self._out_token[:batch_size].cpu().tolist()
+
 
     def reset(self):
         self._position = 0

@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 // =============================================================================
 // Model constants (Qwen3-0.6B)
@@ -908,6 +909,179 @@ __device__ void ldg_o_proj_postnorm_mlp(
   }
 
   grid.sync();
+}
+
+
+// =============================================================================
+// Batched WMMA (tensor-core) GEMM utilities
+// =============================================================================
+using namespace nvcuda;
+
+constexpr int WMMA_TILE = 16;
+
+template <int STRIDE_K, int STRIDE_N>
+__device__ void wmma_gemm(const float *__restrict__ H,
+                          const __nv_bfloat16 *__restrict__ W,
+                          float *__restrict__ C, int M, int N, int K,
+                          int global_warp, int num_warps) {
+  __shared__ __nv_bfloat16 s_a[WMMA_TILE * WMMA_TILE];
+  const int tiles_M = (M + WMMA_TILE - 1) / WMMA_TILE;
+  const int tiles_N = (N + WMMA_TILE - 1) / WMMA_TILE;
+  const int total_tiles = tiles_M * tiles_N;
+
+  for (int tile = global_warp; tile < total_tiles; tile += num_warps) {
+    int tr = tile / tiles_N, tc = tile % tiles_N;
+    int m0 = tr * WMMA_TILE, m_lim = min(m0 + WMMA_TILE, M);
+    int n0 = tc * WMMA_TILE;
+
+    wmma::fragment<wmma::accumulator, WMMA_TILE, WMMA_TILE, WMMA_TILE, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (int k = 0; k < K; k += WMMA_TILE) {
+      for (int idx = threadIdx.x; idx < WMMA_TILE * WMMA_TILE; idx += LDG_BLOCK_SIZE) {
+        int mi = idx / WMMA_TILE, ki = idx % WMMA_TILE;
+        float v = 0.0f;
+        if (m0 + mi < M && k + ki < K)
+          v = H[(m0 + mi) * STRIDE_K + k + ki];
+        s_a[idx] = __float2bfloat16(v);
+      }
+      __syncthreads();
+
+      wmma::fragment<wmma::matrix_a, WMMA_TILE, WMMA_TILE, WMMA_TILE,
+                     __nv_bfloat16, wmma::row_major> a;
+      wmma::load_matrix_sync(a, s_a, WMMA_TILE);
+
+      wmma::fragment<wmma::matrix_b, WMMA_TILE, WMMA_TILE, WMMA_TILE,
+                     __nv_bfloat16, wmma::col_major> b;
+      wmma::load_matrix_sync(b, W + n0 * K + k, K);
+
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(C + m0 * STRIDE_N + n0, acc, STRIDE_N, wmma::mem_row_major);
+  }
+}
+
+// =============================================================================
+// WMMA-batched decode kernel: syncs all blocks globally, uses WMMA tensor-core
+// for all GEMMs (QKV, O, Gate, Up, Down), per-seq attention.
+// =============================================================================
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
+ldg_decode_kernel_batch_wmma(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const LDGLayerWeights *__restrict__ layer_weights,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const __nv_bfloat16 *__restrict__ cos_table,
+    const __nv_bfloat16 *__restrict__ sin_table,
+    __nv_bfloat16 *__restrict__ k_cache, __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations, float *__restrict__ g_residual,
+    float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
+    float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_sense,
+    unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
+    int num_layers, const int64_t *__restrict__ input_token_ids,
+    const int64_t *__restrict__ positions,
+    const int *__restrict__ block_tables, int batch_size,
+    int block_table_stride, int block_size, int num_cache_blocks,
+    int blocks_per_seq, float attn_scale) {
+
+  if (batch_size > LDG_MAX_BATCH) return;
+
+  AtomicGridSync grid{barrier_counter, barrier_sense,
+                      (unsigned int)(blocks_per_seq * batch_size), 0u};
+
+  int block_id = blockIdx.x;
+  int seq_id = block_id / blocks_per_seq;
+  if (seq_id >= batch_size) return;
+  grid.sync();
+
+  constexpr int H = HIDDEN_SIZE, Q = Q_SIZE, K = KV_SIZE, M = INTERMEDIATE_SIZE;
+  int64_t kvls = block_tables
+      ? static_cast<int64_t>(num_cache_blocks) * block_size * K
+      : static_cast<int64_t>(NUM_KV_HEADS) * block_size * num_cache_blocks * HEAD_DIM;
+
+  for (int layer = 0; layer < num_layers; layer++) {
+    const LDGLayerWeights &w = layer_weights[layer];
+    __nv_bfloat16 *lk = k_cache + layer * kvls;
+    __nv_bfloat16 *lv = v_cache + layer * kvls;
+
+    // --- 1: Per-seq RMSNorm ---
+    {
+      const __nv_bfloat16 *inp = (layer == 0)
+          ? (embed_weight + input_token_ids[seq_id] * HIDDEN_SIZE)
+          : (hidden_buffer + seq_id * H);
+      float *on = g_activations + seq_id * H;
+      float *or_ = g_residual + seq_id * H;
+      int wid = threadIdx.x / WARP_SIZE, lid = threadIdx.x % WARP_SIZE;
+      __shared__ float sr[LDG_NUM_WARPS];
+
+      float ss = 0.0f;
+      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+        float v0 = __bfloat162float(__ldg(inp + i)); on[i] = v0; ss += v0 * v0;
+        int i1 = i + LDG_BLOCK_SIZE;
+        if (i1 < HIDDEN_SIZE) { float v1 = __bfloat162float(__ldg(inp + i1)); on[i1] = v1; ss += v1 * v1; }
+      }
+      if (block_id % blocks_per_seq == 0)
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+          or_[i] = on[i]; int i1 = i + LDG_BLOCK_SIZE; if (i1 < HIDDEN_SIZE) or_[i1] = on[i1];
+        }
+      ss = ldg_warp_reduce_sum(ss); if (lid == 0) sr[wid] = ss; __syncthreads();
+      if (wid == 0) { float sum=(lid<LDG_NUM_WARPS)?sr[lid]:0.0f; sum=ldg_warp_reduce_sum(sum); if(lid==0)sr[0]=rsqrtf(sum/HIDDEN_SIZE+LDG_RMS_EPS); }
+      __syncthreads(); float rs = sr[0];
+      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+        float w0=__bfloat162float(__ldg(w.input_layernorm_weight+i)); on[i]=ldg_round_bf16(ldg_round_bf16(on[i]*rs)*w0);
+        int i1=i+LDG_BLOCK_SIZE; if(i1<HIDDEN_SIZE){float w1=__bfloat162float(__ldg(w.input_layernorm_weight+i1)); on[i1]=ldg_round_bf16(ldg_round_bf16(on[i1]*rs)*w1);}
+      }
+    }
+    grid.sync();
+
+    // --- 2: Batched QKV WMMA ---
+    {
+      int nw = gridDim.x * LDG_NUM_WARPS, gw = block_id * LDG_NUM_WARPS + (threadIdx.x/WARP_SIZE);
+      wmma_gemm<H, Q>(g_activations, w.q_proj_weight, g_q, batch_size, Q_SIZE, HIDDEN_SIZE, gw, nw);
+      wmma_gemm<H, K>(g_activations, w.k_proj_weight, g_k, batch_size, KV_SIZE, HIDDEN_SIZE, gw, nw);
+      wmma_gemm<H, K>(g_activations, w.v_proj_weight, g_v, batch_size, KV_SIZE, HIDDEN_SIZE, gw, nw);
+    }
+    grid.sync();
+
+    // --- 3: ldg_attention ---
+    {
+      int pos2 = static_cast<int>(positions[seq_id]);
+      const int *btbl = block_tables ? (block_tables + seq_id * block_table_stride) : nullptr;
+      ldg_attention(grid, block_id % blocks_per_seq, blocks_per_seq,
+                    g_q + seq_id * Q, g_k + seq_id * K, g_v + seq_id * K,
+                    lk, lv, g_attn_out + seq_id * Q,
+                    pos2 + 1, block_size * num_cache_blocks, attn_scale,
+                    w.q_norm_weight, w.k_norm_weight, cos_table, sin_table,
+                    pos2, btbl, block_size, w.o_proj_weight,
+                    w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+                    kv_flag + seq_id, attn_flag + seq_id, layer);
+    }
+
+    // --- 4-9: ldg_o_proj_postnorm_mlp (per-seq) ---
+    ldg_o_proj_postnorm_mlp(
+        grid, block_id % blocks_per_seq, blocks_per_seq, w.o_proj_weight,
+        w.post_attn_layernorm_weight, w.gate_proj_weight,
+        w.up_proj_weight, w.down_proj_weight,
+        g_attn_out + seq_id * Q, g_residual + seq_id * H,
+        g_activations + seq_id * H, g_mlp_intermediate + seq_id * M,
+        hidden_buffer + seq_id * H);
+    grid.sync();
+  }
+
+  // Final RMSNorm (one block per seq)
+  if (block_id % blocks_per_seq == 0) {
+    int wid=threadIdx.x/WARP_SIZE,lid=threadIdx.x%WARP_SIZE; __shared__ float srf[LDG_NUM_WARPS];
+    float *no=g_normalized+seq_id*H,*ac=g_activations+seq_id*H;
+    float ss5=0;for(int i=threadIdx.x;i<HIDDEN_SIZE;i+=LDG_BLOCK_SIZE*2){float v=__bfloat162float(hidden_buffer[seq_id*H+i]);ac[i]=v;ss5+=v*v;int i1=i+LDG_BLOCK_SIZE;if(i1<HIDDEN_SIZE){float v1=__bfloat162float(hidden_buffer[seq_id*H+i1]);ac[i1]=v1;ss5+=v1*v1;}}
+    ss5=ldg_warp_reduce_sum(ss5);if(lid==0)srf[wid]=ss5;__syncthreads();
+    if(wid==0){float sum=(lid<LDG_NUM_WARPS)?srf[lid]:0.0f;sum=ldg_warp_reduce_sum(sum);if(lid==0)srf[0]=rsqrtf(sum/HIDDEN_SIZE+LDG_RMS_EPS);}
+    __syncthreads();float rs5=srf[0];
+    for(int i=threadIdx.x;i<HIDDEN_SIZE;i+=LDG_BLOCK_SIZE*2){float w0=__bfloat162float(__ldg(final_norm_weight+i));no[i]=ldg_round_bf16(ldg_round_bf16(ac[i]*rs5)*w0);int i1=i+LDG_BLOCK_SIZE;if(i1<HIDDEN_SIZE){float w1=__bfloat162float(__ldg(final_norm_weight+i1));no[i1]=ldg_round_bf16(ldg_round_bf16(ac[i1]*rs5)*w1);}}
+  }
 }
 
 __global__ void ldg_lm_head_phase1(const float *__restrict__ hidden,
@@ -2019,6 +2193,65 @@ extern "C" void launch_ldg_decode_paged_batch(
       LDG_LM_NUM_BLOCKS);
   if (!ldg_check_phase("LM head", stream))
     return;
+}
+
+extern "C" void launch_ldg_decode_batch_wmma(
+    const void *input_token_ids, const void *positions,
+    const void *block_tables, int *output_token_ids,
+    const void *embed_weight, const LDGLayerWeights *layer_weights,
+    const void *final_norm_weight, const void *lm_head_weight,
+    const void *cos_table, const void *sin_table, void *k_cache,
+    void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int batch_size,
+    int block_table_stride, int block_size, int num_cache_blocks,
+    float attn_scale, cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+  if (ldg_reset_decode_state(stream) != cudaSuccess) {
+    fprintf(stderr, "Megakernel WMMA decode-state reset failed\n");
+    return;
+  }
+  int grid_blocks = ldg_resident_grid_blocks(
+      ldg_decode_kernel_batch_wmma, LDG_NUM_BLOCKS);
+  int blocks_per_seq = grid_blocks / batch_size;
+  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
+    fprintf(stderr, "Megakernel WMMA batch needs >= %d blocks/seq (occupancy %d for %d seqs)\n",
+            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
+    return;
+  }
+  grid_blocks = blocks_per_seq * batch_size;
+  void *kernel_args[] = {
+      LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
+      LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
+      LDG_ARG(sin_table),           LDG_ARG(k_cache),
+      LDG_ARG(v_cache),             LDG_ARG(hidden_buffer),
+      LDG_ARG(g_activations),       LDG_ARG(g_residual),
+      LDG_ARG(g_q),                 LDG_ARG(g_k),
+      LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
+      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+      LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
+      LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
+      LDG_ARG(num_layers),          LDG_ARG(input_token_ids),
+      LDG_ARG(positions),            LDG_ARG(block_tables),
+      LDG_ARG(batch_size),           LDG_ARG(block_table_stride),
+      LDG_ARG(block_size),            LDG_ARG(num_cache_blocks),
+      LDG_ARG(blocks_per_seq),        LDG_ARG(attn_scale),
+  };
+  if (!ldg_launch_cooperative(ldg_decode_kernel_batch_wmma, grid_blocks,
+                              kernel_args, stream))
+    return;
+  if (!ldg_check_phase("transformer decode (WMMA)", stream))
+    return;
+  cudaMemsetAsync(d_lm_head_counter, 0,
+                  sizeof(unsigned int) * batch_size, stream);
+  ldg_lm_head_fused_batch<<<LDG_LM_NUM_BLOCKS * batch_size,
+                            LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+      (float *)block_max_vals, (int *)block_max_idxs, output_token_ids,
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS, batch_size, HIDDEN_SIZE,
+      LDG_LM_NUM_BLOCKS);
 }
 
 extern "C" void launch_ldg_decode_persistent(
