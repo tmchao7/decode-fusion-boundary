@@ -14,9 +14,12 @@
 
 Megakernel 已经**正确**地直接复用 nano-vLLM 的 paged KV cache 和 scheduler
 block table（不创建第二套 cache），单序列/batch 的 token correctness 已通过
-（匹配精确参考）。但要「在 batch 场景用 tensor-core 击败 cudagraph」，
-当前**两个关键能力虽然写好却没接进 engine**：WMMA tensor-core batch decode、
-和 no-sync 设备侧调度。把它们接进来并扩展到 batch，是后续的主线。
+（匹配精确参考）。R1（WMMA batch 接入 engine / config 开关）、R4（burst block
+预分配）、R2（batch WMMA no-sync 生成 + 设备侧 EOS）的**内核与 op 已实现并验证**
+（2026-09-09）：batch 1/2/4/8 的 no-sync 输出与逐步 WMMA 解码逐 token 一致，
+EOS 截断正确。仍在推进的是把这些能力强接入 `ModelRunner.run()`/scheduler 的
+burst 路径（`schedule_burst` → `generate_paged_batch` → `postprocess_burst`），
+以及 R3（单 launch 内多 token 循环）。
 
 ## 1. 当前代码真实状态（带锚点）
 
@@ -46,9 +49,21 @@ block table（不创建第二套 cache），单序列/batch 的 token correctnes
 
 | 能力 | op / wrapper | engine 是否调用 | 位置 |
 |---|---|---|---|
-| WMMA tensor-core batch decode | `decode_paged_batch_wmma` / `Decoder.decode_paged_batch_wmma` | **否** | `model.py:417-441`、`444-468`（重复定义，需去重）；kernel `kernel.cu:974-1165`、launch `kernel.cu:2278-2335` |
-| no-sync 单序列 N 步生成 | `generate_nosync_paged` / `Decoder.generate_paged` | **否**（仅 `tools/bench_nosync.py`） | `model.py:523-571`；kernel `kernel.cu:2487-2565`；设备侧反馈 `ldg_update_step` `kernel.cu:2001` |
-| 持久 paged 单序列 kernel | `ldg_decode_kernel_persistent_paged` | 被 no-sync 复用，未独立暴露 | `kernel.cu:1969` |
+| WMMA tensor-core batch decode | `decode_paged_batch_wmma` / `Decoder.decode_paged_batch_wmma` | **R1 已接**：`backend.decode_batch` 按 `config.megakernel_batch_kernel` 切换 scalar/wmma | `config.py`、`backend.py`、`model.py:417-441`（重复定义已删）；kernel `kernel.cu:974-1165`、launch `kernel.cu` |
+| no-sync 单序列 N 步生成 | `generate_nosync_paged` / `Decoder.generate_paged` | 否（仅 `tools/bench_nosync.py`） | `model.py`；kernel `kernel.cu`；`ldg_update_step` |
+| **batch WMMA no-sync + 设备侧 EOS**（R2） | `generate_nosync_paged_batch` / `Decoder.generate_paged_batch` | **内核已验证、未接 engine burst 路径** | `kernel.cu` `ldg_update_step_batch` + `launch_ldg_generate_nosync_paged_batch`；`model.py` |
+| 持久 paged 单序列 kernel | `ldg_decode_kernel_persistent_paged` | 被 no-sync 复用，未独立暴露 | `kernel.cu` |
+
+> **2026-09-09 进展**：R1 已把 WMMA batch 接进 engine（`megakernel_batch_kernel`
+> config 开关），R4 `BlockManager.allocate_burst` / `Scheduler.schedule_burst`
+> 已实现，R2 batch no-sync（含 `ldg_update_step_batch` 设备侧 EOS）已实现并通过
+> batch 1/2/4/8 与逐步 WMMA 逐 token 一致的验证。**剩余主工作**：把 burst 路径
+> （`schedule_burst` → `generate_paged_batch` → `postprocess_burst`）接进
+> `ModelRunner.run()` 多序列分支，然后测 batch no-sync 的端到端 perf，再做 R3。
+>
+> R1 实测（2026-09-09，step-wise cadence，max_tokens=32）：WMMA batch 的
+> decode_tok_s 17-39 vs cudagraph 386-2552 —— 仍被每 token `.item()`/`.cpu().tolist()`
+> 主机同步主导，确认「kernel 加速只在 R2/R3 no-sync 设备侧调度后才体现」。
 
 > **结论**：当前 engine 的 batch 路径走的是 **scalar** `decode_paged_batch`，
 > 并没有用 tensor-core；no-sync 也只测过单序列独立 bench，没进 scheduler 循环。
@@ -279,10 +294,11 @@ megakernel 被钉在「与 cudagraph 完全相同的逐步 cadence」上，只�
 
 | 优先级 | 改造点 | 主要文件 | 验收 |
 |---|---|---|---|
-| P0 | 去掉 `model.py:444-468` 重复 `decode_paged_batch_wmma` | `model.py` | compileall + 现有 unittest |
-| P0 | R1：WMMA batch 接进 engine（逐步 cadence，先不上 no-sync） | `model_runner.py:313-318`、`backend.py:216-220`、`model.py:417-441` | batch≤8 perf ≥ scalar batch，与 cudagraph <1.3x |
-| P0 | R4：burst block 预分配 | `block_manager.py`、`scheduler.py` | burst 内无 may_append；交错完成正确 |
-| P0 | R2：batch + WMMA no-sync（含 batch `ldg_update_step`、设备侧 EOS） | `kernel.cu:2001`/`2487` 旁、`model.py`、`backend.py`、`model_runner.py` | batch=8 E2E decode tok/s ≥ cudagraph |
+| ✅ | 去掉 `model.py:444-468` 重复 `decode_paged_batch_wmma` | `model.py` | 已并入 b7bd546 |
+| ✅ | R1：WMMA batch 接进 engine（config 开关 scalar/wmma） | `config.py`、`backend.py`、`model.py` | 已并入 b7bd546；step-wise perf 受 host-sync 主导（见 §1.2 注释） |
+| ✅ | R4：burst block 预分配 | `block_manager.py:allocate_burst`、`scheduler.py:schedule_burst` | 已并入 3fb8e1d；fixed table == 最终 num_blocks |
+| ✅ | R2：batch + WMMA no-sync（`ldg_update_step_batch`、设备侧 EOS） | `kernel.cu`、`model.py.generate_paged_batch` | 已并入 29796bd；batch 1/2/4/8 == 逐步 WMMA；EOS 截断正确 |
+| ⏳ | 把 R2/R4 强接入 engine burst 路径（`schedule_burst` → `generate_paged_batch` → `postprocess_burst`） | `model_runner.py`、`scheduler.py` | batch=8 E2E decode tok/s ≥ cudagraph |
 | P1 | R3：单 launch 内多 token 循环（LM head 融合进 grid） | `kernel.cu` | 纯 GPU kernel 时间 < cudagraph kernel 总和 |
 | P1 | attention 用 tensor-core（QK/PV WMMA） | `kernel.cu` `ldg_attention` | ncu memory throughput ≥ 70% 峰值 |
 | P2 | sampling（temperature>0）接入 | `backend.py:86-91`、kernel | 与 torch sampler 数值一致 |
