@@ -265,19 +265,23 @@ class Decoder:
             self._v_cache = torch.zeros_like(self._k_cache)
 
         # Scratch buffers are partitioned by sequence in paged batch mode.
+        # The WMMA tensor-core GEMM pads the batch (M) dimension to 16 rows
+        # (m16n16k16 tile), so every output buffer's batch axis is padded to a
+        # multiple of 16 to keep store_matrix_sync in-bounds.
+        pad_batch = ((self._max_batch_size + 15) // 16) * 16
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
-        self._hidden = torch.empty((self._max_batch_size, HIDDEN_SIZE), **bf16)
-        self._act = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
-        self._res = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
-        self._q = torch.empty((self._max_batch_size, Q_SIZE), **f32)
-        self._k = torch.empty((self._max_batch_size, KV_SIZE), **f32)
-        self._v = torch.empty((self._max_batch_size, KV_SIZE), **f32)
-        self._attn_out = torch.empty((self._max_batch_size, Q_SIZE), **f32)
+        self._hidden = torch.empty((pad_batch, HIDDEN_SIZE), **bf16)
+        self._act = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
+        self._res = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
+        self._q = torch.empty((pad_batch, Q_SIZE), **f32)
+        self._k = torch.empty((pad_batch, KV_SIZE), **f32)
+        self._v = torch.empty((pad_batch, KV_SIZE), **f32)
+        self._attn_out = torch.empty((pad_batch, Q_SIZE), **f32)
         self._mlp_inter = torch.empty(
-            (self._max_batch_size, INTERMEDIATE_SIZE), **f32
+            (pad_batch, INTERMEDIATE_SIZE), **f32
         )
-        self._norm_out = torch.empty((self._max_batch_size, HIDDEN_SIZE), **f32)
+        self._norm_out = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
         self._bmax_vals = torch.empty(
             self._max_batch_size * LDG_LM_NUM_BLOCKS, **f32
         )

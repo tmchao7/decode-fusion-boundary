@@ -957,7 +957,11 @@ __device__ void wmma_gemm(const float *__restrict__ H,
 
       wmma::mma_sync(acc, a, b, acc);
     }
-    wmma::store_matrix_sync(C + m0 * STRIDE_N + n0, acc, STRIDE_N, wmma::mem_row_major);
+    // The batch output buffers are padded to a multiple of 16 rows, so the
+    // full-16-row store_matrix_sync (whose padded rows for M<16 are garbage)
+    // stays within each buffer's padding and never overruns into neighbours.
+    wmma::store_matrix_sync(C + m0 * STRIDE_N + n0, acc, STRIDE_N,
+                            wmma::mem_row_major);
   }
 }
 
