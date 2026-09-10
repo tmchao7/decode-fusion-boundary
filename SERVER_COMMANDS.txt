@@ -162,6 +162,39 @@ run_correctness() {
       --json results/a100_correctness_batch2.json \
       2>&1 | tee results/a100_correctness_batch2.log
 
+  # WMMA batch kernel correctness (per-step, no burst).
+  # Tests ldg_decode_kernel_batch_wmma with the new batched WMMA MLP path.
+  # batch=1 goes through step_batch → decode_paged_batch_wmma (WMMA with M=1).
+  # batch=2,4,5 go through the same path with M=2,4,5.
+  timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32,128 \
+      --batch-sizes 1,2,4,5 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel-wmma \
+      --require-megakernel \
+      --json results/a100_correctness_wmma.json \
+      2>&1 | tee results/a100_correctness_wmma.log
+
+  # Burst (no-sync) WMMA batch kernel correctness.
+  # batch=1 dispatches to the persistent single-seq kernel (hybrid dispatch).
+  # batch=2,4,5 dispatch to generate_paged_batch (WMMA burst with device-side EOS).
+  timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32,128 \
+      --batch-sizes 1,2,4,5 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel-burst \
+      --require-megakernel \
+      --json results/a100_correctness_burst.json \
+      2>&1 | tee results/a100_correctness_burst.log
+
   echo "A100 correctness: OK"
 }
 
@@ -269,20 +302,28 @@ run_nosync_bench() {
     --seed 0 \
     2>&1 | tee results/a100_nosync_bench.log
 
-  # Controlled A/B: burst vs cudagraph at batch=1/2/4/8, prompt_len=32.
+  # Controlled A/B: burst vs cudagraph at batch=1/2/4/5, prompt_len=32.
+  # batch 1-5 is the correct range (80 blocks / 16 blocks_per_seq = 5 max).
   python -m benchmarks.compare \
     "$MODEL" \
     --suite performance \
     --workloads benchmarks/workloads.json \
     --backends torch-cudagraph,megakernel-burst \
     --prompt-lengths 32 \
-    --batch-sizes 1,2,4,8 \
+    --batch-sizes 1,2,4,5 \
     --max-tokens 128 \
     --warmup 2 \
     --runs 5 \
     --json results/a100_nosync_compare.json \
     --markdown results/a100_nosync_compare.md \
     2>&1 | tee results/a100_nosync_compare.log
+
+  # Multi-batch burst vs cudagraph with ignore_eos=False (burst path triggers).
+  # Uses synthetic prompts; batch=1/2/4/5 (max correct for 80-block grid).
+  python -m tools.bench_burst_batch \
+    --prompt-length 32 \
+    --max-tokens 128 \
+    2>&1 | tee results/a100_burst_batch_bench.log
 }
 
 run_profile() {

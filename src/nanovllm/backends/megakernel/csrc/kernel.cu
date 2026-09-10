@@ -965,6 +965,135 @@ __device__ void wmma_gemm(const float *__restrict__ H,
   }
 }
 
+// Batched WMMA O-proj + post-attn RMSNorm + Gate/Up + SiLU + Down + residual.
+// Replaces the per-seq scalar ldg_o_proj_postnorm_mlp in the WMMA batch kernel.
+// All GEMMs use the full grid (all blocks cooperate on the batched GEMM,
+// M=batch_size), while RMSNorm / SiLU / residual-add are elementwise.
+//
+// Buffers (batch rows are contiguous, row-major):
+//   g_attn_out:  [batch * Q_SIZE]  float  (input, consumed by O proj)
+//   g_residual:  [batch * H]       float  (residual storage)
+//   g_activations:[batch * H]      float  (O out → norm in → Down out)
+//   g_mlp_inter: [batch * M]       float  (Gate output, then SiLU*Up result)
+//   g_mlp_up:    [batch * M]       float  (Up output, temp)
+//   hidden_out:  [batch * H]       bf16   (final hidden output)
+__device__ void ldg_o_proj_mlp_wmma(
+    auto &grid, int block_id, int grid_size, int batch_size,
+    const __nv_bfloat16 *__restrict__ o_weight,
+    const __nv_bfloat16 *__restrict__ post_norm_weight,
+    const __nv_bfloat16 *__restrict__ gate_weight,
+    const __nv_bfloat16 *__restrict__ up_weight,
+    const __nv_bfloat16 *__restrict__ down_weight,
+    float *__restrict__ g_attn_out,    // [batch * Q]
+    float *__restrict__ g_residual,    // [batch * H]
+    float *__restrict__ g_activations, // [batch * H]
+    float *__restrict__ g_mlp_inter,   // [batch * M]
+    float *__restrict__ g_mlp_up,      // [batch * M]
+    __nv_bfloat16 *__restrict__ hidden_out) { // [batch * H]
+  int warp_id = threadIdx.x / WARP_SIZE;
+  int lane_id = threadIdx.x % WARP_SIZE;
+  int nw = grid_size * LDG_NUM_WARPS;
+  int gw = block_id * LDG_NUM_WARPS + warp_id;
+
+  constexpr int H = HIDDEN_SIZE, Q = Q_SIZE, M = INTERMEDIATE_SIZE;
+
+  // --- 1: Batched O projection ---
+  // g_activations[s*H + h] = sum_k g_attn_out[s*Q + k] * o_weight[h*Q + k]
+  wmma_gemm<Q, H>(g_attn_out, o_weight, g_activations, batch_size, H, Q, gw, nw);
+  grid.sync();
+
+  // --- 2: Residual add (elementwise, all blocks) ---
+  {
+    int total = batch_size * H;
+    for (int i = threadIdx.x + block_id * LDG_BLOCK_SIZE; i < total;
+         i += grid_size * LDG_BLOCK_SIZE) {
+      g_activations[i] = g_activations[i] + g_residual[i];
+    }
+  }
+  grid.sync();
+
+  // --- 3: Post-attention RMSNorm (per-seq, block 0 per seq) ---
+  // RMSNorm is cheap relative to GEMM; let block 0 of each seq do it.
+  // With the full grid cooperating, we assign seq s to block s (if s < grid_size).
+  // For batch ≤ 5 and grid_size = 80, each seq gets its own block.
+  {
+    __shared__ float smem_reduce[LDG_NUM_WARPS];
+    for (int s = block_id; s < batch_size; s += grid_size) {
+      float *act = g_activations + s * H;
+      float *res = g_residual + s * H;
+
+      float ss = 0.0f;
+      for (int i = threadIdx.x; i < H; i += LDG_BLOCK_SIZE * 2) {
+        float v0 = act[i]; ss += v0 * v0;
+        int i1 = i + LDG_BLOCK_SIZE;
+        if (i1 < H) { float v1 = act[i1]; ss += v1 * v1; }
+      }
+      ss = ldg_warp_reduce_sum(ss);
+      if (lane_id == 0) smem_reduce[warp_id] = ss;
+      __syncthreads();
+      if (warp_id == 0) {
+        float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
+        sum = ldg_warp_reduce_sum(sum);
+        if (lane_id == 0) smem_reduce[0] = rsqrtf(sum / float(H) + LDG_RMS_EPS);
+      }
+      __syncthreads();
+      float rstd = smem_reduce[0];
+
+      for (int i = threadIdx.x; i < H; i += LDG_BLOCK_SIZE * 2) {
+        res[i] = ldg_round_bf16(act[i]);
+        float w0 = __bfloat162float(__ldg(post_norm_weight + i));
+        act[i] = ldg_round_bf16(ldg_round_bf16(act[i] * rstd) * w0);
+        int i1 = i + LDG_BLOCK_SIZE;
+        if (i1 < H) {
+          res[i1] = ldg_round_bf16(act[i1]);
+          float w1 = __bfloat162float(__ldg(post_norm_weight + i1));
+          act[i1] = ldg_round_bf16(ldg_round_bf16(act[i1] * rstd) * w1);
+        }
+      }
+      __syncthreads();
+    }
+  }
+  grid.sync();
+
+  // --- 4: Batched Gate projection ---
+  // g_mlp_inter[s*M + m] = sum_k g_activations[s*H + k] * gate_weight[m*H + k]
+  wmma_gemm<H, M>(g_activations, gate_weight, g_mlp_inter, batch_size, M, H, gw, nw);
+  grid.sync();
+
+  // --- 5: Batched Up projection ---
+  // g_mlp_up[s*M + m] = sum_k g_activations[s*H + k] * up_weight[m*H + k]
+  wmma_gemm<H, M>(g_activations, up_weight, g_mlp_up, batch_size, M, H, gw, nw);
+  grid.sync();
+
+  // --- 6: SiLU(gate) * up (elementwise, all blocks) ---
+  {
+    int total = batch_size * M;
+    for (int i = threadIdx.x + block_id * LDG_BLOCK_SIZE; i < total;
+         i += grid_size * LDG_BLOCK_SIZE) {
+      float g = g_mlp_inter[i];
+      float u = g_mlp_up[i];
+      g_mlp_inter[i] = ldg_round_bf16(ldg_round_bf16(ldg_silu(g)) * u);
+    }
+  }
+  grid.sync();
+
+  // --- 7: Batched Down projection → g_activations (float) ---
+  // g_activations[s*H + h] = sum_k g_mlp_inter[s*M + k] * down_weight[h*M + k]
+  wmma_gemm<M, H>(g_mlp_inter, down_weight, g_activations, batch_size, H, M, gw, nw);
+  grid.sync();
+
+  // --- 8: Residual add + bf16 cast (elementwise, all blocks) ---
+  {
+    int total = batch_size * H;
+    for (int i = threadIdx.x + block_id * LDG_BLOCK_SIZE; i < total;
+         i += grid_size * LDG_BLOCK_SIZE) {
+      hidden_out[i] = __float2bfloat16(
+          ldg_round_bf16(g_activations[i]) + g_residual[i]);
+    }
+  }
+  grid.sync();
+}
+
 // =============================================================================
 // WMMA-batched decode kernel: syncs all blocks globally, uses WMMA tensor-core
 // for all GEMMs (QKV, O, Gate, Up, Down), per-seq attention.
@@ -982,6 +1111,7 @@ ldg_decode_kernel_batch_wmma(
     float *__restrict__ g_activations, float *__restrict__ g_residual,
     float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
     float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_mlp_up,
     float *__restrict__ g_normalized,
     unsigned int *__restrict__ barrier_counter,
     unsigned int *__restrict__ barrier_sense,
@@ -994,12 +1124,23 @@ ldg_decode_kernel_batch_wmma(
 
   if (batch_size > LDG_MAX_BATCH) return;
 
+  // Read the current generation from barrier_sense (like ldg_decode_one does)
+  // so we don't need ldg_reset_decode_state between no-sync steps.
+  unsigned int initial_generation = *barrier_sense;
   AtomicGridSync grid{barrier_counter, barrier_sense,
-                      (unsigned int)(blocks_per_seq * batch_size), 0u};
+                      (unsigned int)(blocks_per_seq * batch_size),
+                      initial_generation};
 
   int block_id = blockIdx.x;
   int seq_id = block_id / blocks_per_seq;
   if (seq_id >= batch_size) return;
+
+  // Reset per-seq flags (like ldg_decode_one does) so we don't need
+  // ldg_reset_decode_state between no-sync steps.
+  if (block_id % blocks_per_seq == 0 && threadIdx.x == 0) {
+    atomicExch(kv_flag + seq_id, 0u);
+    atomicExch(attn_flag + seq_id, 0u);
+  }
   grid.sync();
 
   constexpr int H = HIDDEN_SIZE, Q = Q_SIZE, K = KV_SIZE, M = INTERMEDIATE_SIZE;
@@ -1065,14 +1206,15 @@ ldg_decode_kernel_batch_wmma(
                     kv_flag + seq_id, attn_flag + seq_id, layer);
     }
 
-    // --- 4-9: ldg_o_proj_postnorm_mlp (per-seq) ---
-    ldg_o_proj_postnorm_mlp(
-        grid, block_id % blocks_per_seq, blocks_per_seq, w.o_proj_weight,
+    // --- 4-9: Batched WMMA O proj + RMSNorm + Gate/Up/SiLU/Down ---
+    // All blocks cooperate on the batched GEMM (M=batch_size), unlike the
+    // old per-seq scalar path which only used blocks_per_seq blocks.
+    ldg_o_proj_mlp_wmma(
+        grid, block_id, gridDim.x, batch_size, w.o_proj_weight,
         w.post_attn_layernorm_weight, w.gate_proj_weight,
         w.up_proj_weight, w.down_proj_weight,
-        g_attn_out + seq_id * Q, g_residual + seq_id * H,
-        g_activations + seq_id * H, g_mlp_intermediate + seq_id * M,
-        hidden_buffer + seq_id * H);
+        g_attn_out, g_residual, g_activations, g_mlp_intermediate,
+        g_mlp_up, hidden_buffer);
     grid.sync();
   }
 
@@ -2252,10 +2394,10 @@ extern "C" void launch_ldg_decode_batch_wmma(
     const void *cos_table, const void *sin_table, void *k_cache,
     void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int num_layers, int batch_size,
-    int block_table_stride, int block_size, int num_cache_blocks,
-    float attn_scale, cudaStream_t stream) {
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs, int num_layers,
+    int batch_size, int block_table_stride, int block_size,
+    int num_cache_blocks, float attn_scale, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
   if (ldg_reset_decode_state(stream) != cudaSuccess) {
@@ -2279,7 +2421,8 @@ extern "C" void launch_ldg_decode_batch_wmma(
       LDG_ARG(g_activations),       LDG_ARG(g_residual),
       LDG_ARG(g_q),                 LDG_ARG(g_k),
       LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
-      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+      LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_mlp_up),
+      LDG_ARG(g_normalized),
       LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
       LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
       LDG_ARG(num_layers),          LDG_ARG(input_token_ids),
@@ -2552,8 +2695,9 @@ extern "C" void launch_ldg_generate_nosync_paged_batch(
     const void *lm_head_weight, const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int *output_log, // device int[batch*max_steps]
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs,
+    int *output_log, // device int[batch*max_steps]
     int num_layers, int batch_size, int block_table_stride, int block_size,
     int num_cache_blocks, int max_steps, int eos_token, float attn_scale,
     cudaStream_t stream) {
@@ -2585,7 +2729,6 @@ extern "C" void launch_ldg_generate_nosync_paged_batch(
   cudaMemsetAsync(d_active, 1, sizeof(int) * batch_size, stream);
 
   for (int step = 0; step < max_steps; step++) {
-    ldg_reset_decode_state(stream);
     void *kernel_args[] = {
         LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
         LDG_ARG(final_norm_weight),   LDG_ARG(cos_table),
@@ -2594,7 +2737,8 @@ extern "C" void launch_ldg_generate_nosync_paged_batch(
         LDG_ARG(g_activations),       LDG_ARG(g_residual),
         LDG_ARG(g_q),                 LDG_ARG(g_k),
         LDG_ARG(g_v),                 LDG_ARG(g_attn_out),
-        LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_normalized),
+        LDG_ARG(g_mlp_intermediate),  LDG_ARG(g_mlp_up),
+        LDG_ARG(g_normalized),
         LDG_ARG(d_barrier_counter),   LDG_ARG(d_barrier_sense),
         LDG_ARG(d_kv_flag),           LDG_ARG(d_attn_flag),
         LDG_ARG(num_layers),          LDG_ARG(input_token_ids),

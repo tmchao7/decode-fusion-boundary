@@ -17,6 +17,18 @@ BACKENDS = {
     "torch-eager": {"decode_backend": "torch", "enforce_eager": True},
     "torch-cudagraph": {"decode_backend": "torch", "enforce_eager": False},
     "megakernel": {"decode_backend": "megakernel", "enforce_eager": False},
+    "megakernel-wmma": {
+        "decode_backend": "megakernel",
+        "enforce_eager": False,
+        "megakernel_batch_kernel": "wmma",
+        "megakernel_burst": False,
+    },
+    "megakernel-burst": {
+        "decode_backend": "megakernel",
+        "enforce_eager": False,
+        "megakernel_batch_kernel": "wmma",
+        "megakernel_burst": True,
+    },
 }
 
 

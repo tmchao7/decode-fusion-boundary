@@ -92,8 +92,8 @@ extern "C" void launch_ldg_decode_paged_batch(
     const void *cos_table, const void *sin_table, void *k_cache,
     void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int num_layers, int batch_size,
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs, int num_layers, int batch_size,
     int block_table_stride, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream);
 
@@ -105,8 +105,8 @@ extern "C" void launch_ldg_decode_batch_wmma(
     const void *cos_table, const void *sin_table, void *k_cache,
     void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int num_layers, int batch_size,
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs, int num_layers, int batch_size,
     int block_table_stride, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream);
 
@@ -118,8 +118,8 @@ extern "C" void launch_ldg_decode_batch_wmma(
     const void *cos_table, const void *sin_table, void *k_cache,
     void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int num_layers, int batch_size,
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs, int num_layers, int batch_size,
     int block_table_stride, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream);
 
@@ -311,7 +311,8 @@ void decode_paged_batch_wmma(
     torch::Tensor v_cache, torch::Tensor hidden_buffer,
     torch::Tensor activations, torch::Tensor residual, torch::Tensor q,
     torch::Tensor k, torch::Tensor v, torch::Tensor attn_out,
-    torch::Tensor mlp_intermediate, torch::Tensor normalized,
+    torch::Tensor mlp_intermediate, torch::Tensor mlp_up,
+    torch::Tensor normalized,
     torch::Tensor block_max_vals, torch::Tensor block_max_idxs,
     int64_t num_layers, int64_t block_size, int64_t num_cache_blocks,
     double attn_scale) {
@@ -327,7 +328,7 @@ void decode_paged_batch_wmma(
       cos_table.data_ptr(), sin_table.data_ptr(), k_cache.data_ptr(),
       v_cache.data_ptr(), hidden_buffer.data_ptr(), activations.data_ptr(),
       residual.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
-      attn_out.data_ptr(), mlp_intermediate.data_ptr(),
+      attn_out.data_ptr(), mlp_intermediate.data_ptr(), mlp_up.data_ptr(),
       normalized.data_ptr(), block_max_vals.data_ptr(),
       block_max_idxs.data_ptr(), static_cast<int>(num_layers),
       static_cast<int>(input_token_ids.numel()),
@@ -448,10 +449,11 @@ extern "C" void launch_ldg_generate_nosync_paged_batch(
     const void *lm_head_weight, const void *cos_table, const void *sin_table,
     void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
-    void *block_max_idxs, int *output_log, int num_layers, int batch_size,
-    int block_table_stride, int block_size, int num_cache_blocks,
-    int max_steps, int eos_token, float attn_scale, cudaStream_t stream);
+    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
+    void *block_max_vals, void *block_max_idxs, int *output_log,
+    int num_layers, int batch_size, int block_table_stride, int block_size,
+    int num_cache_blocks, int max_steps, int eos_token, float attn_scale,
+    cudaStream_t stream);
 
 torch::Tensor generate_nosync_paged_batch(
     torch::Tensor input_token_ids, torch::Tensor positions,
@@ -462,10 +464,10 @@ torch::Tensor generate_nosync_paged_batch(
     torch::Tensor hidden_buffer, torch::Tensor activations,
     torch::Tensor residual, torch::Tensor q, torch::Tensor k, torch::Tensor v,
     torch::Tensor attn_out, torch::Tensor mlp_intermediate,
-    torch::Tensor normalized, torch::Tensor block_max_vals,
-    torch::Tensor block_max_idxs, int64_t num_layers, int64_t max_steps,
-    int64_t eos_token, int64_t block_size, int64_t num_cache_blocks,
-    double attn_scale) {
+    torch::Tensor mlp_up, torch::Tensor normalized,
+    torch::Tensor block_max_vals, torch::Tensor block_max_idxs,
+    int64_t num_layers, int64_t max_steps, int64_t eos_token,
+    int64_t block_size, int64_t num_cache_blocks, double attn_scale) {
   TORCH_CHECK(input_token_ids.is_cuda() && input_token_ids.is_contiguous() &&
                   input_token_ids.scalar_type() == torch::kInt64 &&
                   input_token_ids.dim() == 1 && input_token_ids.numel() > 0 &&
@@ -500,8 +502,8 @@ torch::Tensor generate_nosync_paged_batch(
       cos_table.data_ptr(), sin_table.data_ptr(), k_cache.data_ptr(),
       v_cache.data_ptr(), hidden_buffer.data_ptr(), activations.data_ptr(),
       residual.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
-      attn_out.data_ptr(), mlp_intermediate.data_ptr(), normalized.data_ptr(),
-      block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+      attn_out.data_ptr(), mlp_intermediate.data_ptr(), mlp_up.data_ptr(),
+      normalized.data_ptr(), block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
       static_cast<int *>(output_log.data_ptr()),
       static_cast<int>(num_layers), batch_size,
       static_cast<int>(block_tables.size(1)), static_cast<int>(block_size),
@@ -555,7 +557,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor lm_head_weight, Tensor cos_table, Tensor sin_table, "
           "Tensor k_cache, Tensor v_cache, Tensor hidden_buffer, "
           "Tensor activations, Tensor residual, Tensor q, Tensor k, Tensor v, "
-          "Tensor attn_out, Tensor mlp_intermediate, Tensor normalized, "
+          "Tensor attn_out, Tensor mlp_intermediate, Tensor mlp_up, "
+          "Tensor normalized, "
           "Tensor block_max_vals, Tensor block_max_idxs, int num_layers, "
           "int block_size, int num_cache_blocks, float attn_scale) -> ()");
   ops.impl("decode_paged_batch_wmma", torch::kCUDA, &decode_paged_batch_wmma);
@@ -593,7 +596,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor k_cache, Tensor v_cache, "
           "Tensor hidden_buffer, Tensor activations, Tensor residual, "
           "Tensor q, Tensor k, Tensor v, Tensor attn_out, "
-          "Tensor mlp_intermediate, Tensor normalized, "
+          "Tensor mlp_intermediate, Tensor mlp_up, Tensor normalized, "
           "Tensor block_max_vals, Tensor block_max_idxs, "
           "int num_layers, int max_steps, int eos_token, "
           "int block_size, int num_cache_blocks, float attn_scale) -> Tensor");

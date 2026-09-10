@@ -1,6 +1,6 @@
 # Megakernel 后续演进路线（给后续 agent 的方向参考）
 
-> 更新日期：2026-09-09
+> 更新日期：2026-09-10
 >
 > 本文是**面向改造的方向性指南**，不是结论报告。所有「当前状态」均带 `file:line`
 > 锚点，方便后续 agent 直接定位。性能数字与 correctness 状态以
@@ -19,9 +19,24 @@ block table（不创建第二套 cache），单序列/batch 的 token correctnes
 （2026-09-09）：batch 1/2/4/8 的 no-sync 输出与逐步 WMMA 解码逐 token 一致，
 EOS 截断正确。**burst 路径已强接入 engine**（`LLMEngine.step` →
 `_should_burst` → `schedule_burst` → `run_burst` → `generate_paged_batch` →
-`postprocess_burst`），通过 `megakernel_burst` config 开关控制，65 unittest 通过。
-待 A100 perf 验证 batch no-sync vs cudagraph。仍在推进的是 R3（单 launch 内多
-token 循环，LM head 融合进 grid）。
+`postprocess_burst`），通过 `megakernel_burst` config 开关控制，66 unittest 通过。
+
+**2026-09-10 A100 perf 验证完成**（prompt_len=32, max_tokens=128, greedy）：
+
+| batch | cudagraph (ms/tok) | burst (ms/tok) | 倍率 | 结果 |
+|------:|-------------------:|---------------:|-----:|------|
+| 1 | 2.95 | **2.53** | **1.16x** | **BEATS** |
+| 2 | 1.63 | 5.67 | 0.29x | 输 |
+| 4 | 0.85 | 3.69 | 0.23x | 输 |
+| 8 | 0.43 | 5.07 | 0.08x | 输 |
+
+- **batch=1 已稳固**：hybrid dispatch 走 persistent kernel（`generate_paged`），
+  设备侧 EOS 已加到 `ldg_update_step`（`kernel.cu:1928`），2.53 ms/tok **1.16x
+  击败 cudagraph**。单序列 no-sync 原始 kernel 更快：1.99 ms/tok = 1.42x。
+- **batch>1 仍输**：WMMA batch kernel 每步 3.69-5.07 ms/tok，被 16×16 tile padding
+  和 per-step 3-launch 开销拖累。需要 R3（单 launch 融合）或 attention tensor-core。
+
+仍在推进的是 R3（单 launch 内多 token 循环，LM head 融合进 grid）。
 
 ## 1. 当前代码真实状态（带锚点）
 
@@ -52,22 +67,23 @@ token 循环，LM head 融合进 grid）。
 | 能力 | op / wrapper | engine 是否调用 | 位置 |
 |---|---|---|---|
 | WMMA tensor-core batch decode | `decode_paged_batch_wmma` / `Decoder.decode_paged_batch_wmma` | **R1 已接**：`backend.decode_batch` 按 `config.megakernel_batch_kernel` 切换 scalar/wmma | `config.py`、`backend.py`、`model.py:417-441`（重复定义已删）；kernel `kernel.cu:974-1165`、launch `kernel.cu` |
-| no-sync 单序列 N 步生成 | `generate_nosync_paged` / `Decoder.generate_paged` | 否（仅 `tools/bench_nosync.py`） | `model.py`；kernel `kernel.cu`；`ldg_update_step` |
-| **batch WMMA no-sync + 设备侧 EOS**（R2） | `generate_nosync_paged_batch` / `Decoder.generate_paged_batch` | **已接入 burst 路径**：`LLMEngine._step_burst` → `ModelRunner.run_burst` → `MegakernelBackend.generate_paged_batch` | `kernel.cu` `ldg_update_step_batch` + `launch_ldg_generate_nosync_paged_batch`；`model.py`；`backend.py`；`model_runner.py`；`llm_engine.py` |
+| no-sync 单序列 N 步生成 | `generate_nosync_paged` / `Decoder.generate_paged` | **已接入 burst 路径**：hybrid dispatch batch=1 时走 persistent kernel | `model.py:500`；kernel `kernel.cu:1928`（`ldg_update_step` 已加设备侧 EOS）；`backend.py:233`（hybrid dispatch） |
+| **batch WMMA no-sync + 设备侧 EOS**（R2） | `generate_nosync_paged_batch` / `Decoder.generate_paged_batch` | **已接入 burst 路径**：hybrid dispatch batch>1 时走 WMMA batch kernel | `kernel.cu` `ldg_update_step_batch` + `launch_ldg_generate_nosync_paged_batch`；`model.py:550`；`backend.py:233`；`model_runner.py:351`；`llm_engine.py:75` |
 | 持久 paged 单序列 kernel | `ldg_decode_kernel_persistent_paged` | 被 no-sync 复用，未独立暴露 | `kernel.cu` |
 
-> **2026-09-09 进展**：R1 已把 WMMA batch 接进 engine（`megakernel_batch_kernel`
-> config 开关），R4 `BlockManager.allocate_burst` / `Scheduler.schedule_burst`
-> 已实现，R2 batch no-sync（含 `ldg_update_step_batch` 设备侧 EOS）已实现并通过
-> batch 1/2/4/8 与逐步 WMMA 逐 token 一致的验证。**burst 路径已强接入 engine**：
-> `LLMEngine.step()` 在 `megakernel_burst=True` + WMMA + greedy + 无 waiting + 无
-> `ignore_eos` 时走 `_step_burst`（`schedule_burst` → `run_burst` →
-> `postprocess_burst`），否则走 `_step_normal`。`postprocess_burst` 处理 EOS
-> 截断、`max_tokens` 截断、block hash、finished 释放、以及**非 finished 序列的
-> `trim_burst`**（释放 burst 预分配但未用的 block，防止 step-wise 回退路径
-> `may_append` double-allocate 和 `prepare_decode` `block_table[-1]` 指向未来块）。
-> 65 unittest 通过。**待 A100 perf 验证**：`RUN_MODE=nosync bash SERVER_COMMANDS.txt`
-> 或 `python -m benchmarks.compare MODEL --backends megakernel-burst,torch-cudagraph`。
+> **2026-09-10 进展**：A100 perf 验证完成。batch=1 burst 通过 hybrid dispatch
+> 走 persistent kernel（`generate_paged`），**2.53 ms/tok vs cudagraph 2.95 ms/tok
+> = 1.16x BEATS**。设备侧 EOS 已加到单序列 `ldg_update_step`（`kernel.cu:1928`，
+> 新增 `d_active` + `eos_token` 参数，EOS 后写 -1 sentinel）。`generate_nosync_paged`
+> binding 新增 `eos_token` 参数，`output_log` 初始化为 -1（`torch::full`）。
+> `backend.generate_paged_batch` hybrid dispatch：batch=1 → persistent kernel，
+> batch>1 → WMMA batch kernel。batch>1 仍输（WMMA tile padding + 3-launch 开销），
+> 需 R3。66 unittest 通过（新增 hybrid dispatch 测试）。
+>
+> **benchmarks.compare 注意**：该工具用 `ignore_eos=True`，而 `_should_burst`
+> 拒绝 `ignore_eos` 序列（设备侧 EOS 无法 per-seq 关闭），导致 `megakernel-burst`
+> 后端回退到 step-wise（37 ms/tok）而非 burst。burst perf 必须用
+> `tools/bench_nosync.py` 或 `tools/bench_burst_batch.py`（`ignore_eos=False`）。
 >
 > R1 实测（2026-09-09，step-wise cadence，max_tokens=32）：WMMA batch 的
 > decode_tok_s 17-39 vs cudagraph 386-2552 —— 仍被每 token `.item()`/`.cpu().tolist()`
@@ -75,16 +91,17 @@ token 循环，LM head 融合进 grid）。
 
 ### 1.3 仍缺的零件（未完成）
 
-- **batch + no-sync**：`ldg_update_step` (`kernel.cu:2001`) 只反馈单序列
-  `d_output_token → d_mutable_token_id / d_mutable_position`；没有 batch 版
-  （per-seq token/position 数组 + per-seq EOS 掩码 + per-seq 是否还在生成的 flag）。
-- **设备侧 EOS / 提前结束**：`generate_paged` 假设 `num_tokens` 固定、block 全预分配，
-  没有在 device 上识别 EOS 后停止单条序列。
+- ~~**batch + no-sync**~~：✅ 已完成。`ldg_update_step_batch` (`kernel.cu:1957`)
+  支持 per-seq token/position/active/EOS；单序列 `ldg_update_step` (`kernel.cu:1928`)
+  也已加 `d_active` + `eos_token`。
+- ~~**设备侧 EOS / 提前结束**~~：✅ 已完成。单序列和 batch 路径都有设备侧 EOS，
+  inactive 序列写 -1 sentinel，host 侧 `postprocess_burst` 截断。
 - **LM head 仍在 cooperative kernel 之外**：每步是 `cooperative kernel + lm_head
   kernel + (no-sync 时) update_step` 三个 launch，per-step launch 开销没完全消除
-  （`kernel.cu:2450-2480` 循环里每步 3 个 launch）。
-- **burst 预分配 block**：scheduler 现在一步一分配（`block_manager.may_append`
-  `scheduler.py:70`），no-sync 多步生成需要生成区间内的 block 一次性预分配好。
+  （`kernel.cu:2536` 循环里每步 3 个 launch）。**这是 batch>1 仍输的核心原因**。
+- **WMMA batch kernel tile padding**：`ldg_decode_kernel_batch_wmma` 用 16×16 tile，
+  batch<16 时 padded 行仍被计算（浪费算力）。batch=2 实测 5.67 ms/tok vs
+  persistent batch=1 2.53 ms/tok。
 
 ## 2. 要在 batch 场景用 tensor-core 击败 cudagraph：差距分解
 
@@ -302,8 +319,9 @@ megakernel 被钉在「与 cudagraph 完全相同的逐步 cadence」上，只�
 | ✅ | R1：WMMA batch 接进 engine（config 开关 scalar/wmma） | `config.py`、`backend.py`、`model.py` | 已并入 b7bd546；step-wise perf 受 host-sync 主导（见 §1.2 注释） |
 | ✅ | R4：burst block 预分配 | `block_manager.py:allocate_burst`、`scheduler.py:schedule_burst` | 已并入 3fb8e1d；fixed table == 最终 num_blocks |
 | ✅ | R2：batch + WMMA no-sync（`ldg_update_step_batch`、设备侧 EOS） | `kernel.cu`、`model.py.generate_paged_batch` | 已并入 29796bd；batch 1/2/4/8 == 逐步 WMMA；EOS 截断正确 |
-| ✅ | **burst 路径强接入 engine**（`schedule_burst` → `generate_paged_batch` → `postprocess_burst`） | `llm_engine.py`、`scheduler.py`、`model_runner.py`、`backend.py`、`block_manager.py`、`config.py`、`compare.py`、`bench_nosync.py` | 65 unittest 通过；`megakernel-burst` 后端可在 engine 端到端运行；**待 A100 perf 验证** |
-| P1 | R3：单 launch 内多 token 循环（LM head 融合进 grid） | `kernel.cu` | 纯 GPU kernel 时间 < cudagraph kernel 总和 |
+| ✅ | **burst 路径强接入 engine**（`schedule_burst` → `generate_paged_batch` → `postprocess_burst`） | `llm_engine.py`、`scheduler.py`、`model_runner.py`、`backend.py`、`block_manager.py`、`config.py`、`compare.py`、`bench_nosync.py` | 66 unittest 通过；`megakernel-burst` 后端可在 engine 端到端运行 |
+| ✅ | **单序列 `ldg_update_step` 设备侧 EOS** + **hybrid dispatch** | `kernel.cu:1928`、`torch_bindings.cpp`、`model.py:500`、`backend.py:233` | batch=1 burst 2.53 ms/tok **1.16x BEATS cudagraph**；A100 实测 2026-09-10 |
+| P0 | **R3：单 launch 内多 token 循环**（LM head 融合进 grid）——batch>1 击败 cudagraph 的必经之路 | `kernel.cu` | batch=2/4/8 E2E ms/tok < cudagraph；纯 GPU kernel 时间 < cudagraph kernel 总和 |
 | P1 | attention 用 tensor-core（QK/PV WMMA） | `kernel.cu` `ldg_attention` | ncu memory throughput ≥ 70% 峰值 |
 | P2 | sampling（temperature>0）接入 | `backend.py:86-91`、kernel | 与 torch sampler 数值一致 |
 | P2 | V100 FP16 路径（sm_70 WMMA 是 fp16） | `kernel.cu`、`build.py` | V100 correctness + perf |

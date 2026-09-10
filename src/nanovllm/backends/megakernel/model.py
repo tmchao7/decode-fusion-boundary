@@ -281,6 +281,9 @@ class Decoder:
         self._mlp_inter = torch.empty(
             (pad_batch, INTERMEDIATE_SIZE), **f32
         )
+        self._mlp_up = torch.empty(
+            (pad_batch, INTERMEDIATE_SIZE), **f32
+        )
         self._norm_out = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
         self._bmax_vals = torch.empty(
             self._max_batch_size * LDG_LM_NUM_BLOCKS, **f32
@@ -437,7 +440,7 @@ class Decoder:
             self._k_cache, self._v_cache,
             self._hidden, self._act, self._res,
             self._q, self._k, self._v,
-            self._attn_out, self._mlp_inter, self._norm_out,
+            self._attn_out, self._mlp_inter, self._mlp_up, self._norm_out,
             self._bmax_vals, self._bmax_idxs,
             NUM_LAYERS, self._block_size, self._num_cache_blocks,
             self._attn_scale,
