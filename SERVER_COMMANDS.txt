@@ -165,14 +165,16 @@ run_correctness() {
   # WMMA batch kernel correctness (per-step, no burst).
   # Tests ldg_decode_kernel_batch_wmma with the new batched WMMA MLP path.
   # batch=1 goes through step_batch → decode_paged_batch_wmma (WMMA with M=1).
-  # batch=2,4,5 go through the same path with M=2,4,5.
+  # batch=2,3,4,5 go through the same path with M=2,3,4,5.
+  # batch=3 is included because it exposed the GPU-scope fence race
+  # (grid_blocks=78 leaves 2 idle SMs, changing L1 write-back timing).
   timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
     python -m tools.correctness_smoke \
       "$MODEL" \
       --prompt-lengths 32,128 \
-      --batch-sizes 1,2,4,5 \
+      --batch-sizes 1,2,3,4,5 \
       --max-tokens 16 \
       --backends torch-eager,megakernel-wmma \
       --require-megakernel \
@@ -181,19 +183,34 @@ run_correctness() {
 
   # Burst (no-sync) WMMA batch kernel correctness.
   # batch=1 dispatches to the persistent single-seq kernel (hybrid dispatch).
-  # batch=2,4,5 dispatch to generate_paged_batch (WMMA burst with device-side EOS).
+  # batch=2,3,4,5 dispatch to generate_paged_batch (WMMA burst with device-side EOS).
   timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
     python -m tools.correctness_smoke \
       "$MODEL" \
       --prompt-lengths 32,128 \
-      --batch-sizes 1,2,4,5 \
+      --batch-sizes 1,2,3,4,5 \
       --max-tokens 16 \
       --backends torch-eager,megakernel-burst \
       --require-megakernel \
       --json results/a100_correctness_burst.json \
       2>&1 | tee results/a100_correctness_burst.log
+
+  # WMMA vs scalar megakernel token-by-token (the correct correctness gate).
+  # The scalar megakernel itself diverges from torch-eager by ~1-ulp (bf16
+  # reduction-order), so the gate for the WMMA conversion is WMMA == scalar,
+  # not WMMA == torch-eager. Each backend runs in a fresh process to avoid
+  # CUDA-fault poisoning. Includes batch=3 (fence-race exposed case).
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_wmma_vs_scalar \
+      "$MODEL" \
+      --batch-sizes 1,2,3,4,5 \
+      --prompt-lengths 32,128 \
+      --max-tokens 16 \
+      2>&1 | tee results/a100_correctness_wmma_vs_scalar.log
 
   echo "A100 correctness: OK"
 }

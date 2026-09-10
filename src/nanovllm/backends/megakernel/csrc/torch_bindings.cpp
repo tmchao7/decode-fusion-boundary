@@ -92,8 +92,8 @@ extern "C" void launch_ldg_decode_paged_batch(
     const void *cos_table, const void *sin_table, void *k_cache,
     void *v_cache, void *hidden_buffer, void *g_activations,
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
-    void *block_max_vals, void *block_max_idxs, int num_layers, int batch_size,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int batch_size,
     int block_table_stride, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream);
 

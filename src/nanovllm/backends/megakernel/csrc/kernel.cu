@@ -106,9 +106,14 @@ struct AtomicGridSync {
 
   __device__ void sync() {
     __syncthreads();
+    // All threads in the block must publish their global stores (e.g. WMMA
+    // store_matrix_sync by other warps) at GPU scope before thread 0 signals
+    // arrival; fence.acq_rel.gpu is a per-thread fence, so only the executing
+    // thread's writes are made visible. Without this, reader blocks can see
+    // stale GEMM output after the barrier releases (cross-SM WMMA race).
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
     if (threadIdx.x == 0) {
       unsigned int my_gen = local_gen;
-      asm volatile("fence.acq_rel.gpu;" ::: "memory");
       unsigned int arrived = atomicAdd(counter, 1);
       if (arrived == nblocks - 1) {
         *counter = 0;
@@ -505,10 +510,14 @@ __device__ void ldg_attention(
     if (block_id < ATTN_BLOCKS) {
       __syncthreads();
     }
-    // Block 0: signal KV cache is written (after intra-block sync)
-    if (block_id == 0 && threadIdx.x == 0) {
+    // Block 0: signal KV cache is written (after intra-block sync). All
+    // threads of block 0 fence their KV writes at GPU scope (fence is
+    // per-thread) before thread 0 raises the flag, so attention blocks on
+    // other SMs are guaranteed to see the freshly written K/V.
+    if (block_id == 0) {
       asm volatile("fence.acq_rel.gpu;" ::: "memory");
-      atomicExch(kv_flag, (unsigned int)(layer_idx + 1));
+      if (threadIdx.x == 0)
+        atomicExch(kv_flag, (unsigned int)(layer_idx + 1));
     }
     // Blocks 1-15: wait for KV cache
     if (block_id > 0 && block_id < ATTN_BLOCKS) {
@@ -1205,6 +1214,12 @@ ldg_decode_kernel_batch_wmma(
                     w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
                     kv_flag + seq_id, attn_flag + seq_id, layer);
     }
+
+    // Full grid sync: ldg_attention uses per-seq flag sync, so different
+    // sequences may finish attention at different times. ldg_o_proj_mlp_wmma
+    // uses ALL blocks and reads ALL seqs' g_attn_out, so every seq's attention
+    // must be complete before the batched GEMM starts.
+    grid.sync();
 
     // --- 4-9: Batched WMMA O proj + RMSNorm + Gate/Up/SiLU/Down ---
     // All blocks cooperate on the batched GEMM (M=batch_size), unlike the
