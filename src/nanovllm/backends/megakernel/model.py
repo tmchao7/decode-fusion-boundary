@@ -20,7 +20,6 @@ _decode = torch.ops.nanovllm_megakernel_C.decode
 _decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
 _decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
 _decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
-_decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
 _generate_nosync_paged = torch.ops.nanovllm_megakernel_C.generate_nosync_paged
 _generate_nosync_paged_batch = torch.ops.nanovllm_megakernel_C.generate_nosync_paged_batch
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
@@ -504,13 +503,16 @@ class Decoder:
         start_position: int,
         block_table,
         num_tokens: int,
+        eos_token: int = -1,
     ) -> list[int]:
         """Generate ``num_tokens`` on-device with NO per-step CPU sync.
 
         All ``block_table`` blocks for positions
         ``[start_position, start_position + num_tokens)`` must already be
-        allocated (the block table is fixed over the span). Returns the full
-        token list after a single host sync.
+        allocated (the block table is fixed over the span). When
+        ``eos_token >= 0`` the kernel deactivates on EOS and writes -1
+        sentinels for the remaining steps; the caller truncates. Returns the
+        raw token list (with -1 past EOS) after a single host sync.
         """
         if not self._paged:
             raise RuntimeError("generate_paged() requires paged KV cache mode")
@@ -544,6 +546,7 @@ class Decoder:
             start_position,
             self._block_size,
             self._num_cache_blocks,
+            eos_token,
             self._attn_scale,
         )
         return output_ids.cpu().tolist()
@@ -600,14 +603,10 @@ class Decoder:
             self._num_cache_blocks,
             self._attn_scale,
         )
-        out = output.cpu().tolist()  # [batch][max_steps]
-        # Truncate each sequence at its EOS (if any) to match scheduler semantics.
-        result = []
-        for row in out:
-            if eos_token in row:
-                row = row[: row.index(eos_token)]
-            result.append(row)
-        return result
+        # Return the raw [batch][max_steps] int32 log. Inactive-seq entries
+        # past EOS are -1 (sentinel, set in the binding). The caller
+        # (Scheduler.postprocess_burst) truncates at EOS / max_tokens.
+        return output.cpu().tolist()
 
 
 def generate(prompt: str, max_tokens: int = 100, verbose: bool = True) -> str:

@@ -37,6 +37,13 @@ BACKEND_CONFIGS = {
         "decode_backend": "megakernel",
         "enforce_eager": False,
         "megakernel_batch_kernel": "wmma",
+        "megakernel_burst": False,
+    },
+    "megakernel-burst": {
+        "decode_backend": "megakernel",
+        "enforce_eager": False,
+        "megakernel_batch_kernel": "wmma",
+        "megakernel_burst": True,
     },
 }
 PromptFactory = Callable[[int, int], str | list[int]]
@@ -156,7 +163,7 @@ def run_case(
     # The megakernel batch is sequence-level parallel (one cooperative grid
     # partitioned per sequence), but each sequence needs >= LDG_ATTN_BLOCKS
     # blocks; the default 80-block grid caps parallel batch near 8-10.
-    if backend_name in ("megakernel", "megakernel-wmma") and batch_size > 10:
+    if backend_name in ("megakernel", "megakernel-wmma", "megakernel-burst") and batch_size > 10:
         raise ValueError("Megakernel parallel batch is bounded by the 80-block grid")
 
     backend_config = BACKEND_CONFIGS[backend_name]
@@ -295,7 +302,7 @@ def mark_correctness(experiments: list[dict[str, Any]]) -> None:
             # sequence (documented ~1 ulp reduction-order cascade). Treat it as
             # correct when it actually ran and every request's first token
             # matches, which is the strong signal that the decode path is sound.
-            if experiment["backend"] in ("megakernel", "megakernel-wmma"):
+            if experiment["backend"] in ("megakernel", "megakernel-wmma", "megakernel-burst"):
                 first_token_matches = all(
                     bool(exp and act and exp[0] == act[0])
                     for exp, act in zip(reference_outputs, experiment["outputs"])
@@ -341,7 +348,7 @@ def add_comparisons(
             comparison = compare_metric_summaries(
                 baseline["summary"], optimized["summary"]
             )
-            if optimized["backend"] in ("megakernel", "megakernel-wmma") and (
+            if optimized["backend"] in ("megakernel", "megakernel-wmma", "megakernel-burst") and (
                 not _backend_actual_is_megakernel(optimized["summary"])
                 or not optimized.get("correctness", {}).get("passed", False)
             ):

@@ -393,7 +393,7 @@ extern "C" void launch_ldg_generate_nosync_paged(
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, const int *block_table, int *output_log,
     int num_layers, int start_position, int block_size, int num_cache_blocks,
-    float attn_scale, cudaStream_t stream);
+    int eos_token, float attn_scale, cudaStream_t stream);
 
 torch::Tensor generate_nosync_paged(
     int64_t first_token_id, int64_t num_steps, torch::Tensor embed_weight,
@@ -406,7 +406,7 @@ torch::Tensor generate_nosync_paged(
     torch::Tensor normalized, torch::Tensor block_max_vals,
     torch::Tensor block_max_idxs, torch::Tensor block_table,
     int64_t num_layers, int64_t start_position, int64_t block_size,
-    int64_t num_cache_blocks, double attn_scale) {
+    int64_t num_cache_blocks, int64_t eos_token, double attn_scale) {
 
   TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == torch::kInt32 &&
                   block_table.is_contiguous() && block_table.dim() == 1,
@@ -414,8 +414,11 @@ torch::Tensor generate_nosync_paged(
   TORCH_CHECK(num_steps > 0, "num_steps must be positive");
 
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  auto output_log = torch::empty(
-      {num_steps}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+  // Initialise to -1 so that entries past EOS (where the device-side update
+  // kernel skips writing) are sentinel-valued rather than garbage.
+  auto output_log = torch::full(
+      {num_steps}, -1,
+      torch::dtype(torch::kInt32).device(torch::kCUDA));
 
   launch_ldg_generate_nosync_paged(
       static_cast<int>(first_token_id), static_cast<int>(num_steps),
@@ -431,7 +434,7 @@ torch::Tensor generate_nosync_paged(
       block_table.data_ptr<int>(), static_cast<int *>(output_log.data_ptr()),
       static_cast<int>(num_layers), static_cast<int>(start_position),
       static_cast<int>(block_size), static_cast<int>(num_cache_blocks),
-      static_cast<float>(attn_scale), stream);
+      static_cast<int>(eos_token), static_cast<float>(attn_scale), stream);
 
   // Single sync at end -- all N steps already queued
   cudaStreamSynchronize(stream);
@@ -480,8 +483,11 @@ torch::Tensor generate_nosync_paged_batch(
 
   int batch_size = static_cast<int>(input_token_ids.numel());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  auto output_log = torch::empty(
-      {batch_size, max_steps}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+  // Initialise to -1 so that entries past a per-seq EOS (where the device-side
+  // update kernel skips writing) are sentinel-valued rather than garbage.
+  auto output_log = torch::full(
+      {batch_size, max_steps}, -1,
+      torch::dtype(torch::kInt32).device(torch::kCUDA));
 
   // Reset positions/tokens in place (the launcher mutates them via the batch
   // update kernel), then run the whole burst without host sync.
@@ -577,7 +583,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor mlp_intermediate, Tensor normalized, "
           "Tensor block_max_vals, Tensor block_max_idxs, Tensor block_table, "
           "int num_layers, int start_position, int block_size, "
-          "int num_cache_blocks, float attn_scale) -> Tensor");
+          "int num_cache_blocks, int eos_token, float attn_scale) -> Tensor");
   ops.impl("generate_nosync_paged", torch::kCUDA, &generate_nosync_paged);
 
   ops.def("generate_nosync_paged_batch(Tensor input_token_ids, Tensor positions, "

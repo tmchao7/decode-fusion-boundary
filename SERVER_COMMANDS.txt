@@ -13,6 +13,7 @@ set -euo pipefail
 #   RUN_MODE=verify bash SERVER_COMMANDS.txt         # environment + extension check
 #   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean A100 Megakernel rebuild
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # controlled A/B benchmark
+#   RUN_MODE=nosync bash SERVER_COMMANDS.txt         # no-sync / burst vs cudagraph
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
@@ -220,7 +221,7 @@ run_benchmark() {
     "$MODEL" \
     --suite performance \
     --workloads benchmarks/workloads.json \
-    --backends torch-eager,torch-cudagraph,megakernel \
+    --backends torch-eager,torch-cudagraph,megakernel,megakernel-wmma,megakernel-burst \
     --prompt-lengths 32,128,512,1024 \
     --batch-sizes 1,8,32 \
     --max-tokens 128 \
@@ -232,6 +233,56 @@ run_benchmark() {
   python -m tools.plot_metrics \
     results/a100_performance.json \
     --output-dir results/a100_plots
+}
+
+run_nosync_bench() {
+  mkdir -p results
+  require_model
+  select_gpu
+  build_extension
+  verify_extension_import
+
+  PYTHONPATH=src python -m unittest discover -s tests -v \
+    2>&1 | tee results/a100_nosync_unittest.log
+
+  # Correctness: batch=1 (persistent kernel via hybrid dispatch) and batch=2
+  # (WMMA batch kernel). Verifies device-side EOS on the single-seq kernel.
+  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32 \
+      --batch-sizes 1,2 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel \
+      --require-megakernel \
+      --json results/a100_nosync_correctness.json \
+      2>&1 | tee results/a100_nosync_correctness.log
+
+  # End-to-end ms/token: megakernel sync vs no-sync vs burst vs cudagraph.
+  # Each path runs in a fresh process so KV pools do not starve each other.
+  # batch=1 burst now dispatches to the persistent kernel (hybrid dispatch).
+  python -m tools.bench_nosync \
+    --prompt-length 32 \
+    --tokens 200 \
+    --seed 0 \
+    2>&1 | tee results/a100_nosync_bench.log
+
+  # Controlled A/B: burst vs cudagraph at batch=1/2/4/8, prompt_len=32.
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-cudagraph,megakernel-burst \
+    --prompt-lengths 32 \
+    --batch-sizes 1,2,4,8 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 5 \
+    --json results/a100_nosync_compare.json \
+    --markdown results/a100_nosync_compare.md \
+    2>&1 | tee results/a100_nosync_compare.log
 }
 
 run_profile() {
@@ -314,6 +365,9 @@ case "$RUN_MODE" in
   benchmark)
     select_gpu
     run_benchmark
+    ;;
+  nosync)
+    run_nosync_bench
     ;;
   profile)
     select_gpu

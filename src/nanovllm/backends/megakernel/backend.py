@@ -230,6 +230,55 @@ class MegakernelBackend:
             )
         return self.decoder.step_batch(input_ids, positions, block_tables)
 
+    def generate_paged_batch(
+        self, seqs, block_tables, max_steps: int, eos_token: int
+    ) -> list[list[int]]:
+        """Run a no-sync burst for a batch of sequences.
+
+        ``block_tables`` is a device int32 tensor built by
+        ``ModelRunner.prepare_block_tables``. Returns the raw ``[batch][max_steps]``
+        token log (entries past per-seq EOS are -1). The caller (scheduler
+        ``postprocess_burst``) handles EOS / max_tokens truncation.
+
+        Hybrid dispatch: batch=1 uses the persistent single-seq kernel
+        (faster — no WMMA tile padding), batch>1 uses the WMMA batch kernel.
+        """
+        self._ensure_decoder()
+        import torch
+
+        batch_size = len(seqs)
+        if batch_size == 1:
+            # Persistent single-seq kernel: extract the 1D block table and
+            # call generate_paged with device-side EOS.
+            seq = seqs[0]
+            block_table_1d = block_tables[0][: len(seq.block_table)]
+            raw = self.decoder.generate_paged(
+                seq.last_token,
+                len(seq) - 1,
+                block_table_1d,
+                max_steps,
+                eos_token,
+            )
+            return [raw]
+
+        input_ids = torch.tensor(
+            [seq.last_token for seq in seqs],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        positions = torch.tensor(
+            [len(seq) - 1 for seq in seqs],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        return self.decoder.generate_paged_batch(
+            input_ids,
+            positions,
+            block_tables,
+            max_steps,
+            eos_token,
+        )
+
     def decode(self, seq, block_table) -> list[int]:
         """Decode one token and return a one-element Python token-id list.
 

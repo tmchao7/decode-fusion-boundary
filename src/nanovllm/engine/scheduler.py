@@ -80,30 +80,78 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def schedule_burst(self, burst_cap: int = 64) -> tuple[list[Sequence], int]:
+    def schedule_burst(
+        self, burst_cap: int = 64, max_batch: int = 8
+    ) -> tuple[list[Sequence], int]:
         """Select running sequences for a fixed-table no-sync megakernel burst.
 
-        Pre-allocates each sequence's decode blocks for up to ``min(max_tokens -
-        num_completion_tokens, burst_cap)`` new tokens so the block table stays
-        fixed for the whole burst. Returns ``(seqs, max_steps)`` where
-        ``max_steps`` is the largest per-seq token budget.
+        Pre-allocates each sequence's decode blocks for up to
+        ``min(max_tokens - num_completion_tokens, burst_cap)`` new tokens so the
+        block table stays fixed for the whole burst. Returns ``(seqs,
+        max_steps)`` where ``max_steps`` is the largest per-seq token budget.
+
+        Only sequences whose burst blocks can be allocated are included; if none
+        qualify the caller should fall back to the normal step-wise schedule.
+        Selected sequences stay in ``self.running`` (no rotation); finished
+        sequences are removed by :meth:`postprocess_burst`.
         """
-        seqs = []
+        seqs: list[Sequence] = []
         max_steps = 0
-        for _ in range(min(len(self.running), self.max_num_seqs)):
-            seq = self.running[0]
+        for seq in self.running:
+            if len(seqs) >= max_batch:
+                break
             budget = min(
                 seq.max_tokens - seq.num_completion_tokens, burst_cap
             )
             if budget <= 0:
-                break
+                continue
+            if not self.block_manager.can_allocate_burst(seq, budget):
+                continue
             self.block_manager.allocate_burst(seq, budget)
             seq.is_prefill = False
             seqs.append(seq)
             if budget > max_steps:
                 max_steps = budget
-            self.running.append(self.running.popleft())
         return seqs, max_steps
+
+    def postprocess_burst(
+        self, seqs: list[Sequence], token_logs: list[list[int]]
+    ) -> None:
+        """Apply burst-generated tokens to sequences.
+
+        ``token_logs[s]`` is the raw ``[max_steps]`` output for sequence ``s``.
+        Entries past a per-seq EOS are -1 (sentinel). This method truncates at
+        EOS (inclusive) and ``max_tokens``, appends the surviving tokens, hashes
+        newly completed blocks, and deallocates finished sequences.
+        """
+        for seq, raw_tokens in zip(seqs, token_logs):
+            remaining = seq.max_tokens - seq.num_completion_tokens
+            tokens: list[int] = []
+            for tok in raw_tokens:
+                if tok < 0 or len(tokens) >= remaining:
+                    break
+                tokens.append(tok)
+                if not seq.ignore_eos and tok == self.eos:
+                    break
+            for token_id in tokens:
+                seq.append_token(token_id)
+            seq.num_scheduled_tokens = len(tokens)
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+            finished = bool(tokens) and (
+                (not seq.ignore_eos and tokens[-1] == self.eos)
+                or seq.num_completion_tokens == seq.max_tokens
+            )
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+            else:
+                # Free burst-allocated blocks past the current length so the
+                # next step-wise schedule/may_append sees a table that matches
+                # num_blocks (no double-allocate, no stale block_table[-1]).
+                self.block_manager.trim_burst(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):

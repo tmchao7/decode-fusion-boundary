@@ -72,9 +72,101 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
-    def step(self, metrics: MetricsCollector | None = None):
+    def _should_burst(self) -> bool:
+        """Whether the next ``step`` can use the no-sync megakernel burst path."""
+        if not getattr(self.config, "megakernel_burst", False):
+            return False
+        if self.config.decode_backend != "megakernel":
+            return False
+        if self.config.megakernel_batch_kernel != "wmma":
+            return False
+        mr = self.model_runner
+        if mr.megakernel is None or mr.megakernel.disabled_reason:
+            return False
+        if mr._cuda_poisoned:
+            return False
+        if self.scheduler.waiting:
+            return False
+        if not self.scheduler.running:
+            return False
+        for seq in self.scheduler.running:
+            if not seq.is_greedy:
+                return False
+            if seq.ignore_eos:
+                # The device-side EOS kernel always deactivates on EOS; until
+                # per-seq ignore_eos flags are plumbed through, fall back.
+                return False
+        return True
+
+    def _step_burst(self, metrics: MetricsCollector | None):
+        """Execute one no-sync burst and return ``(outputs, num_tokens)``."""
+        seqs, max_steps = self.scheduler.schedule_burst(
+            burst_cap=getattr(self.config, "megakernel_burst_cap", 64),
+            max_batch=getattr(self.config, "megakernel_burst_batch", 8),
+        )
+        if not seqs or max_steps <= 0:
+            return self._step_normal(metrics)
+
+        before_completion = {
+            seq.seq_id: len(seq.completion_token_ids) for seq in seqs
+        }
+        model_start = perf_counter()
+        cuda_timer = CudaEventTimer() if metrics is not None else None
+        if cuda_timer is not None:
+            cuda_timer.start()
+        with nvtx_range("nano_vllm_burst"):
+            token_logs = self.model_runner.call("run_burst", seqs, max_steps)
+        if cuda_timer is not None:
+            cuda_timer.stop()
+        model_duration = perf_counter() - model_start
+
+        if token_logs is None:
+            # Burst failed before the kernel ran. Undo the burst block
+            # allocations so the step-wise fallback's may_append / prepare_decode
+            # see a table matching num_blocks (no double-allocate, no stale
+            # block_table[-1]).
+            for seq in seqs:
+                self.scheduler.block_manager.trim_burst(seq)
+            return self._step_normal(metrics)
+
+        self.scheduler.postprocess_burst(seqs, token_logs)
+        token_timestamp = perf_counter()
+        total_new = 0
+        if metrics is not None:
+            metrics.record_step(
+                seqs,
+                False,
+                model_duration,
+                self.model_runner.last_backend_used,
+                self.model_runner.last_fallback_reason,
+                cuda_timer=cuda_timer,
+            )
+            for seq in seqs:
+                new_tokens = (
+                    len(seq.completion_token_ids) - before_completion[seq.seq_id]
+                )
+                total_new += max(0, new_tokens)
+                for _ in range(max(0, new_tokens)):
+                    metrics.record_token(seq.seq_id, token_timestamp)
+        else:
+            for seq in seqs:
+                new_tokens = (
+                    len(seq.completion_token_ids) - before_completion[seq.seq_id]
+                )
+                total_new += max(0, new_tokens)
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in seqs
+            if seq.is_finished
+        ]
+        return outputs, -total_new
+
+    def _step_normal(self, metrics: MetricsCollector | None):
+        """Execute one normal (step-wise) schedule/run/postprocess cycle."""
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = (
+            sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        )
         before_completion = {
             seq.seq_id: len(seq.completion_token_ids) for seq in seqs
         }
@@ -105,6 +197,11 @@ class LLMEngine:
                     metrics.record_token(seq.seq_id, token_timestamp)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
+
+    def step(self, metrics: MetricsCollector | None = None):
+        if self._should_burst():
+            return self._step_burst(metrics)
+        return self._step_normal(metrics)
 
     def is_finished(self):
         return self.scheduler.is_finished()

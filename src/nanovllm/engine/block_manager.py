@@ -126,6 +126,37 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         return missing
 
+    def can_allocate_burst(self, seq: Sequence, num_new_tokens: int) -> bool:
+        """Check whether ``allocate_burst`` would succeed without allocating."""
+        target = (
+            len(seq) + num_new_tokens + self.block_size - 1
+        ) // self.block_size
+        missing = max(0, target - len(seq.block_table))
+        return len(self.free_block_ids) >= missing
+
+    def trim_burst(self, seq: Sequence) -> int:
+        """Free burst-allocated blocks beyond what ``len(seq)`` currently needs.
+
+        After a no-sync burst, ``seq.block_table`` may hold blocks reserved for
+        future positions that were never written (early EOS or ``max_tokens``
+        cutoff). Leaving them in place breaks the normal step-wise path:
+        ``may_append`` would double-allocate and ``prepare_decode``'s
+        ``block_table[-1]`` would point at a future block. This method pops and
+        frees those trailing blocks so the table matches ``seq.num_blocks``.
+        Returns how many blocks were freed.
+        """
+        target = (len(seq) + self.block_size - 1) // self.block_size
+        freed = 0
+        while len(seq.block_table) > target:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count <= 0:
+                block.ref_count = 0
+                self._deallocate_block(block_id)
+            freed += 1
+        return freed
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

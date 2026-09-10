@@ -1921,17 +1921,31 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persisten
 
 // Device-side step update: copies LM head output -> next token input,
 // increments position, logs output token. Uses device-side step counter
-// so the kernel arg is fixed (graph-compatible).
+// so the kernel arg is fixed (graph-compatible). When ``eos_token >= 0`` and
+// the generated token equals it, the sequence is deactivated (position/token
+// frozen); subsequent steps write -1 sentinel to output_log so the host can
+// truncate. Mirrors ldg_update_step_batch's per-seq EOS semantics.
 __global__ void ldg_update_step(const int *__restrict__ lm_output,
                                 int *__restrict__ d_token_id,
                                 int *__restrict__ d_position,
                                 int *__restrict__ output_log,
-                                int *__restrict__ d_step_counter) {
-  int tok = *lm_output;
+                                int *__restrict__ d_step_counter,
+                                int *__restrict__ d_active,
+                                int eos_token) {
   int step = *d_step_counter;
-  *d_token_id = tok;
-  *d_position = *d_position + 1;
+  if (!*d_active) {
+    output_log[step] = -1;
+    *d_step_counter = step + 1;
+    return;
+  }
+  int tok = *lm_output;
   output_log[step] = tok;
+  if (eos_token >= 0 && tok == eos_token) {
+    *d_active = 0;
+  } else {
+    *d_token_id = tok;
+    *d_position = *d_position + 1;
+  }
   *d_step_counter = step + 1;
 }
 
@@ -2385,11 +2399,14 @@ extern "C" void launch_ldg_generate_nosync(
   // Allocate device-side step counter
   static int *d_step_counter = nullptr;
   static int *d_output_token = nullptr;
+  static int *d_active = nullptr;
   if (!d_step_counter) {
     cudaMalloc(&d_step_counter, sizeof(int));
     cudaMalloc(&d_output_token, sizeof(int));
+    cudaMalloc(&d_active, sizeof(int));
   }
   cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+  cudaMemsetAsync(d_active, 1, sizeof(int), stream);
 
   // Set initial position and token_id on device
   *h_pinned_position = start_position;
@@ -2429,9 +2446,10 @@ extern "C" void launch_ldg_generate_nosync(
         d_lm_head_counter, LDG_LM_NUM_BLOCKS);
 
     // Update step: feed output token back, increment position, log result
+    // eos_token=-1 disables device-side EOS (host checks between steps).
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
                                          d_mutable_position, output_log,
-                                         d_step_counter);
+                                         d_step_counter, d_active, -1);
   }
 }
 
@@ -2449,7 +2467,7 @@ extern "C" void launch_ldg_generate_nosync_paged(
     void *block_max_idxs, const int *block_table,
     int *output_log, // device int[num_steps]: all generated tokens
     int num_layers, int start_position, int block_size, int num_cache_blocks,
-    float attn_scale, cudaStream_t stream) {
+    int eos_token, float attn_scale, cudaStream_t stream) {
 
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
@@ -2471,11 +2489,14 @@ extern "C" void launch_ldg_generate_nosync_paged(
 
   static int *d_step_counter = nullptr;
   static int *d_output_token = nullptr;
+  static int *d_active = nullptr;
   if (!d_step_counter) {
     cudaMalloc(&d_step_counter, sizeof(int));
     cudaMalloc(&d_output_token, sizeof(int));
+    cudaMalloc(&d_active, sizeof(int));
   }
   cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+  cudaMemsetAsync(d_active, 1, sizeof(int), stream);
 
   // Set initial position and token_id on device
   *h_pinned_position = start_position;
@@ -2515,7 +2536,7 @@ extern "C" void launch_ldg_generate_nosync_paged(
 
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
                                          d_mutable_position, output_log,
-                                         d_step_counter);
+                                         d_step_counter, d_active, eos_token);
   }
 }
 

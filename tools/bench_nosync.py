@@ -55,6 +55,26 @@ def _worker(connection, path: str, prompt, prompt_len: int, N: int):
             torch.cuda.synchronize()
             value = (time.perf_counter() - t0) * 1000 / N
             llm.exit(); del llm; del dec
+        elif path == "mega-burst":
+            # End-to-end through the engine with burst path enabled.
+            # The engine's step() detects burst eligibility (WMMA + greedy +
+            # no waiting) and dispatches to schedule_burst → generate_paged_batch
+            # → postprocess_burst automatically.
+            llm = LLM(MODEL, decode_backend="megakernel", enforce_eager=False,
+                      max_num_seqs=1, max_model_len=2048,
+                      megakernel_batch_kernel="wmma", megakernel_burst=True)
+            sp = SamplingParams(temperature=0.0, max_tokens=10)
+            warm = llm.add_request(prompt, sp)
+            while not llm.is_finished():
+                llm.step()
+            torch.cuda.synchronize()
+            seq = llm.add_request(prompt, SamplingParams(temperature=0.0, max_tokens=N))
+            t0 = time.perf_counter()
+            while not llm.is_finished():
+                llm.step()
+            torch.cuda.synchronize()
+            value = (time.perf_counter() - t0) * 1000 / N
+            llm.exit(); del llm
         else:  # torch-cudagraph
             llm = LLM(MODEL, decode_backend="torch", enforce_eager=False,
                       max_num_seqs=1, max_model_len=2048)
@@ -99,16 +119,19 @@ def main() -> None:
     prompt = prompt_ids(args.prompt_length, args.seed)
     N = args.tokens
     results = {}
-    for path in ("mega-sync", "mega-nosync", "torch-cudagraph"):
+    for path in ("mega-sync", "mega-nosync", "mega-burst", "torch-cudagraph"):
         print(f"measuring {path} ...", flush=True)
         results[path] = measure(path, prompt, args.prompt_length, N)
 
     print(f"\ntokens={N} prompt_len={args.prompt_length} seed={args.seed}")
     print(f"{'megakernel sync (.item())':34s} {results['mega-sync']:8.2f} ms/token")
     print(f"{'megakernel no-sync':34s} {results['mega-nosync']:8.2f} ms/token")
+    print(f"{'megakernel burst (engine E2E)':34s} {results['mega-burst']:8.2f} ms/token")
     print(f"{'torch-cudagraph':34s} {results['torch-cudagraph']:8.2f} ms/token")
     print(f"no-sync vs cudagraph: {results['torch-cudagraph'] / results['mega-nosync']:.2f}x "
           f"({'BEATS' if results['mega-nosync'] < results['torch-cudagraph'] else 'ties/loses'})")
+    print(f"burst vs cudagraph:   {results['torch-cudagraph'] / results['mega-burst']:.2f}x "
+          f"({'BEATS' if results['mega-burst'] < results['torch-cudagraph'] else 'ties/loses'})")
     print(f"no-sync vs sync:     {results['mega-sync'] / results['mega-nosync']:.2f}x faster")
 
 

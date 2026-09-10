@@ -125,6 +125,74 @@ class MegakernelBackendTests(unittest.TestCase):
         self.assertEqual(backend.decode(SequenceStub(), block_table="device-table"), [17])
         self.assertEqual(calls, [(99, 0, "device-table")])
 
+    def test_generate_paged_batch_dispatches_batch1_to_persistent(self):
+        backend = MegakernelBackend(self.make_config(), model=None)
+        calls = []
+
+        class FakeDecoder:
+            def generate_paged(self, first_token_id, start_position,
+                               block_table, num_tokens, eos_token):
+                calls.append((first_token_id, start_position, block_table,
+                              num_tokens, eos_token))
+                return [10, 11, 12]
+
+        backend.decoder = FakeDecoder()
+
+        class SequenceStub:
+            def __init__(self, last_token, length, block_table):
+                self.last_token = last_token
+                self._len = length
+                self.block_table = block_table
+
+            def __len__(self):
+                return self._len
+
+        seq = SequenceStub(last_token=42, length=5, block_table=[10, 20])
+        result = backend.generate_paged_batch(
+            [seq], [[10, 20, 30]], max_steps=3, eos_token=999
+        )
+        self.assertEqual(result, [[10, 11, 12]])
+        self.assertEqual(len(calls), 1)
+        saved_tok, saved_pos, saved_bt, saved_steps, saved_eos = calls[0]
+        self.assertEqual(saved_tok, 42)
+        self.assertEqual(saved_pos, 4)
+        self.assertEqual(saved_bt, [10, 20])
+        self.assertEqual(saved_steps, 3)
+        self.assertEqual(saved_eos, 999)
+
+    def test_generate_paged_batch_builds_input_metadata_from_seqs(self):
+        backend = MegakernelBackend(self.make_config(), model=None)
+        calls = []
+
+        class FakeDecoder:
+            def generate_paged_batch(self, input_ids, positions,
+                                     block_tables, max_steps, eos_token):
+                calls.append((input_ids, positions, block_tables,
+                              max_steps, eos_token))
+                return [[10, 11, 12], [20, 21, 22]]
+
+        backend.decoder = FakeDecoder()
+
+        class SequenceStub:
+            def __init__(self, last_token, length):
+                self.last_token = last_token
+                self._len = length
+
+            def __len__(self):
+                return self._len
+
+        seq_a = SequenceStub(last_token=42, length=5)
+        seq_b = SequenceStub(last_token=7, length=3)
+        result = backend.generate_paged_batch(
+            [seq_a, seq_b], "bt", max_steps=3, eos_token=999
+        )
+        self.assertEqual(result, [[10, 11, 12], [20, 21, 22]])
+        self.assertEqual(len(calls), 1)
+        saved_ids, saved_pos, saved_bt, saved_steps, saved_eos = calls[0]
+        self.assertEqual(saved_bt, "bt")
+        self.assertEqual(saved_steps, 3)
+        self.assertEqual(saved_eos, 999)
+
 
 if __name__ == "__main__":
     unittest.main()

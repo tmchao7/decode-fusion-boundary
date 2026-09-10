@@ -348,6 +348,51 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def run_burst(
+        self, seqs: list[Sequence], max_steps: int
+    ) -> list[list[int]]:
+        """Run a no-sync megakernel burst for a batch of decode sequences.
+
+        The scheduler has already pre-allocated burst blocks (R4) so the block
+        table is fixed for the whole span. Returns ``[seq][max_steps]`` raw
+        token log; the scheduler ``postprocess_burst`` truncates at EOS /
+        max_tokens.
+        """
+        self.last_backend_used = "torch"
+        self.last_fallback_reason = None
+        try:
+            with nvtx_range("megakernel_burst"):
+                block_tables = self.prepare_block_tables(seqs)
+                token_logs = self.megakernel.generate_paged_batch(
+                    seqs,
+                    block_tables,
+                    max_steps,
+                    self.config.eos,
+                )
+        except Exception as exc:
+            # The kernel has already started (and may have written to the
+            # shared paged cache), so a silent fallback would corrupt state.
+            if self.megakernel.decoder is not None:
+                self._cuda_poisoned = True
+                raise RuntimeError(
+                    "Megakernel burst failed after initialization: "
+                    f"{exc}; restart with decode_backend=\"torch\""
+                ) from exc
+            self.megakernel.disable(str(exc))
+            self.last_fallback_reason = str(exc)
+            warnings.warn(
+                "Megakernel burst unavailable; falling back to step-wise: "
+                f"{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        else:
+            self.last_backend_used = "megakernel"
+            return token_logs
+        finally:
+            reset_context()
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config

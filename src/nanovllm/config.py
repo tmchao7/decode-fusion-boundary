@@ -34,6 +34,9 @@ class Config:
     enforce_eager: bool = False
     decode_backend: str = "torch"
     megakernel_batch_kernel: str = "scalar"
+    megakernel_burst: bool = True
+    megakernel_burst_cap: int = 64
+    megakernel_burst_batch: int = 8
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
