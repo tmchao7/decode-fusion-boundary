@@ -49,7 +49,7 @@ def kernel_flags() -> list[str]:
     """Return tunable kernel flags for the selected GPU family."""
 
     return [
-        f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
+        f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 80)}",
         f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
         f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
         f"-DLDG_LM_BLOCK_SIZE={_env_int('LDG_LM_BLOCK_SIZE', 384)}",
@@ -62,22 +62,32 @@ def kernel_flags() -> list[str]:
         f"-DLDG_PREFETCH_BLOCK_STRIDE={_env_int('LDG_PREFETCH_BLOCK_STRIDE', 1)}",
         f"-DLDG_PREFETCH_GATE={_env_int('LDG_PREFETCH_GATE', 1)}",
         f"-DLDG_PREFETCH_UP={_env_int('LDG_PREFETCH_UP', 1)}",
+        "-DLDG_MAX_BATCH=32",
         "-DLDG_USE_UINT4",
         "-DLDG_ATTENTION_VEC4",
         "-DLDG_WEIGHT_LDCS",
         "-DLDG_MLP_SMEM",
+        *(["-DLDG_FAST_MATH"] if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1" else []),
     ]
 
 
 def cuda_flags() -> list[str]:
-    return [
+    flags = [
         "-O3",
-        "--use_fast_math",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         f"-arch={cuda_arch_for_device()}",
         f"-I{_CSRC}",
-    ] + kernel_flags()
+    ]
+    # Correctness builds use IEEE-oriented libdevice math by default. The
+    # approximate path remains opt-in for later performance experiments.
+    if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1":
+        flags.append("--use_fast_math")
+    # Compute Sanitizer needs line mappings to identify the exact CUDA source
+    # line for an invalid access.
+    if os.getenv("NANOVLLM_CUDA_SANITIZE") == "1":
+        flags.append("-lineinfo")
+    return flags + kernel_flags()
 
 
 def get_extension():
@@ -97,3 +107,8 @@ def get_extension():
         verbose=False,
     )
     return _module
+
+
+if __name__ == "__main__":
+    get_extension()
+    print("Megakernel extension build: OK")

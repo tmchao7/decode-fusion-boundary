@@ -2,9 +2,9 @@
 
 The CUDA extension is imported lazily so the regular nano-vLLM backend remains
 usable on machines without CUDA, and so importing the package never triggers a
-CUDA build. The first implementation intentionally handles only single-sequence
-Qwen3-0.6B greedy decode; callers should use :meth:`compatibility` before
-invoking :meth:`decode` and fall back to the normal model path otherwise.
+CUDA build. The initial paged implementation supports Qwen3-0.6B greedy decode
+with a conservative batch limit; callers should use :meth:`compatibility`
+before invoking :meth:`decode` or :meth:`decode_batch`.
 """
 
 from dataclasses import dataclass
@@ -12,6 +12,24 @@ from typing import Any
 
 
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
+MAX_BATCH_SIZE = 32
+
+# Fixed-shape contract baked into the fused CUDA kernel (kernel.cu). This is
+# the single Python-side source of truth for what the kernel was compiled for;
+# compatibility() guards that the loaded nano-vLLM model matches it. If these
+# ever change, kernel.cu's constexpr block (HIDDEN_SIZE, NUM_*_HEADS, HEAD_DIM,
+# NUM_LAYERS at the launch site, LDG_VOCAB_SIZE) must change in lockstep.
+QWEN3_CONTRACT = {
+    "model_type": "qwen3",
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "vocab_size": 151936,
+    "max_model_len": 2048,
+    "head_dim": 128,
+}
 
 
 @dataclass(frozen=True)
@@ -47,56 +65,134 @@ class MegakernelBackend:
         self.config = config
         self.model = model
         self.decoder = None
-        self.sequence_id = None
+        self.kv_cache = None
         self.disabled_reason = None
 
     @staticmethod
     def compatibility(config, seqs, is_prefill: bool) -> Compatibility:
         if is_prefill:
             return Compatibility(False, "Megakernel is decode-only; use the prefill backend")
-        if len(seqs) != 1:
-            return Compatibility(False, "Megakernel v1 supports one decode sequence")
-        if _get_attr(config, "max_num_seqs", 1) != 1:
+        max_batch_size = min(
+            _get_attr(config, "max_num_seqs", MAX_BATCH_SIZE), MAX_BATCH_SIZE
+        )
+        if not 1 <= len(seqs) <= max_batch_size:
             return Compatibility(
                 False,
-                "Megakernel v1 requires max_num_seqs=1 while paged KV sync is pending",
+                f"Megakernel v1 supports batch sizes from 1 to {max_batch_size}",
             )
         if _get_attr(config, "tensor_parallel_size", 1) != 1:
             return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
 
-        seq = seqs[0]
-        if not bool(_get_attr(seq, "is_greedy", False)):
+        for seq in seqs:
+            if bool(_get_attr(seq, "is_greedy", False)):
+                continue
             temperature = _get_attr(seq, "temperature", None)
             if temperature is None or temperature > 1e-10:
                 return Compatibility(False, "Megakernel v1 supports greedy sampling only")
 
-        hf_config = _get_attr(config, "hf_config")
-        expected = {
-            "model_type": "qwen3",
-            "hidden_size": 1024,
-            "intermediate_size": 3072,
-            "num_hidden_layers": 28,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 8,
-            "vocab_size": 151936,
-        }
-        for name, value in expected.items():
-            if _get_attr(hf_config, name) != value:
-                return Compatibility(False, f"unsupported Qwen config: {name}")
+        # Hybrid architecture (docs/07 §9.6): megakernel wins batch=1 by
+        # eliminating host launch overhead, but loses batch>=2 because the
+        # fixed cooperative grid cannot saturate SMs for batched GEMMs
+        # (§2/§3.5). Default: batch>1 falls back to cudagraph. Set
+        # megakernel_batch_decode=True to force the megakernel batch path
+        # (used by correctness research tools).
+        if len(seqs) > 1 and not _get_attr(config, "megakernel_batch_decode", False):
+            return Compatibility(
+                False,
+                "batch>1 defaults to cudagraph (megakernel_batch_decode=False); "
+                "set megakernel_batch_decode=True to force megakernel batch",
+            )
 
-        max_model_len = _get_attr(config, "max_model_len", 2048)
-        if max_model_len > 2048:
-            return Compatibility(False, "Megakernel v1 supports max_model_len <= 2048")
+        hf_config = _get_attr(config, "hf_config")
+        for name, expected in QWEN3_CONTRACT.items():
+            if name == "max_model_len":
+                actual = _get_attr(config, "max_model_len", 2048)
+            else:
+                actual = (
+                    _get_attr(hf_config, "head_dim", None)
+                    if name == "head_dim"
+                    else _get_attr(hf_config, name)
+                )
+                if name == "head_dim" and actual is None:
+                    actual = hf_config.hidden_size // hf_config.num_attention_heads
+            if actual != expected:
+                return Compatibility(False, f"unsupported Qwen config: {name}")
         return Compatibility(True)
+
+    def set_kv_cache(self, kv_cache) -> None:
+        """Attach the nano-vLLM-owned ``[K/V, layer, block, token, head, dim]`` cache."""
+
+        if kv_cache is None or kv_cache.dim() != 6 or kv_cache.shape[0] != 2:
+            raise ValueError("kv_cache must have shape [2, layers, blocks, tokens, heads, dim]")
+        self.kv_cache = kv_cache
 
     def disable(self, reason: str) -> None:
         self.disabled_reason = reason
+
+    @property
+    def ready(self) -> bool:
+        return self.decoder is not None
+
+    def ensure_ready(self) -> None:
+        """Build the decoder eagerly so the first decode has no cold-start spike.
+
+        Called at ModelRunner startup after the KV cache is attached. On any
+        failure the caller should ``disable()`` so the torch path remains the
+        integration fallback.
+        """
+        self._ensure_decoder()
+
+    def _validate_cache_layout(self) -> None:
+        """Validate nano-vLLM's paged cache against the kernel's offset contract.
+
+        The fused kernel (``ldg_kv_ptr``) computes flat element offsets assuming
+        a single contiguous ``[layers, blocks, block_size, kv_heads, head_dim]``
+        K/V view per cache with layer stride ``num_blocks * block_stride``.
+        ``PagedKVCacheSpec`` is the canonical description of that layout; check
+        the actual attached tensors against it so any layout drift surfaces at
+        init instead of producing silently-wrong attention.
+        """
+        from nanovllm.backends.megakernel.cache import PagedKVCacheSpec
+
+        kv = self.kv_cache
+        hf = self.config.hf_config
+        head_dim = getattr(hf, "head_dim", None) or (
+            hf.hidden_size // hf.num_attention_heads
+        )
+        spec = PagedKVCacheSpec(
+            num_layers=hf.num_hidden_layers,
+            num_blocks=kv.shape[2],
+            block_size=self.config.kvcache_block_size,
+            num_kv_heads=kv.shape[4],
+            head_dim=kv.shape[5],
+            dtype_itemsize=kv.element_size(),
+        )
+        expected = spec.shape  # (2, layers, blocks, bs, kv_heads, head_dim)
+        if tuple(kv.shape) != expected:
+            raise RuntimeError(
+                f"paged KV cache shape {tuple(kv.shape)} does not match the "
+                f"megakernel contract {expected}"
+            )
+        if not (kv[0].is_contiguous() and kv[1].is_contiguous()):
+            raise RuntimeError(
+                "paged KV cache views must be contiguous for the megakernel "
+                "layer-stride offset math"
+            )
+        if kv[0].size(0) * spec.layer_stride != kv[0].numel():
+            raise RuntimeError(
+                "paged KV cache layer stride does not match the megakernel "
+                "offset contract"
+            )
+        if head_dim != QWEN3_CONTRACT["head_dim"]:
+            raise RuntimeError("Qwen head_dim differs from the megakernel contract")
 
     def _ensure_decoder(self):
         if self.disabled_reason:
             raise RuntimeError(self.disabled_reason)
         if self.decoder is not None:
             return
+        if self.kv_cache is None:
+            raise RuntimeError("nano-vLLM KV cache has not been attached")
 
         # Keep the extension optional and isolated from the normal import path.
         import torch
@@ -110,27 +206,105 @@ class MegakernelBackend:
                 f"detected sm_{capability[0]}{capability[1]}"
             )
 
+        self._validate_cache_layout()
+
         from .build import get_extension
-        from .model import Decoder, weights_from_nano_model
 
         get_extension()
+        from .model import Decoder, weights_from_nano_model
         weights = weights_from_nano_model(self.model, self.config.hf_config)
-        self.decoder = Decoder(weights=weights, tokenizer=None, verbose=False)
+        self.decoder = Decoder(
+            weights=weights,
+            tokenizer=None,
+            verbose=False,
+            k_cache=self.kv_cache[0],
+            v_cache=self.kv_cache[1],
+            block_size=self.config.kvcache_block_size,
+            num_cache_blocks=self.kv_cache.shape[2],
+            max_batch_size=min(
+                _get_attr(self.config, "max_num_seqs", 1), MAX_BATCH_SIZE
+            ),
+        )
 
-    def decode(self, seq) -> list[int]:
-        """Decode one token and return a one-element Python token-id list.
+    def decode_batch(self, input_ids, positions, block_tables) -> list[int]:
+        """Decode one token for each scheduler-selected sequence.
 
-        The first call reconstructs the Megakernel's contiguous KV state from
-        the full prompt by replaying prompt tokens. Subsequent calls only run
-        the current last token. This establishes an integration baseline while
-        the paged-KV direct path is developed separately.
+        Uses the WMMA tensor-core batch kernel when
+        ``config.megakernel_batch_kernel == "wmma"`` (A/B switch); otherwise the
+        scalar batch kernel.
         """
 
         self._ensure_decoder()
-        if self.sequence_id != seq.seq_id:
-            self.decoder.reset()
-            for token_id in seq.prompt_token_ids:
-                self.decoder.step(token_id)
-            self.sequence_id = seq.seq_id
-        token_id = self.decoder.step(seq.last_token)
+        if (
+            getattr(self.config, "megakernel_batch_kernel", "scalar") == "wmma"
+        ):
+            return self.decoder.decode_paged_batch_wmma(
+                input_ids, positions, block_tables
+            )
+        return self.decoder.step_batch(input_ids, positions, block_tables)
+
+    def generate_paged_batch(
+        self, seqs, block_tables, max_steps: int, eos_token: int
+    ) -> list[list[int]]:
+        """Run a no-sync burst for a batch of sequences.
+
+        ``block_tables`` is a device int32 tensor built by
+        ``ModelRunner.prepare_block_tables``. Returns the raw ``[batch][max_steps]``
+        token log (entries past per-seq EOS are -1). The caller (scheduler
+        ``postprocess_burst``) handles EOS / max_tokens truncation.
+
+        Hybrid dispatch: batch=1 uses the persistent single-seq kernel
+        (faster — no WMMA tile padding), batch>1 uses the WMMA batch kernel.
+        """
+        self._ensure_decoder()
+        import torch
+
+        batch_size = len(seqs)
+        if batch_size == 1:
+            # Persistent single-seq kernel: extract the 1D block table and
+            # call generate_paged with device-side EOS.
+            seq = seqs[0]
+            block_table_1d = block_tables[0][: len(seq.block_table)]
+            raw = self.decoder.generate_paged(
+                seq.last_token,
+                len(seq) - 1,
+                block_table_1d,
+                max_steps,
+                eos_token,
+            )
+            return [raw]
+
+        input_ids = torch.tensor(
+            [seq.last_token for seq in seqs],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        positions = torch.tensor(
+            [len(seq) - 1 for seq in seqs],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        return self.decoder.generate_paged_batch(
+            input_ids,
+            positions,
+            block_tables,
+            max_steps,
+            eos_token,
+        )
+
+    def decode(self, seq, block_table) -> list[int]:
+        """Decode one token and return a one-element Python token-id list.
+
+        The caller supplies the current nano-vLLM block table. The decoder
+        writes the new K/V values into the scheduler-owned paged cache and
+        reads prior positions through that same cache; no prompt replay or
+        private contiguous cache is used.
+        """
+
+        self._ensure_decoder()
+        token_id = self.decoder.step(
+            seq.last_token,
+            position=len(seq) - 1,
+            block_table=block_table,
+        )
         return [int(token_id)]

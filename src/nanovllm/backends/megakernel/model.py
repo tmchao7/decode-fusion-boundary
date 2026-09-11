@@ -1,6 +1,7 @@
 """Weight loading and high-level decode API for Qwen3-0.6B."""
 
 import math
+import os
 import struct
 
 import torch
@@ -16,6 +17,31 @@ MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
 _decode = torch.ops.nanovllm_megakernel_C.decode
+_decode_paged = torch.ops.nanovllm_megakernel_C.decode_paged
+_decode_paged_batch = torch.ops.nanovllm_megakernel_C.decode_paged_batch
+_decode_paged_batch_wmma = torch.ops.nanovllm_megakernel_C.decode_paged_batch_wmma
+_generate_nosync_paged = torch.ops.nanovllm_megakernel_C.generate_nosync_paged
+_generate_nosync_paged_batch = torch.ops.nanovllm_megakernel_C.generate_nosync_paged_batch
+LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
+
+
+def _resolve_rope_theta(config, default: float = 10000.0) -> float:
+    """Resolve the RoPE base frequency from a HuggingFace/transformers config.
+
+    Qwen3-0.6B stores ``rope_theta`` inside the ``rope_scaling`` dict (as
+    ``rope_scaling={"rope_theta": 1000000, "rope_type": "default"}``) rather
+    than as a top-level attribute.  nano-vLLM's Qwen3 model handles this in
+    ``Qwen3Attention.__init__``; the Megakernel weight loader must do the
+    same or the cos/sin tables will use the wrong frequency.
+    """
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", default)
+        else:
+            rope_theta = default
+    return float(rope_theta)
 
 
 def _rope_tables(rope_theta: float = 10000.0):
@@ -62,7 +88,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     state = model.state_dict()
 
     cos_table, sin_table = _rope_tables(
-        getattr(model.config, "rope_theta", 10000.0)
+        _resolve_rope_theta(model.config)
     )
 
     # Per-layer weight list (11 tensors per layer, flattened)
@@ -141,7 +167,7 @@ def weights_from_nano_model(model, hf_config):
         )
 
     cos_table, sin_table = _rope_tables(
-        getattr(hf_config, "rope_theta", 10000.0)
+        _resolve_rope_theta(hf_config)
     )
     embed_weight = qwen.embed_tokens.weight
     return dict(
@@ -177,11 +203,19 @@ class Decoder:
         tokenizer=None,
         model_name="Qwen/Qwen3-0.6B",
         verbose: bool = True,
+        k_cache=None,
+        v_cache=None,
+        block_size: int | None = None,
+        num_cache_blocks: int | None = None,
+        max_batch_size: int = 1,
     ):
         if weights is None:
             weights, tokenizer = load_weights(model_name, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
+        self._max_batch_size = int(max_batch_size)
+        if self._max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
 
         # Keep references so tensors stay alive (prevents GC of weight memory).
         self._weights = weights
@@ -196,35 +230,116 @@ class Decoder:
 
         self._attn_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-        # KV cache
-        self._k_cache = torch.zeros(
-            NUM_LAYERS,
-            NUM_KV_HEADS,
-            MAX_SEQ_LEN,
-            HEAD_DIM,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        self._v_cache = torch.zeros_like(self._k_cache)
+        # KV cache. When views are provided, they must be nano-vLLM's
+        # [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        # tensors; the Megakernel then uses the scheduler's block table.
+        if (k_cache is None) != (v_cache is None):
+            raise ValueError("k_cache and v_cache must be provided together")
+        self._paged = k_cache is not None
+        if self._paged:
+            if k_cache.dim() != 5 or v_cache.shape != k_cache.shape:
+                raise ValueError("paged KV cache views must have matching 5D shapes")
+            if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+                raise ValueError("paged KV cache views must use BF16")
+            self._k_cache = k_cache
+            self._v_cache = v_cache
+            self._block_size = int(block_size or k_cache.shape[2])
+            self._num_cache_blocks = int(num_cache_blocks or k_cache.shape[1])
+            if k_cache.shape[0] != NUM_LAYERS:
+                raise ValueError("paged KV cache layer count does not match Qwen3-0.6B")
+            if k_cache.shape[1] != self._num_cache_blocks:
+                raise ValueError("num_cache_blocks does not match k_cache")
+            if k_cache.shape[2] != self._block_size:
+                raise ValueError("block_size does not match k_cache")
+            if k_cache.shape[3:] != (NUM_KV_HEADS, HEAD_DIM):
+                raise ValueError("paged KV cache head shape does not match Qwen3-0.6B")
+        else:
+            self._k_cache = torch.zeros(
+                NUM_LAYERS,
+                NUM_KV_HEADS,
+                MAX_SEQ_LEN,
+                HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._v_cache = torch.zeros_like(self._k_cache)
 
-        # Scratch buffers (single-token decode)
+        # Scratch buffers are partitioned by sequence in paged batch mode.
+        # The WMMA tensor-core GEMM pads the batch (M) dimension to 16 rows
+        # (m16n16k16 tile), so every output buffer's batch axis is padded to a
+        # multiple of 16 to keep store_matrix_sync in-bounds.
+        pad_batch = ((self._max_batch_size + 15) // 16) * 16
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
-        self._hidden = torch.empty(HIDDEN_SIZE, **bf16)
-        self._act = torch.empty(HIDDEN_SIZE, **f32)
-        self._res = torch.empty(HIDDEN_SIZE, **f32)
-        self._q = torch.empty(Q_SIZE, **f32)
-        self._k = torch.empty(KV_SIZE, **f32)
-        self._v = torch.empty(KV_SIZE, **f32)
-        self._attn_out = torch.empty(Q_SIZE, **f32)
-        self._mlp_inter = torch.empty(INTERMEDIATE_SIZE, **f32)
-        self._norm_out = torch.empty(HIDDEN_SIZE, **f32)
-        self._bmax_vals = torch.empty(4096, **f32)
-        self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
-        self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
+        self._hidden = torch.empty((pad_batch, HIDDEN_SIZE), **bf16)
+        self._act = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
+        self._res = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
+        self._q = torch.empty((pad_batch, Q_SIZE), **f32)
+        self._k = torch.empty((pad_batch, KV_SIZE), **f32)
+        self._v = torch.empty((pad_batch, KV_SIZE), **f32)
+        self._attn_out = torch.empty((pad_batch, Q_SIZE), **f32)
+        self._mlp_inter = torch.empty(
+            (pad_batch, INTERMEDIATE_SIZE), **f32
+        )
+        self._mlp_up = torch.empty(
+            (pad_batch, INTERMEDIATE_SIZE), **f32
+        )
+        self._norm_out = torch.empty((pad_batch, HIDDEN_SIZE), **f32)
+        self._bmax_vals = torch.empty(
+            self._max_batch_size * LDG_LM_NUM_BLOCKS, **f32
+        )
+        self._bmax_idxs = torch.empty(
+            self._max_batch_size * LDG_LM_NUM_BLOCKS,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self._out_token = torch.empty(
+            self._max_batch_size, dtype=torch.int32, device="cuda"
+        )
 
-    def step(self, token_id: int) -> int:
-        """Decode one token. Returns the next token id."""
+    def step(self, token_id: int, position: int | None = None, block_table=None) -> int:
+        """Decode one token and return the next token id.
+
+        Paged mode requires the caller to provide the logical position and the
+        device block table for the current sequence. Legacy mode keeps the
+        original contiguous-cache operator for the standalone reference tool.
+        """
+        if self._paged:
+            if position is None or block_table is None:
+                raise ValueError("paged decode requires position and block_table")
+            _decode_paged(
+                self._out_token,
+                token_id,
+                self._embed_weight,
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight,
+                self._cos_table,
+                self._sin_table,
+                self._k_cache,
+                self._v_cache,
+                self._hidden,
+                self._act,
+                self._res,
+                self._q,
+                self._k,
+                self._v,
+                self._attn_out,
+                self._mlp_inter,
+                self._norm_out,
+                self._bmax_vals,
+                self._bmax_idxs,
+                block_table,
+                NUM_LAYERS,
+                position,
+                self._block_size,
+                self._num_cache_blocks,
+                self._attn_scale,
+            )
+            # Single-sequence decode writes only element 0 of _out_token, which
+            # is sized to _max_batch_size (and can be > 1). Index element 0 so
+            # .item() works even after a multi-sequence batch shrinks to one.
+            return int(self._out_token[0].item())
         _decode(
             self._out_token,
             token_id,
@@ -253,18 +368,99 @@ class Decoder:
             self._attn_scale,
         )
         self._position += 1
-        return self._out_token.item()
+        return int(self._out_token[0].item())
+
+    def step_batch(self, input_token_ids, positions, block_tables) -> list[int]:
+        """Decode one token for each sequence using one paged batch operator."""
+
+        if not self._paged:
+            raise RuntimeError("step_batch() requires paged KV cache mode")
+        batch_size = int(input_token_ids.numel())
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(
+                f"batch size must be between 1 and {self._max_batch_size}"
+            )
+        if (
+            positions.numel() != batch_size
+            or block_tables.dim() != 2
+            or block_tables.shape[0] != batch_size
+        ):
+            raise ValueError("batch metadata shapes do not match")
+        _decode_paged_batch(
+            self._out_token[:batch_size],
+            input_token_ids,
+            positions,
+            block_tables,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            NUM_LAYERS,
+            self._block_size,
+            self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return self._out_token[:batch_size].cpu().tolist()
+
+    def decode_paged_batch_wmma(
+        self, input_token_ids, positions: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> list[int]:
+        """Paged batch decode using WMMA tensor-core GEMMs.
+
+        ``input_token_ids`` and ``positions`` are int64 CUDA tensors (aligned with
+        ``step_batch``); this avoids the per-call host->device upload.
+        """
+        batch_size = int(input_token_ids.numel())
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(f"wmma batch size 1-{self._max_batch_size}")
+        _decode_paged_batch_wmma(
+            self._out_token[:batch_size],
+            input_token_ids,
+            positions,
+            block_tables.contiguous(),
+            self._embed_weight, self._layer_weights_packed,
+            self._final_norm_weight, self._lm_head_weight,
+            self._cos_table, self._sin_table,
+            self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res,
+            self._q, self._k, self._v,
+            self._attn_out, self._mlp_inter, self._mlp_up, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._block_size, self._num_cache_blocks,
+            self._attn_scale,
+        )
+        return self._out_token[:batch_size].cpu().tolist()
+
 
     def reset(self):
         self._position = 0
-        self._k_cache.zero_()
-        self._v_cache.zero_()
+        if not self._paged:
+            self._k_cache.zero_()
+            self._v_cache.zero_()
 
     @property
     def position(self) -> int:
         return self._position
 
     def generate(self, prompt: str, max_tokens: int = 100) -> str:
+        if self._paged:
+            raise RuntimeError("generate() is only available for contiguous reference mode")
         self.reset()
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         for tid in ids[:-1]:
@@ -303,6 +499,118 @@ class Decoder:
         if eos in out:
             out = out[: out.index(eos)]
         return self.tokenizer.decode(out, skip_special_tokens=True)
+
+    def generate_paged(
+        self,
+        first_token_id: int,
+        start_position: int,
+        block_table,
+        num_tokens: int,
+        eos_token: int = -1,
+    ) -> list[int]:
+        """Generate ``num_tokens`` on-device with NO per-step CPU sync.
+
+        All ``block_table`` blocks for positions
+        ``[start_position, start_position + num_tokens)`` must already be
+        allocated (the block table is fixed over the span). When
+        ``eos_token >= 0`` the kernel deactivates on EOS and writes -1
+        sentinels for the remaining steps; the caller truncates. Returns the
+        raw token list (with -1 past EOS) after a single host sync.
+        """
+        if not self._paged:
+            raise RuntimeError("generate_paged() requires paged KV cache mode")
+        if not isinstance(block_table, torch.Tensor):
+            block_table = torch.tensor(block_table, dtype=torch.int32, device="cuda")
+        block_table = block_table.to(torch.int32).contiguous()
+        output_ids = _generate_nosync_paged(
+            first_token_id,
+            num_tokens,
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            block_table,
+            NUM_LAYERS,
+            start_position,
+            self._block_size,
+            self._num_cache_blocks,
+            eos_token,
+            self._attn_scale,
+        )
+        return output_ids.cpu().tolist()
+
+    def generate_paged_batch(
+        self,
+        input_token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_steps: int,
+        eos_token: int = -1,
+    ) -> list[list[int]]:
+        """Generate up to ``max_steps`` tokens for a batch with NO per-step sync.
+
+        Uses the WMMA tensor-core batch kernel in a no-sync loop with device-side
+        EOS. ``input_token_ids``/``positions`` are int64 CUDA tensors (mutated on
+        device); ``block_tables`` is fixed over the burst (R4). Returns
+        ``[seq][tokens]`` (de-truncated at EOS for each sequence).
+        """
+        if not self._paged:
+            raise RuntimeError("generate_paged_batch() requires paged KV cache mode")
+        batch_size = int(input_token_ids.numel())
+        if batch_size <= 0 or batch_size > self._max_batch_size:
+            raise ValueError(
+                f"generate_paged_batch batch size 1-{self._max_batch_size}"
+            )
+        output = _generate_nosync_paged_batch(
+            input_token_ids.contiguous(),
+            positions.contiguous(),
+            block_tables.contiguous(),
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._act,
+            self._res,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_inter,
+            self._mlp_up,
+            self._norm_out,
+            self._bmax_vals,
+            self._bmax_idxs,
+            NUM_LAYERS,
+            max_steps,
+            eos_token,
+            self._block_size,
+            self._num_cache_blocks,
+            self._attn_scale,
+        )
+        # Return the raw [batch][max_steps] int32 log. Inactive-seq entries
+        # past EOS are -1 (sentinel, set in the binding). The caller
+        # (Scheduler.postprocess_burst) truncates at EOS / max_tokens.
+        return output.cpu().tolist()
 
 
 def generate(prompt: str, max_tokens: int = 100, verbose: bool = True) -> str:

@@ -9,8 +9,9 @@ The repository currently contains three execution paths:
 
 - `torch-eager`: standard nano-vLLM PyTorch execution;
 - `torch-cudagraph`: standard nano-vLLM CUDA Graph execution;
-- `megakernel`: Qwen3-0.6B BF16 greedy decode on an A100-class GPU, limited to
-  one sequence and `max_model_len <= 2048`.
+- `megakernel`: experimental Qwen3-0.6B BF16 greedy decode on an A100-class
+  GPU, with paged KV support and an initial batch limit of 32 sequences;
+  correctness and performance remain pending server validation.
 
 Megakernel requests that are unsupported or run on V100 fall back to the
 standard backend and are marked as non-comparable in benchmark reports.
@@ -30,14 +31,16 @@ examples/                 Minimal inference examples
 
 ## Server Environment
 
-Use Miniconda for Python isolation. The setup script installs Python 3.11, a
-CUDA-enabled PyTorch wheel, project dependencies, and the repository in
-editable mode. The server must provide `nvidia-smi` and `nvcc`.
+Use `uv` for fast Python environment setup. The setup script reuses an
+existing server Python 3.10–3.12, explicitly avoids downloading a managed
+CPython, installs a CUDA-enabled PyTorch wheel and project dependencies, and
+installs the repository in editable mode. The server must provide `nvidia-smi`
+and `nvcc`.
 
 ```bash
 bash setup_server.sh
-conda activate nano-vllm-server
-python tools/verify_server_env.py
+source .venv/bin/activate
+python -m tools.verify_server_env
 ```
 
 Set `NANOVLLM_MODEL_PATH` when the model path should also be checked.
@@ -112,7 +115,7 @@ Nsight profiling is documented in `docs/server_benchmark.md`.
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall src/nanovllm tools
+python -m compileall src/nanovllm benchmarks tools
 ```
 
 ## 中文项目说明
@@ -121,4 +124,5 @@ python -m compileall src/nanovllm tools
 - [Benchmark 方法](docs/02_Benchmark方法.md)：服务器实验矩阵、运行步骤、结果保存和 Nsight 使用方式；
 - [基线与创新](docs/03_基线与创新.md)：baseline、Megakernel 模块、当前已实现能力和后续边界；
 - [Megakernel 设计笔记](docs/megakernel_design.md)：paged-KV 直连目标和 kernel 演进路径；
-- [服务器运行手册](docs/server_benchmark.md)：A100/V100 环境配置与完整命令。
+- [服务器运行手册](docs/server_benchmark.md)：A100/V100 环境配置与完整命令；
+- [服务器命令清单](SERVER_COMMANDS.txt)：可直接复制执行的服务器命令。

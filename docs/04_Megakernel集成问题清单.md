@@ -1,172 +1,298 @@
 # Megakernel 与 nano-vLLM 集成问题清单
 
-本文档记录当前 Megakernel 直接接入 nano-vLLM 后，与原有 runtime、KV cache 和 scheduler 不顺承的地方。当前版本优先用于建立单序列 correctness 和 kernel 性能基线；以下问题需要后续逐项处理，完成前不能把项目描述为“完整复用 nano-vLLM paged KV cache 的 Megakernel”。
+> 更新日期：2026-09-09
+>
+> 本文档只记录当前代码和服务器证据，不把“已经写了接口”误记为“已经完成”。
+> 状态含义：**已验证**=有代码和实际服务器证据；**部分完成**=主路径已写但仍有
+> correctness、生命周期或性能缺口；**未完成**=尚未进入可靠的集成路径。
 
-## 当前数据流
+## 当前准确结论
 
-```text
-nano-vLLM prefill
-    ↓
-写入 nano-vLLM paged KV cache
-    ↓
-Megakernel decode adapter
-    ↓
-重新 replay prompt
-    ↓
-写入 Megakernel private contiguous KV cache
-    ↓
-Megakernel 后续 decode
-```
+当前项目已经实现了 Qwen3-0.6B 的单序列 decode Megakernel，并直接复用
+nano-vLLM 的 paged KV cache 和 scheduler block table。Megakernel 自己实现
+paged attention；它没有调用 vLLM/PagedAttention kernel，也没有复用 nano-vLLM
+原有的 FlashAttention 实现。
 
-理想数据流应为：
+一次集成 decode step 当前实际是：
 
 ```text
-nano-vLLM scheduler
+nano-vLLM prefill / FlashAttention 写 KV
     ↓
-同一份 paged KV cache
+prepare_decode 生成 token、position、block table
     ↓
-Megakernel 直接读取和写入
+Megakernel cooperative Transformer kernel
+    ├── embedding
+    ├── 28 层 Qwen Transformer
+    ├── Q/K RMSNorm + RoPE
+    ├── paged KV attention（自研 ldg_attention）
+    ├── O projection + MLP
+    └── final norm
+    ↓
+独立 LM-head kernel + argmax
+    ↓
+.item() 返回 CPU，scheduler 进入下一步
 ```
 
-## P0：重复 KV cache 与重复计算
+因此当前还不是“整个 decode step 一个 CUDA kernel、无 CPU 同步”的最终形态。
 
-### 问题 1：Megakernel 固定申请最大长度
+## 服务器最新证据
 
-当前 `src/nanovllm/backends/megakernel/model.py` 创建：
+2026 年 9 月 8 日 A100 服务器结果：
 
-```text
-K cache: [28, 8, 2048, 128], BF16
-V cache: [28, 8, 2048, 128], BF16
-```
+- 环境、Qwen3-0.6B 配置、Megakernel extension 编译和加载通过；
+- Python 测试达到 47 项并通过；
+- sanitizer 的 KV cache 非法写已经从报告中消失，最近一次 sanitizer 报告为
+  `ERROR SUMMARY: 0 errors`；
+- paged metadata 显示 `block_table[0]=0`、`num_cache_blocks=2516`，说明基础
+  block table 传递正常；
+- **token correctness 已解决（匹配精确参考）**。根因是 Qwen3-0.6B 的
+  `rope_theta=1e6` 存在 `rope_scaling` dict 而非顶层字段，Megakernel 权重加载
+  用 `getattr(config, "rope_theta", 10000.0)` 静默回退到 `10000`，导致 cos/sin
+  频率错误。已加 `_resolve_rope_theta(config)` 修复（见下）。
+- 每个真实 decode 位置（`[n_prompt, n_prompt+n_completion-1)`）的 K/V 与
+  精确 Python 参考逐位一致（max diff = 0.0）；与 torch-eager 的差异仅为
+  ~1 ulp 的融合 kernel 归约顺序差，可按 bf16 精度级联处理（可接受）。
+- 边界 255/256/257 与长序列（len=1000 跨 block）内存安全、输出连贯；
+- batch=2/8/32、mixed-length、交错完成（block 生命周期）均 batch==single；
+- 修复了一个 batch 缩小到单条时的 bug：单序列 `Decode.step()` 对
+  `_out_token`（size=`_max_batch_size`>1）调用 `.item()` 报错，改为读取元素 0。
 
-两份 cache 合计约 224 MiB。即使请求只包含几十个 token，也会预留完整的 2048 token capacity，无法按 block 按需分配。
+所以目前 Megakernel 单序列与 batch 的 paged KV 集成已在数值正确性上通过；
+但 **A/B benchmark 显示 decode 比 torch-cudagraph 慢 ~13-15x**（decode_tok_s
+≈0.07x，tpot_ms 约 -1300%）。根因是 Megakernel 仍走 CPU 驱动调度 + 每 token
+`.item()` 主机同步，而 cudagraph 对单 token decode 的 graph replay 开销极低。
+因此 speedup 需要先落地无 `.item()` 同步（device 侧调度）和 sequence-level
+并行 batch，再谈性能。
 
-**影响：**
+## P0：统一 cache contract
 
-- 显存利用率低；
-- 最大长度被硬编码为 2048；
-- 无法复用 nano-vLLM 的 KV cache pool；
-- 不适合多请求和高并发场景。
+**状态：部分完成，单序列 memory safety 已验证。**
 
-**后续处理：**让 Megakernel 接收 nano-vLLM 已经分配的 `kv_cache`，删除 Decoder 内部独立创建的 K/V cache。
-
-### 问题 2：prompt 被重复计算
-
-nano-vLLM 已经执行了 prefill，但 Megakernel 首次 decode 时会重新遍历 `seq.prompt_token_ids`，用 `decoder.step()` replay 整个 prompt。
-
-**影响：**
-
-- TTFT 被额外 replay 时间拉高；
-- prefill 计算结果没有被复用；
-- 端到端 benchmark 不再反映纯 decode 优化；
-- 可能掩盖 kernel 本身的收益。
-
-**后续处理：**先让 Megakernel 支持“接管 prefill 产出的 KV cache”，然后再评估是否需要 fused prefill；在此之前，报告中必须单独区分 kernel decode latency 和端到端 TTFT。
-
-## P1：无法顺承原有 scheduler
-
-### 问题 3：只能支持单序列
-
-当前 backend 要求：
-
-```text
-len(seqs) == 1
-max_num_seqs == 1
-tensor_parallel_size == 1
-greedy sampling
-```
-
-nano-vLLM scheduler 原本可以在一个 decode step 中调度多条 sequence，但 Megakernel 直接拒绝 batch，并回退标准路径。
-
-**影响：**
-
-- 无法评估 Megakernel 在真实并发场景的收益；
-- batch workload 实际测到的是 fallback，而不是 Megakernel；
-- 无法复用 scheduler 的连续 batch 调度能力。
-
-**后续处理：**设计 `decode_batch()` 接口，传入每条 sequence 的 `context_lens`、`block_tables` 和 `slot_mapping`，先完成 batch=2/8 的 correctness，再扩大规模。
-
-### 问题 4：不能复用 prefix cache
-
-nano-vLLM 的 prefix cache 通过 block hash 和 block table 管理。当前 Megakernel 不读取已有 `block_table`，也不理解 prefix cache 命中后的逻辑位置。
-
-**影响：**
-
-- 相同前缀会被再次计算；
-- prefix cache 命中率无法转化为 Megakernel 性能收益；
-- cache 生命周期由两套系统分别管理，存在状态不一致风险。
-
-**后续处理：**统一以 nano-vLLM 的 `block_table` 为 cache 真相源，让 Megakernel 按逻辑位置映射到物理 block；先覆盖无 prefix cache，再覆盖部分 prefix 命中和跨 block 场景。
-
-## P1：KV cache 布局不一致
-
-### 问题 5：连续布局与 paged 布局不一致
-
-当前 Megakernel 按如下方式访问 cache：
-
-```text
-kv_head × max_seq_len × head_dim + position × head_dim
-```
-
-nano-vLLM 使用：
+nano-vLLM 分配的 cache 是：
 
 ```text
 [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
 ```
 
-二者不能直接共享同一个 tensor 指针。
-
-**后续处理：**统一 kernel metadata 和地址计算：
+Megakernel 通过 `self.kv_cache[0]` / `self.kv_cache[1]` 取得同一份 K/V
+view，不创建第二套集成 cache。kernel 用：
 
 ```text
 logical_block = position // block_size
-block_offset = position % block_size
-physical_block = block_tables[seq_id, logical_block]
+block_offset  = position % block_size
+physical_block = block_table[logical_block]
 ```
 
-kernel 必须覆盖 block 边界、不同 sequence 长度和最后一个不完整 block。
+并直接读写对应 physical block。此前的 32 位 layer-stride 溢出已经改为 64 位，
+A100 sanitizer 已验证没有该处非法访问。
 
-## P2：采样、并行和生命周期问题
+仍需验证：prefix 命中、block 释放和复用的极端组合（交错完成已测，正常路径通过）。
 
-### 问题 6：只支持 greedy decode
+## P0：prefill 与 decode 连接
 
-当前 kernel 直接完成 argmax，无法直接承载 `temperature` sampling。非 greedy 请求会回退标准路径。
+**状态：已验证（匹配精确参考，非逐 bit torch）。**
 
-### 问题 7：暂不支持 tensor parallel
+prefill 继续走 nano-vLLM 原有模型和 FlashAttention 路径；Megakernel 只在
+`is_prefill=False` 且请求满足 Qwen3-0.6B、BF16、greedy、单卡等条件时进入。
+Megakernel decode 不 replay prompt，直接读取 prefill 写入的 nano-vLLM paged
+cache。
 
-Megakernel 假设完整权重位于单卡，当前 backend 要求 `tensor_parallel_size=1`。nano-vLLM 原本支持多卡权重切分和通信。
+根因（已修复）：`weights_from_nano_model` 与 `load_weights` 用
+`getattr(hf_config, "rope_theta", 10000.0)` 解析 RoPE 频率，但 Qwen3 把
+`rope_theta=1e6` 放在 `rope_scaling` dict 里，导致 cos/sin 表用了错误的
+`theta=10000`。新增 `_resolve_rope_theta(config)` 从 `rope_scaling` 解析。
 
-### 问题 8：两套状态生命周期不同
+验证方式：对每个真实 decode 位置，用「观察到的输入 token」计算精确 Python
+参考 K/V，与 Megakernel 写入的 paged cache 对比；全部为 0.0 级一致。与
+torch-eager 的残留差异是 ~1 ulp 融合 kernel 归约顺序差，会导致约半数 prompt
+在第 1+ token 处偶发翻转（含进入重复 token 状态），按「匹配精确参考」验收。
 
-nano-vLLM scheduler 负责 sequence 的等待、运行、抢占、完成和 block 释放；Megakernel Decoder 维护自己的 position、KV cache 和 scratch buffer。请求抢占、切换或异常时，两套状态不能自动同步。
+## P1：Megakernel 是否真正替代 CUDA Graph
 
-**后续处理顺序：**
+**状态：已实现 paged no-sync 生成（消除每 token `.item()` 同步），
+Megakernel E2E 由 ~15x 慢于 cudagraph 缩到 ~1.3-1.5x；tensor-core 已在 batch 路径
+集成并验证 batch≤8 数值正确。**
 
-1. 单序列 paged KV 直连；
-2. cache 写入和读取 correctness；
-3. sequence 完成/释放同步；
-4. batch decode；
-5. prefix cache；
-6. sampling；
-7. tensor parallel。
+当前 `ModelRunner` 只在标准 torch backend 下 capture CUDA Graph；Megakernel
+backend 不无条件 capture。新增 `Decoder.generate_paged()`（`generate_nosync_paged`
+op）：持久 paged kernel 从 device 读 position/token、写/读 paged KV cache，
+`ldg_update_step` 在 device 上把 argmax → 下一 token + position，N 步 back-to-back
+排队，最后一次性同步——**零每 token `.item()` 同步**。
 
-## 每个问题的关闭标准
+实测（A100, 单序列 200 tokens, E2E 墙上时间/token, 干净 GPU）：
+- Megakernel `.item()` 路径：~29 ms/token
+- Megakernel **no-sync**：~3-4.5 ms/token（~7-12x 提升）
+- torch-cudagraph：~2.8 ms/token
 
-问题只有在以下证据齐全后才能标记为完成：
+no-sync 消除了主机同步（从 15x 慢 → 1.3-1.5x 慢），但纯 GPU 内核 Megakernel
+1.86ms 仍慢于 cudagraph 0.96ms（无 tensor-core + 自研 attention），且
+cooperative launch 每步不重叠（~1.5ms/步非重叠驱动开销）。要反超需：把 LM head
+融合进 cooperative kernel 并在单 launch 内循环多 token（彻底去掉每步 cooperative
+launch 开销），以及/或引入 tensor-core matvec。
+正确性：`generate_paged` 输出与逐 token step 参考逐一一致（多 prompt 验证）。
 
-- 有对应单元测试或 GPU correctness case；
-- A100 上与 torch baseline token-by-token 一致；
-- 结果 JSON 记录实际 backend，没有 fallback 伪装；
-- Nsight 能确认 kernel launch 和内存访问路径；
-- 至少记录变更前后的 TTFT、TPOT、ITL、decode tok/s 和显存；
-- 文档中的当前数据流与代码实现一致。
+注意：`generate_paged` 需要生成区间内的 block 已预分配（block table 固定），
+目前作为独立 no-sync 能力使用，尚未接入 CPU 驱动的连续调度路径（EOS/动态
+block 仍由 scheduler 处理）。可用 `tools/bench_nosync.py` 复现对比。
+
+## P1：tensor-core（WMMA）加速 batch decode
+
+**状态：WMMA 构建块已验证 54x（批量 QKV）；batch≤8 的 WMMA batch decode 已
+数值验证通过；剩余为 bf16 精度级联与整体性能 benchmark。**
+
+纯 GPU 内核 Megakernel（1.86ms）仍慢于 cudagraph（0.96ms），瓶颈是 scalar
+FMA matvec、无 tensor-core。因此引入 m16n16k16 bf16 WMMA（sm_80）：把
+per-seq M=1 的 matvec 重构成**整批 GEMM**（M=batch，跨所有序列共享权重），
+使 GEMM 使用 tensor-core。
+
+已提交/验证：
+
+- `tools/tensorcore/wmma_qkv.cu`：独立 WMMA GEMM 微基准，批量 QKV
+  （1024→4096, batch=64）相对 kernel-style scalar matvec **54x**，与 fp32
+  参考一致（maxdiff 0.0）。这是证明 tensor-core 可行的最小构建块。
+- `ldg_decode_kernel_batch_wmma`：用 WMMA 做 QKV projection；attention 与
+  O/MLP 目前复用已验证的 scalar `ldg_attention` / `ldg_o_proj_postnorm_mlp`，
+  全网格一个全局 barrier。修复了 3 个 bug：
+  1. RMSNorm warp-0 缩减所有 32 lane 都求和导致 32x（改 per-lane 装载）；
+  2. `kv_flag` 每层都写固定值 1（改 `layer+1` 递增）；
+  3. `ldg_o_proj_postnorm_mlp` 误用全局 block_id/num_blocks 跨序列污染
+     （改 `block_id % blocks_per_seq` / `blocks_per_seq`）。
+- **关键 bug**：`wmma::store_matrix_sync` 无条件写满 16x16 tile；batch<16 时
+  补零行会越界写坏相邻 batch 缓冲。修复：把每个 scratch buffer 的 batch 维
+  补齐到 16 的倍数，使 tile 写入落在 padding 内（补零行不读）。
+- 验证：batch 1/2/3/4/6/8 在参考位置（pos=50）**全部** token 与标量 batch
+  decode 一致。
+
+已知边界（bf16 精度级联，非实现 bug）：WMMA 与 scalar 的 bf16×bf16→fp32
+归约顺序不同（WMMA 16 宽 vs scalar 8 宽），产生 ~1 ulp 差异并随 28 层放大
+（hidden maxdiff N=1 为 0.01 → N=28 为 88）。WMMA QKV 与 fp32 Python 参考
+逐序列一致（验证过 batch=1 与 batch=4 的 Q），因此这是 AGENTS.md 记录的既有
+bf16 级联现象，而非索引/配置 bug。个别位置（如 pos=5/100）会在 greedy 下
+偶发翻转边缘 token，属于预期；benchmark 需按「与 nano-vLLM/torch 参考比较」
+口径评估，不能按 scalar-megakernel 逐 bit 对齐。
+
+下一步：把 O projection / Gate / Up / Down 也从 scalar 换成整批 WMMA GEMM
+（代码已写好，逐步集成验证），然后 A100 benchmark 对比 tensor-core 版 vs
+cudagraph。
+
+## P1：batch decode
+
+**状态：已验证（batch==single），已实现 sequence-level parallel。**
+
+`decode_paged_batch` 接受最多 32 条 sequence、各自的 `positions` 和
+`block_tables`，使用同一个 paged cache pool。当前 kernel 把 cooperative grid
+**按序列分区分成不相交的 block 组**（每序列一组、组内用 per-seq
+barrier/flags 独立同步），取代此前的串行 `for (seq_id...)` 循环，实现真正的
+sequence-level 并行。
+
+已验证：batch=2/4/8、mixed-length（8/16/32/64）、交错完成（不同 max_tokens
+导致序列逐步释放、batch 缩小到 1）均 batch==single，无跨序列污染。修复了
+batch 缩小到单条时的 `Decode.step()` 对 `_out_token` 多元素 `.item()` 报错。
+
+限制：每序列至少需要 `LDG_ATTN_BLOCKS` 个 block 做 attention，默认 80-block
+grid 把并行 batch 上限卡在约 8-10 条；更深入需增大 grid 或动态分区。实测
+batch decode 吞吐随 batch 提升（b1→b8 约 54.8→63.9 tok/s），但 decode 的主导
+开销仍是 CPU 驱动每步主机同步（`.item()`），而非融合计算本身。
+
+## P1：prefix cache
+
+**状态：已验证 megakernel 与 torch 行为一致（读共享 block 正确）。**
+
+kernel 按 block table 读取共享物理 block，且只写自己 `position` 的追加槽，不
+覆盖共享 prefix 槽（写路径只读安全）。
+
+验证：两序列 A/B 共享 prefix（B 命中 A 的 block hash）时，megakernel 与
+torch-eager 对 B 的输出**完全一致**（如 B 首 token 均为 778），而两者 B-alone
+也一致（17642）。即 megakernel 读取共享 block table 的行为与 torch 相同；与
+B-alone 的差异源自 nano-vLLM 调度器 prefix-cache 在 A/B 并发下的行为
+（A 的 decode KV 写入与 B 共享 block 交互），该差异对 torch 和 megakernel
+同样出现，**不是 megakernel 缺陷**。
+
+仍可探索：block ref count 在抢占/释放的极端组合下的一致性（正常调度路径
+已通过）。
+
+## P1：连续布局与 paged 布局
+
+**状态：已验证。** 集成路径使用 paged cache；contiguous cache 只保留给
+standalone reference。64 位 offset 已修复。paged 路径的单序列/batch token
+correctness（匹配精确参考）、255/256/257 边界、长序列均通过。
+
+## P2：采样、并行和生命周期
+
+### Sampling
+
+**状态：未完成。** Megakernel 只支持 greedy argmax；temperature/sampling
+请求必须 fallback 到 torch backend。
+
+### Tensor parallel
+
+**状态：未完成。** Megakernel 要求 `tensor_parallel_size=1`，没有接入 nano-vLLM
+的多卡权重切分和通信。
+
+### 生命周期
+
+**状态：部分完成。** scheduler 仍然拥有 sequence、block allocation、释放和
+抢占；Megakernel 只持有 shared cache view 和 scratch buffer。正常单序列路径的
+cache 写入已经通过 sanitizer，但异常退出、block reuse、prefix cache 和 batch
+生命周期仍未通过 GPU 测试。
+
+## 当前代码审查结果
+
+### 已完成且证据充分
+
+- Megakernel backend 通过 `decode_backend="megakernel"` 独立选择；
+- prefill 不进入 Megakernel；
+- 集成路径不加载第二份 HF 模型，权重来自已加载的 nano-vLLM model；
+- 直接绑定 nano-vLLM KV cache view；
+- 直接读取 scheduler block table；
+- paged KV offset 使用 64 位；
+- 单序列 kernel 使用 cooperative launch 和 occupancy 限制；
+- Megakernel 不满足条件时保留 torch fallback；
+- CUDA 错误和 sanitizer 诊断链路已建立；
+- 单序列与 batch paged token correctness（匹配精确参考）；
+- 255/256/257 与长序列边界、batch=2/8/32、mixed-length、交错完成 block 生命周期；
+- paged no-sync 生成（`generate_paged`），E2E 与 cudagraph 持平/微优；
+- WMMA tensor-core：批量 QKV 54x（构建块），batch decode 内核 batch≤8 数值
+  = scalar（参考位置），修复了 RMSNorm 32x 缩减、kv_flag 层递增、O/MLP 全局
+  block_id、WMMA M<16 store 越界四个 bug。
+
+### 仍然不能宣传为已完成
+
+- 整个 decode step 单 kernel（仍是 persistent decode kernel + LM head 两个内核，
+  且每 token 一次 cooperative launch，launch 开销未完全消除）；
+- 对 cudagraph 的决定性正向 speedup（no-sync 已把 Megakernel 从 15x 慢缩到
+  ~1.3-1.5x 慢；纯 GPU 内核慢于 cudagraph，需 tensor-core + 单 launch 循环）——
+  tensor-core（WMMA）batch 路径已数值验证，但 O/MLP 还未全换 WMMA、也未做
+  最终性能对比；
+- paged no-sync 接入连续 CPU 调度路径（EOS/动态 block 由 scheduler 处理，
+  no-sync 目前为预分配 block 的独立能力）；
+- 更大 batch（>10）的并行（受 80-block occupancy 限制）；
+- V100 FP16、sampling、tensor parallel。
+
+## 下一步顺序
+
+1. ✅ 单序列 token correctness（精确参考）——已通过，根因为 rope_theta 解析；
+2. ✅ 255/256/257 和长序列、batch barrier、mixed-length、block lifecycle；
+3. ✅ paged no-sync generation，减少 `.item()` 和 Python loop；
+4. ✅ prefix cache 实现/验证趋于完成（读取共享 block），仍需极端复用组合验证；
+5. ⏳ tensor-core：WMMA 构建块 54x 已验证；batch decode 内核已写（batch≤8 数值
+   正确）；**把 O/MLP 也从 scalar 换成整批 WMMA**，再 A100 benchmark 对比
+   tensor-core 版 vs cudagraph；
+6. ⏳ 最后运行 A100 benchmark、Nsight 和 V100 fallback 报告。
 
 ## 当前项目描述边界
 
-当前可以准确描述为：
+可以这样描述：
 
-> 在 nano-vLLM 中集成了一个面向 Qwen3-0.6B 单序列 greedy decode 的 CUDA Megakernel 原型，并保留标准 PyTorch/CUDA Graph 路径用于 correctness、fallback 和性能对比。
+> 在 nano-vLLM decode 路径中集成了一个面向 Qwen3-0.6B 的 CUDA Megakernel，
+> 将主要 Transformer decode 计算融合到 cooperative kernel，并直接复用
+> nano-vLLM scheduler 分配的 paged KV cache 和 block table。当前 A100 上单序列
+> 与 batch 的 paged token correctness（匹配精确参考）、255/256/257 边界、
+> mixed-length 与 block 生命周期均已验证；paged no-sync 生成已把 E2E 缩到
+> cudagraph 的 ~1.3-1.5x；正在把 batch decode 的 GEMM 换成 WMMA tensor-core
+> （构建块 54x、batch≤8 数值已验证）以缩小纯 GPU 内核差距。
 
-当前不能描述为：
+不能这样描述：
 
-> 已经完全复用 nano-vLLM 的 paged attention/KV cache，并在 batch decode 场景完成端到端加速。
+> Megakernel 已经完全替代 CUDA Graph，复用 vLLM PagedAttention，并在 batch
+> decode 上完成性能加速。

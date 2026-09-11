@@ -48,6 +48,8 @@ class CudaEventTimer:
 
     def __init__(self):
         self.enabled = False
+        self.started = False
+        self.stopped = False
         self.start_event = None
         self.end_event = None
         try:
@@ -63,16 +65,22 @@ class CudaEventTimer:
     def start(self) -> None:
         if self.enabled:
             self.start_event.record()
+            self.started = True
+            self.stopped = False
 
     def stop(self) -> None:
-        if self.enabled:
+        if self.enabled and self.started:
             self.end_event.record()
+            self.stopped = True
 
     def elapsed_seconds(self) -> float | None:
-        if not self.enabled:
+        if not self.enabled or not self.started or not self.stopped:
             return None
-        self.end_event.synchronize()
-        return self.start_event.elapsed_time(self.end_event) / 1000.0
+        try:
+            self.end_event.synchronize()
+            return self.start_event.elapsed_time(self.end_event) / 1000.0
+        except (RuntimeError, ValueError):
+            return None
 
 
 @dataclass
@@ -251,6 +259,12 @@ class MetricsCollector:
     def report(self, wall_time: float | None = None) -> dict[str, Any]:
         self._finalize_cuda_timing()
         summary = aggregate_requests(self.requests.values(), wall_time=wall_time)
+        summary["prefill_tok_s"] = _safe_rate(
+            summary["prompt_tokens"], self.prefill_time
+        )
+        summary["decode_tok_s"] = _safe_rate(
+            summary["output_tokens"], self.decode_time
+        )
         summary.update(
             {
                 "step_count": self.step_count,
@@ -323,6 +337,7 @@ def aggregate_requests(
     return {
         "request_count": len(requests),
         "completed_requests": len(completed),
+        "wall_time_s": wall_time,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "ttft_ms": summarize(ttft_values),
@@ -348,6 +363,66 @@ def aggregate_requests(
                 for name in request["backend_actual"].split("+")
             }
         ),
+    }
+
+
+
+def request_metrics_from_dict(data: dict[str, Any]) -> RequestMetrics:
+    """Rehydrate a serialized request for merging independent benchmark runs."""
+
+    return RequestMetrics(
+        request_id=int(data["request_id"]),
+        prompt_tokens=int(data["prompt_tokens"]),
+        arrival_time=float(data["arrival_time"]),
+        token_times=[float(value) for value in data.get("token_times", [])],
+        output_tokens=int(data["output_tokens"]),
+        prefill_time=float(data.get("prefill_time_ms", 0.0)) / 1000.0,
+        decode_time=float(data.get("decode_time_ms", 0.0)) / 1000.0,
+        backend_requested=str(data["backend_requested"]),
+        backend_actual=data.get("backend_actual"),
+        fallback_reason=data.get("fallback_reason"),
+        error=data.get("error"),
+        cuda_prefill_time=float(data.get("cuda_prefill_time_ms", 0.0)) / 1000.0,
+        cuda_decode_time=float(data.get("cuda_decode_time_ms", 0.0)) / 1000.0,
+    )
+
+
+def merge_metric_reports(reports: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-run reports while preserving request-level distributions."""
+
+    reports = list(reports)
+    requests = [
+        request_metrics_from_dict(request)
+        for report in reports
+        for request in report.get("requests", [])
+    ]
+    wall_time = sum(
+        float(report.get("summary", {}).get("wall_time_s", 0.0) or 0.0)
+        for report in reports
+    )
+    summary = aggregate_requests(requests, wall_time=wall_time)
+    for key in (
+        "step_count",
+        "prefill_steps",
+        "decode_steps",
+        "prefill_time_ms_total",
+        "decode_time_ms_total",
+        "cuda_prefill_time_ms_total",
+        "cuda_decode_time_ms_total",
+    ):
+        summary[key] = sum(
+            float(report.get("summary", {}).get(key, 0.0) or 0.0)
+            for report in reports
+        )
+    summary["prefill_tok_s"] = _safe_rate(
+        summary["prompt_tokens"], summary["prefill_time_ms_total"] / 1000.0
+    )
+    summary["decode_tok_s"] = _safe_rate(
+        summary["output_tokens"], summary["decode_time_ms_total"] / 1000.0
+    )
+    return {
+        "summary": summary,
+        "requests": [request.to_dict() for request in requests],
     }
 
 

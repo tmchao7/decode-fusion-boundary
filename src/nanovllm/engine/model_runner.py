@@ -1,3 +1,4 @@
+import gc
 import pickle
 import warnings
 
@@ -13,38 +14,69 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.metrics import nvtx_range
 from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.distributed import build_init_method
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+        init_method: str | None = None,
+    ):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        # Megakernel owns the decode path; capturing a second CUDA-Graph is
+        # unnecessary overhead. Unsupported Megakernel requests still use the
+        # eager torch path through this flag.
+        self.use_cudagraph = (
+            not self.enforce_eager and config.decode_backend != "megakernel"
+        )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl",
+            init_method or build_init_method(),
+            world_size=self.world_size,
+            rank=rank,
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
-        self.megakernel = (
-            MegakernelBackend(config, self.model)
-            if config.decode_backend == "megakernel"
-            else None
-        )
+        self.megakernel = None
         self.last_backend_used = "torch"
         self.last_fallback_reason = None
+        self._cuda_poisoned = False
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        if config.decode_backend == "megakernel":
+            self.megakernel = MegakernelBackend(config, self.model)
+            self.megakernel.set_kv_cache(self.kv_cache)
+            # Build the decoder (pack weights, allocate scratch) eagerly so the
+            # first decode token has no cold-start spike. On failure disable the
+            # megakernel and let the torch path remain the fallback.
+            try:
+                self.megakernel.ensure_ready()
+            except Exception as exc:  # noqa: BLE001 - fall back gracefully
+                warnings.warn(
+                    "Megakernel disabled at startup; using the standard "
+                    f"backend: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.megakernel.disable(str(exc))
+        if self.use_cudagraph:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -64,9 +96,13 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if self.use_cudagraph:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
+        # A device-side kernel fault poisons the CUDA stream. Synchronizing
+        # again during cleanup would mask the original exception with a second
+        # "illegal memory access" and make diagnosis harder.
+        if not self._cuda_poisoned:
+            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -102,16 +138,28 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        """Compile a small representative path without consuming KV-cache budget.
+
+        The previous warmup used the full ``max_num_batched_tokens`` budget
+        (16,384 tokens by default). FlashAttention/torch.compile can retain a
+        very large temporary allocation from that shape, leaving no room for
+        the actual KV pool. Graph capture happens separately after KV allocation.
+        """
+
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
+        seq_len = min(self.config.max_model_len, 512)
+        seqs = [Sequence([0] * seq_len)]
+        seqs[0].num_scheduled_tokens = seq_len
+        try:
+            self.run(seqs, True)
+            torch.cuda.synchronize()
+        finally:
+            reset_context()
+            del seqs
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -123,8 +171,18 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        available_for_kv = total * config.gpu_memory_utilization - used - peak + current
+        config.num_kvcache_blocks = int(available_for_kv) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(
+                "Insufficient free GPU memory for KV cache: "
+                f"GPU total={total / 2**30:.2f} GiB, "
+                f"free={free / 2**30:.2f} GiB, "
+                f"model/current allocation={used / 2**30:.2f} GiB, "
+                f"peak allocation={peak / 2**30:.2f} GiB, "
+                f"requested utilization={config.gpu_memory_utilization:.2f}. "
+                "Select an idle GPU with CUDA_VISIBLE_DEVICES or stop other GPU jobs."
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -210,7 +268,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or not self.use_cudagraph or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -233,7 +291,7 @@ class ModelRunner:
         # The first Megakernel milestone is intentionally a single-sequence,
         # greedy decode path. Unsupported requests fall back to the existing
         # PyTorch/eager/CUDA-Graph implementation below.
-        if self.megakernel is not None:
+        if self.megakernel is not None and not self.megakernel.disabled_reason:
             decision = MegakernelBackend.compatibility(
                 self.config, seqs, is_prefill
             )
@@ -242,18 +300,31 @@ class ModelRunner:
             if decision.supported:
                 try:
                     with nvtx_range("megakernel_decode"):
-                        token_ids = self.megakernel.decode(seqs[0])
-                    self.last_backend_used = "megakernel"
-                    return token_ids
+                        if len(seqs) == 1:
+                            # Single-seq decode reads seq.last_token/len(seq)
+                            # itself; only the block table (device tensor) is
+                            # required, so skip the full prepare_decode() which
+                            # would otherwise build unused CUDA tensors each step.
+                            block_tables = self.prepare_block_tables(seqs)
+                            set_context(False, block_tables=block_tables)
+                            token_ids = self.megakernel.decode(
+                                seqs[0], block_tables[0]
+                            )
+                        else:
+                            input_ids, positions = self.prepare_decode(seqs)
+                            context = get_context()
+                            token_ids = self.megakernel.decode_batch(
+                                input_ids, positions, context.block_tables
+                            )
                 except Exception as exc:
-                    # Once a kernel step has started, its private contiguous KV
-                    # cache may have advanced while nano-vLLM's paged cache has
-                    # not. Do not silently produce incorrect tokens by falling
-                    # back after that point.
+                    # Once a kernel step has started, nano-vLLM's shared paged
+                    # cache may have been updated. Do not silently produce
+                    # incorrect tokens by falling back after that point.
                     if self.megakernel.decoder is not None:
+                        self._cuda_poisoned = True
                         raise RuntimeError(
-                            "Megakernel decode failed after initialization; "
-                            "restart with decode_backend=\"torch\""
+                            "Megakernel decode failed after initialization: "
+                            f"{exc}; restart with decode_backend=\"torch\""
                         ) from exc
                     self.megakernel.disable(str(exc))
                     self.last_fallback_reason = str(exc)
@@ -263,6 +334,11 @@ class ModelRunner:
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                else:
+                    self.last_backend_used = "megakernel"
+                    return token_ids
+                finally:
+                    reset_context()
 
         # 对输入seqs进行 p or d的处理 ,这里返回对seqs中的seq的id和位置
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -271,6 +347,51 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def run_burst(
+        self, seqs: list[Sequence], max_steps: int
+    ) -> list[list[int]]:
+        """Run a no-sync megakernel burst for a batch of decode sequences.
+
+        The scheduler has already pre-allocated burst blocks (R4) so the block
+        table is fixed for the whole span. Returns ``[seq][max_steps]`` raw
+        token log; the scheduler ``postprocess_burst`` truncates at EOS /
+        max_tokens.
+        """
+        self.last_backend_used = "torch"
+        self.last_fallback_reason = None
+        try:
+            with nvtx_range("megakernel_burst"):
+                block_tables = self.prepare_block_tables(seqs)
+                token_logs = self.megakernel.generate_paged_batch(
+                    seqs,
+                    block_tables,
+                    max_steps,
+                    self.config.eos,
+                )
+        except Exception as exc:
+            # The kernel has already started (and may have written to the
+            # shared paged cache), so a silent fallback would corrupt state.
+            if self.megakernel.decoder is not None:
+                self._cuda_poisoned = True
+                raise RuntimeError(
+                    "Megakernel burst failed after initialization: "
+                    f"{exc}; restart with decode_backend=\"torch\""
+                ) from exc
+            self.megakernel.disable(str(exc))
+            self.last_fallback_reason = str(exc)
+            warnings.warn(
+                "Megakernel burst unavailable; falling back to step-wise: "
+                f"{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        else:
+            self.last_backend_used = "megakernel"
+            return token_logs
+        finally:
+            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):

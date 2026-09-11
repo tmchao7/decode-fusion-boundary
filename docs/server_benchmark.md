@@ -4,37 +4,57 @@ All CUDA commands in this document are intended for the GPU server, not a develo
 
 ## 1. Environment
 
-The recommended setup is Miniconda for Python isolation, the official CUDA PyTorch wheel for the runtime, and the server's NVIDIA driver/CUDA toolkit for `nvidia-smi` and `nvcc`. The PyTorch wheel does not replace the driver, and compiling the Megakernel extension still requires `nvcc`.
+The recommended server setup uses `uv` for Python isolation and fast dependency installation. The script reuses an existing server Python 3.10–3.12 and disables uv-managed CPython downloads. The NVIDIA driver, `nvidia-smi`, CUDA toolkit, and `nvcc` remain system/module dependencies. PyTorch's wheel supplies the CUDA runtime used by Python; it does not replace the driver or the compiler required by the Megakernel.
 
 From the repository root:
 
 ```bash
 bash setup_server.sh
-conda activate nano-vllm-server
+source .venv/bin/activate
 ```
 
-The script uses Python 3.11, PyTorch 2.8.0 with the CUDA 12.8 wheel, and the pinned project runtime requirements. Override the defaults when the server requires another supported wheel:
+The script creates `.venv` with an existing compatible Python, installs the repository's CUDA PyTorch wheel and Python requirements, installs the project in editable mode, and runs a basic environment check. Ordinary Python packages, PyTorch, and `nvidia-*` CUDA dependencies prefer the Huawei Cloud PyPI mirror; the official PyTorch CUDA index remains only as a fallback for packages missing from the mirror. To use another PyTorch CUDA wheel index:
 
 ```bash
-NANOVLLM_TORCH_VERSION=2.8.0 \
 NANOVLLM_TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126 \
 bash setup_server.sh
 ```
 
-Check a specific local model too:
+To change only the ordinary Python package mirror:
+
+```bash
+NANOVLLM_PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+bash setup_server.sh
+```
+
+Validate a local Qwen3-0.6B model:
 
 ```bash
 NANOVLLM_MODEL_PATH=/path/to/Qwen3-0.6B \
-python tools/verify_server_env.py
+python -m tools.verify_server_env --require-megakernel
 ```
 
-Use a local Qwen3-0.6B model directory. Do not commit model weights, Hugging Face tokens, profiler reports, or generated result files.
+The setup script uses `UV_HTTP_TIMEOUT=300` and `UV_LINK_MODE=copy`; the latter is appropriate when uv's cache and the repository are on different filesystems. If uv reports `invalid peer certificate: UnknownIssuer`, do not disable TLS verification. Set `UV_SYSTEM_CERTS=true` when the enterprise CA is installed in the system trust store, or set `SSL_CERT_FILE=/path/to/company-ca-bundle.pem` to the PEM bundle supplied by the server administrator. If `nvcc` is unavailable, load the server's CUDA module before running the setup script:
 
-## 2. Static and smoke checks
+```bash
+module avail cuda
+module load cuda/<server-version>
+```
+
+Do not commit model weights, credentials, benchmark results, or profiler reports.
+
+## 2. Static, build, and smoke checks
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall src/nanovllm tools
+```
+
+Compile the extension separately before running a correctness test:
+
+```bash
+NANOVLLM_CUDA_ARCH=sm_80 \
+python -m nanovllm.backends.megakernel.build
 ```
 
 Run a short correctness check before performance testing:

@@ -32,6 +32,9 @@ models/
 huggingface/
 .ref/
 
+# CUDA extension build cache
+.torch_extensions/
+
 # GPU benchmarks and profiling
 results/
 *.nsys-rep

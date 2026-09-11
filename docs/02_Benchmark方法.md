@@ -8,8 +8,8 @@
 
 ```bash
 bash setup_server.sh
-conda activate nano-vllm-server
-python tools/verify_server_env.py
+source .venv/bin/activate
+python -m tools.verify_server_env
 ```
 
 确认代码可导入并通过纯 Python 检查：
