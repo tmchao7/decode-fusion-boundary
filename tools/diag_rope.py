@@ -94,7 +94,7 @@ def main():
 
     # Check if there's a position offset
     print("\n=== Position offset search ===")
-    x_flat = x[0, 0]  # [128]
+    x_flat = x  # [128] (x is already 1D)
     for pos in [8, 16]:
         cos_p = torch_cos[pos].unsqueeze(0)
         sin_p = torch_sin[pos].unsqueeze(0)

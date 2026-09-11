@@ -114,9 +114,6 @@ class MetricsMathTests(unittest.TestCase):
         self.assertEqual(report["requests"][0]["output_tokens"], 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class MetricsMergeTests(unittest.TestCase):
     def test_merge_reports_preserves_requests_and_adds_wall_time(self):
         from nanovllm.metrics import merge_metric_reports
@@ -146,3 +143,7 @@ class BatchThroughputTests(unittest.TestCase):
         collector.record_token(2, 0.6)
         summary = collector.report(wall_time=0.6)["summary"]
         self.assertEqual(summary["prefill_tok_s"], 60.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

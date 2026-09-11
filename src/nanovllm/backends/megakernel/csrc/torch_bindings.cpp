@@ -110,19 +110,6 @@ extern "C" void launch_ldg_decode_batch_wmma(
     int block_table_stride, int block_size, int num_cache_blocks,
     float attn_scale, cudaStream_t stream);
 
-extern "C" void launch_ldg_decode_batch_wmma(
-    const void *input_token_ids, const void *positions,
-    const void *block_tables, int *output_token_ids,
-    const void *embed_weight, const LDGLayerWeights *layer_weights,
-    const void *final_norm_weight, const void *lm_head_weight,
-    const void *cos_table, const void *sin_table, void *k_cache,
-    void *v_cache, void *hidden_buffer, void *g_activations,
-    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
-    void *g_mlp_intermediate, void *g_mlp_up, void *g_normalized,
-    void *block_max_vals, void *block_max_idxs, int num_layers, int batch_size,
-    int block_table_stride, int block_size, int num_cache_blocks,
-    float attn_scale, cudaStream_t stream);
-
 void decode(torch::Tensor output_token, int64_t input_token_id,
             torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
             torch::Tensor final_norm_weight, torch::Tensor lm_head_weight,
