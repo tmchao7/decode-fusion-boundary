@@ -1,8 +1,17 @@
-# 多 batch 场景为何打不过 cudagraph：证据与根因分析（第 3 版）
+# 多 batch 场景为何打不过 cudagraph：证据与根因分析（第 5 版）
 
-> 更新日期：2026-09-11（第 3 版）
+> 更新日期：2026-09-11（第 5 版）
 >
-> - 第 2 版基于**当前代码**与**本机 A100 实测**修订（张量核全覆盖 + barrier 实际成本）。
+> - 第 5 版新增 **§3.5 nsys 实测纯 GPU kernel 时间分解**（4 组配置 b1/b8 × mega/cg），
+>   用四个实测比值坐实根因：b1 mega 纯 kernel 慢于 cg 2.6x 但 E2E 反超（launch 消除）；
+>   b8 mega 纯 kernel 慢 133x；b8/b1 mega kernel 增长 54x vs cg 1.04x（SM 空转）。
+>   发现 ncu 不能用于 cooperative kernel（driver hang），改用 nsys。§6 同步更新。
+> - 第 4 版把 **§9.6 crossover 实验从「待跑」升级为「A100 已跑 + 实测数据」**：
+>   batch=1/2/3/…/32 全扫描，拐点实测在 batch=1→2（悬崖式，无打平区），
+>   b1 1.31x BEATS、b≥2 单调劣化到 b32 0.02x，MegaKernel 在 b6 触底后平台化
+>   于 ~6.5 ms/tok。数据存 `results/crossover_scan.json` +
+>   `results/crossover_plot.png`，工具 `tools/bench_burst_batch.py` +
+>   `tools/plot_crossover.py`。§6 验证清单同步更新。
 > - 第 3 版在第 2 版结论之上，补充 **§9 外部公开实现/研究的交叉印证**
 >   （megaQwen、Ada-MK、vLLM CUDA Graph 设计），并新增 **§6 验证清单中的
 >   crossover 实验与 batch-aware 审计**两个待办。
@@ -164,6 +173,52 @@ launch(336 barriers): avg 0.5468 ms  -> 1.63 us/barrier
   GEMM 只有 4-12/80 block 干活、其余 SM 空转**导致的「潜伏期累加」——这是延迟问题，
   不是 barrier 的原始执行成本。
 
+### 3.5 nsys 实测：纯 GPU kernel 时间分解（坐实 SM 空转 + 资源模型不对称）
+
+> ncu（Nsight Compute）**不能用于 cooperative kernel**：其 kernel-replay 机制与
+> `cudaLaunchCooperativeKernel` 冲突，会导致 GPU driver hang（本机实测，连
+> `nvidia-smi` 都被阻塞，需等 driver TDR 恢复）。改用 nsys（只 trace 不 replay）
+> 采集 4 组配置的 GPU kernel 时间，结果存 `results/nsys_b*_*.sqlite`，
+> 解析工具 `tools/parse_nsys_kernel.py`。
+
+**实测**（A100-SXM4-80GB, Qwen3-0.6B, prompt_len=32, max_tokens=50, greedy；
+nsys `--trace=cuda --sample=none`；per-step = 纯 decode kernel ÷ 49 decode steps，
+prefill 占比 <4% 已分摊掉）：
+
+| 配置 | 纯 decode kernel ms/step | 主 kernel | E2E ms/tok |
+|------|------------------------:|-----------|-----------:|
+| b1 cudagraph | **0.74** | cuBLAS gemm + triton softmax/rmsnorm（33 种 kernel） | 2.94 |
+| b1 megakernel | **1.89** | `ldg_decode_kernel_persistent_paged` 1.71ms + `ldg_lm_head` 0.18ms | 2.24 |
+| b8 cudagraph | **0.77** | 同 b1 cuBLAS（batched gemm，kernel 时间几乎不变） | 0.43 |
+| b8 megakernel | **101.8** | `ldg_decode_kernel_batch_wmma` 98.5ms + `ldg_lm_head_batch` 3.38ms | 6.50 |
+
+**四个关键比值（全部 nsys 实测，非推理）**：
+
+1. **b1 megakernel 纯 kernel 比 cudagraph 慢 2.6x**（1.89 vs 0.74 ms/step），
+   但 E2E **反超 1.31x**（2.24 vs 2.94）——因为 megakernel 把 cudagraph 的
+   **2.2ms host/launch 开销**消到 0.35ms。**这量化了 §1 的「赢点 = launch 消除，
+   不是算力更强」**：megakernel 的 scalar kernel 本身就比 cuBLAS 慢，是 cooperative
+   一次 launch + 设备侧 EOS 把 host 开销压掉才赢的。
+
+2. **b8 megakernel 纯 kernel 比 cudagraph 慢 133x**（101.8 vs 0.77 ms/step）——
+   host 消除的 2.2ms 收益 vs kernel 多花的 101ms，**完全无法补偿**。E2E 14x 慢
+   （6.50 vs 0.43 ms/tok）的根源就在 kernel 本身，不是 host。
+
+3. **b8/b1 megakernel kernel 时间增长 54x**（98.5 vs 1.71 ms/step），而 batch
+   只大 8x——每多一个序列 kernel 时间涨 ~7x，远超计算量增长（batch GEMM 的
+   计算量只随 batch 线性增长）。**坐实「每 GEMM 仅 4-12/80 block 干活 + barrier
+   串行」：加 batch 不加并行度，只加等待时间。**
+
+4. **b8/b1 cudagraph kernel 时间增长 1.04x**（0.77 vs 0.74 ms/step，几乎不变）——
+   batched cuBLAS GEMM 用满 108 SM，算力富余，batch 从 1→8 计算量 8x 但 kernel
+   时间不变。**这是资源模型的根本不对称**：cudagraph 的 kernel 天生能吃满 SM，
+   megakernel 的固定 grid 吃不满。
+
+> `ldg_decode_kernel_batch_wmma` 在 b8 时极稳定（min 96.6 / avg 98.5 / max 101.5 ms，
+> 9 次采样），说明 ~98ms 是确定性的「层间串行潜伏期」而非随机噪声。
+> `ldg_decode_kernel_persistent_paged` 在 b1 同样极稳（min 1.707 / avg 1.711 / max 1.724 ms，
+> 49 次采样），确定性 scalar matvec。
+
 ## 4. root cause 三：没有真正的 continuous batching（不变）
 
 - burst 路径是「静态定长 burst」：`_should_burst`（`llm_engine.py:75-99`）要求无
@@ -196,9 +251,9 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | 剩余 scalar（Attention/LM head） | ✅ 代码确认 | 仍 scalar（§3.2） |
 | batch 上限（LDG_ATTN_BLOCKS=8） | ✅ build/agent 确认 | ≈10，batch=16 不跑 |
 | E2E 多 batch A/B（bench_burst_batch.py） | 服务器已跑 | batch=8 9.66 vs 0.461（21x） |
-| ncu kernel 时间分解 / SM 占用 | 待跑 | 预期 GEMM 只用少数 SM |
+| ncu kernel 时间分解 / SM 占用 | ✅ nsys 替代（ncu 对 cooperative kernel 致 driver hang） | b8 mega kernel 133x 慢于 cg；b8/b1 增长 54x vs cg 1.04x（§3.5） |
 | LM head 接 WMMA 后 A/B | 待跑 | 验证 scalar LM head 占比 |
-| **crossover 扫描**（batch 1/2/4/8/…/64 双轨 ms/tok + tok/s） | 待跑 | 找 MegaKernel 由胜转败的拐点（§9.6） |
+| **crossover 扫描**（batch 1/2/3/4/5/6/7/8/10/16/32 双轨 ms/tok + tok/s） | ✅ A100 已跑 | 拐点在 batch=1→2（§9.6）；b1 1.31x BEATS，b≥2 单调劣化到 b32 0.02x |
 | **batch-aware 审计**（batch 是否直映 CTA/warp、tile/KV/mapping） | 部分完成 | 已确认每 GEMM 仅 4-12/80 block 干活（§9.7） |
 | 四象限对照（eager / CG / mega / mega+CG） | 待跑 | 区分 launch 消除 vs kernel 内效率（§9.8） |
 
@@ -209,10 +264,14 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
    决定了 batch>1 无法通过「优化某个 kernel」翻盘。
 2. **唯一可持续的战略胜利点是 batch=1**：走 persistent kernel + 设备侧 EOS，靠消除
    launch 间隙 1.04-1.16x 微胜（docs/06 §0 实测）。
-3. **务实集成**：batch=1 走 megakernel persistent；batch>1 回退 cudagraph
+3. **务实集成（✅ 已落地）**：batch=1 走 megakernel persistent；batch>1 回退 cudagraph
    （megakernel 批处理路径不占优，不值得付出层间串行 + 多 launch 的代价）。WMMA batch
-   保留为显式开关供正确性研究。当前 hybrid dispatch（backend.py:250-274）已接近此
-   形态，仅需把 batch>1 默认策略从 WMMA batch 调整为回退 cudagraph。
+   保留为显式开关 `megakernel_batch_decode=True` 供正确性研究。`MegakernelBackend.
+   compatibility()`（`backend.py:93-100`）默认对 batch>1 返回 not supported →
+   `model_runner.run` 自动回退 torch+cudagraph；`_should_burst`（`llm_engine.py:99-103`）
+   同步拒绝 batch>1 burst。`megakernel-wmma` / `megakernel-burst` 后端（`compare.py`、
+   `correctness_smoke.py`）显式开启该开关以走 megakernel batch 路径。67 unittest 通过 +
+   GPU 实测：默认 batch=2 FALLBACK、batch=1 supported、开启后 batch=2 走 megakernel。
 4. 若要彻底翻盘只能**去掉逐层 grid.sync**、改成每层软件流水/隐式同步 + 让每个 batched
    GEMM 用满全 grid（向 cudagraph 靠拢）——工作量大且不确定（docs/06 R3 的方向）。
 
@@ -303,28 +362,62 @@ B↑    MegaKernel << CUDA Graph
 tile padding 使用率 batch/16）指向后者**，这从内部机制上印证了外部项目
 「megakernel 是 batch=1 窄场景优化」的说法。
 
-### 9.6 crossover 实验（把它从「demo」升级成「可发表结论」）
+### 9.6 crossover 实验（✅ A100 已跑，从「demo」升级成「可发表结论」）
 
 不要问「megakernel 能不能打败 vLLM」，改问：
 
 > **在 LLM decode 中，Kernel Fusion 与 CUDA Graph 的收益随 batch size 如何变化？
 > MegaKernel 的最优适用区间在哪里？**
 
-扫 batch = 1/2/4/8/16/32/64，记录两边的 decode ms/step、tok/s，最好再配
-GPU 利用率 / SM occupancy / DRAM BW / L2 hit / kernel duration，找 crossover 点：
+**实测**（A100-SXM4-80GB, Qwen3-0.6B, prompt_len=32, max_tokens=128, greedy,
+warmup=2, runs=3, 主指标 = min-of-runs 滤干扰；`tools/bench_burst_batch.py`，
+结果存 `results/crossover_scan.json` + `results/crossover_plot.png`）：
 
-```
-                 MegaKernel
-                     \        × ← crossover
-                      \      / \
-                       \    /   CUDA Graph
-                        \  /
-                    batch ───────→
-```
+| batch | CG ms/tok | MegaKernel ms/tok | speedup | verdict |
+|------:|----------:|------------------:|--------:|:--------|
+| 1 | 2.944 | 2.241 | **1.31x** | **BEATS** |
+| 2 | 1.634 | 11.352 | 0.14x | loses |
+| 3 | 1.120 | 8.236 | 0.14x | loses |
+| 4 | 0.840 | 6.631 | 0.13x | loses |
+| 5 | 0.680 | 5.902 | 0.12x | loses |
+| 6 | 0.566 | 5.621 | 0.10x | loses |
+| 7 | 0.487 | 5.979 | 0.08x | loses |
+| 8 | 0.429 | 6.495 | 0.07x | loses |
+| 10 | 0.347 | 7.478 | 0.05x | loses (serial×2) |
+| 16 | 0.224 | 6.500 | 0.03x | loses (serial×2) |
+| 32 | 0.111 | 6.496 | 0.02x | loses (serial×4) |
 
-预期形态：`batch ≤ B1` MegaKernel 最优；`B1<batch<B2` 打平；`batch≥B2` CUDA Graph
-最优。这个 crossover 本身就有研究价值（比「快 3x」的 demo 更有意义）。注意本仓库
-并行 batch 上限 ≈10，batch>10 需依赖 hybrid dispatch 的多批串行，测的时候要注明。
+> batch=1 权威复现（`tools/bench_nosync.py`, max_num_seqs=1, tokens=200）：
+> burst 2.62 vs cudagraph 2.85 = **1.09x BEATS**；no-sync raw kernel 2.01 = 1.42x。
+> 两个工具量级一致，crossover 工具用 max_num_seqs=32（噪声略大）+ min 指标后
+> batch=1 为 1.31x，均落在交接记录的 1.04–1.16x 区间之上沿（本次 GPU 较空闲）。
+
+**实测拐点结论**：
+
+- **crossover 发生在 batch=1 → 2**，且是「悬崖式」而非「平缓过渡」：batch=1
+  MegaKernel 赢 1.31x，batch=2 立刻跌到 0.14x（7x 慢），没有「打平区」。
+  原因是 batch=1 的赢点 = 消除 launch 间隙（cooperative 一次 launch 排队 N 步），
+  一旦 batch>1，固定 grid 按序列切分 + 每层 barrier 串行 + 每 GEMM 仅少数 block
+  干活的三重根因（§2/§5）立即主导，launch 消除的收益被淹没。
+- **CUDA Graph 平滑扩展**：ms/tok 从 2.94（b1）单调降到 0.11（b32），近似
+  线性摊薄——每个 batched GEMM 用满 108 SM、张量核全开、无 padding。
+- **MegaKernel 在 b6 触底（5.62）后平台化于 ~6.5 ms/tok**：b6→b32 几乎不变，
+  证实 §2.3「每 GEMM 仅 4-12/80 block 干活，其余 SM 空转」是恒定开销而非
+  随 batch 摊薄。b>8 因 `LDG_ATTN_BLOCKS=8` 上限拆成串行 burst（note 列标
+  serial×N），但单 burst 内部开销不变，所以 b8/b16/b32 都停在 ~6.5。
+- **b32 时 MegaKernel 慢 ~50x**（0.111 vs 6.496），与 §1.1 交接记录的 batch=8
+  21x 量级一致（batch 更大差距更大）。
+
+这把 §9.5 的「B≤B1 赢、B1<B<B2 打平、B≥B2 输」三段假设**修正为实测**：
+真实形态是「B=1 赢、B≥2 立输」，没有打平区——因为 MegaKernel 的优势
+（launch 消除）是 batch=1 独占的，batch>1 时 cudagraph 在每一项都是强项（§5），
+叠加成单调扩大而非平缓过渡。
+
+> 复现：`python -m tools.bench_burst_batch --batch-sizes 1,2,3,4,5,6,7,8,10,16,32 \
+> --max-tokens 128 --runs 3 --warmup 2 --json results/crossover_scan.json`，
+> 然后 `python -m tools.plot_crossover results/crossover_scan.json \
+> --output results/crossover_plot.png`。本仓库并行 batch 上限 ≈10，
+> batch>8 标注为 serial×N（hybrid dispatch 拆成多次 ≤8 的串行 burst）。
 
 ### 9.7 batch-aware 审计（最关键的自查清单）
 
