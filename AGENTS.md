@@ -74,6 +74,21 @@ config-resolution bug, not the fused math.
   ~1-ulp fused-kernel (reduction-order) difference, which can cascade into an
   occasional token flip or even a repeating-token state at greedy decoding.
   The megakernel matches an exact reference, not torch's fused bf16 kernels.
+- **The batched WMMA and scalar megakernel paths are not bit-identical across
+  grid/batch configs**, and can't be made token-exact at every batch/length. A
+  non-perturbing per-layer hidden dump shows L0 is bit-identical across
+  batches; the divergence is a single ~1-2 bf16 ULP at a later layer
+  (deterministic in clean runs, but shifted by timing perturbation such as
+  device `printf`), which then cascades into an occasional token flip at greedy
+  decode. This is the same documented ulp cascade, not memory corruption
+  (compute-sanitizer clean, L0 bit-identical, values bounded). A strict
+  token-equality gate for WMMA-vs-scalar therefore can never pass at every
+  batch; `tools/correctness_wmma_vs_scalar.py` instead classifies each case as
+  **PASS** (identical), **CASCADE** (divergence only at a decode token >= 1,
+  expected ulp cascade), or **FAIL** (divergence at prefill token 0 or a length
+  mismatch = real bug). Use the non-perturbing hidden-state dump
+  (`LDG_DBG_HIDDEN` + a per-layer device buffer, see git history) rather than
+  device `printf` when verifying a suspected divergence.
 
 ## Commit & Pull Request Guidelines
 

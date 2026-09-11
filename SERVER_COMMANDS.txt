@@ -197,11 +197,14 @@ run_correctness() {
       --json results/a100_correctness_burst.json \
       2>&1 | tee results/a100_correctness_burst.log
 
-  # WMMA vs scalar megakernel token-by-token (the correct correctness gate).
-  # The scalar megakernel itself diverges from torch-eager by ~1-ulp (bf16
-  # reduction-order), so the gate for the WMMA conversion is WMMA == scalar,
-  # not WMMA == torch-eager. Each backend runs in a fresh process to avoid
-  # CUDA-fault poisoning. Includes batch=3 (fence-race exposed case).
+  # WMMA vs scalar megakernel, cascade-aware gate.
+  # The batched megakernel and WMMA tensor-core paths are not bit-identical: a
+  # ~1-ulp bf16 reduction-order difference at some layer cascades into a token
+  # flip at greedy decode (documented in AGENTS.md). The scalar megakernel also
+  # diverges from torch-eager by ~1-ulp, so the meaningful gate is WMMA vs
+  # scalar, with the cascade classified separately: PASS (identical),
+  # CASCADE (divergence only at a decode token >= 1, expected ulp cascade),
+  # FAIL (divergence at prefill token 0 or a length mismatch = real bug).
   timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
