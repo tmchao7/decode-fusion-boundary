@@ -90,6 +90,19 @@ class MegakernelBackend:
             if temperature is None or temperature > 1e-10:
                 return Compatibility(False, "Megakernel v1 supports greedy sampling only")
 
+        # Hybrid architecture (docs/07 §9.6): megakernel wins batch=1 by
+        # eliminating host launch overhead, but loses batch>=2 because the
+        # fixed cooperative grid cannot saturate SMs for batched GEMMs
+        # (§2/§3.5). Default: batch>1 falls back to cudagraph. Set
+        # megakernel_batch_decode=True to force the megakernel batch path
+        # (used by correctness research tools).
+        if len(seqs) > 1 and not _get_attr(config, "megakernel_batch_decode", False):
+            return Compatibility(
+                False,
+                "batch>1 defaults to cudagraph (megakernel_batch_decode=False); "
+                "set megakernel_batch_decode=True to force megakernel batch",
+            )
+
         hf_config = _get_attr(config, "hf_config")
         for name, expected in QWEN3_CONTRACT.items():
             if name == "max_model_len":

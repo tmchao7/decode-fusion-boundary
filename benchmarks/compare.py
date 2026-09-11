@@ -38,12 +38,14 @@ BACKEND_CONFIGS = {
         "enforce_eager": False,
         "megakernel_batch_kernel": "wmma",
         "megakernel_burst": False,
+        "megakernel_batch_decode": True,
     },
     "megakernel-burst": {
         "decode_backend": "megakernel",
         "enforce_eager": False,
         "megakernel_batch_kernel": "wmma",
         "megakernel_burst": True,
+        "megakernel_batch_decode": True,
     },
 }
 PromptFactory = Callable[[int, int], str | list[int]]
@@ -160,10 +162,12 @@ def run_case(
 ) -> dict[str, Any]:
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"unknown backend: {backend_name}")
-    # The megakernel batch is sequence-level parallel (one cooperative grid
-    # partitioned per sequence), but each sequence needs >= LDG_ATTN_BLOCKS
-    # blocks; the default 80-block grid caps parallel batch near 8-10.
-    if backend_name in ("megakernel", "megakernel-wmma", "megakernel-burst") and batch_size > 10:
+    # The megakernel batch kernel (WMMA/burst) is sequence-level parallel (one
+    # cooperative grid partitioned per sequence), but each sequence needs >=
+    # LDG_ATTN_BLOCKS blocks; the default 80-block grid caps parallel batch near
+    # 8-10. Plain "megakernel" now falls back to cudagraph for batch>1, so the
+    # guard only applies to the explicit batch backends.
+    if backend_name in ("megakernel-wmma", "megakernel-burst") and batch_size > 10:
         raise ValueError("Megakernel parallel batch is bounded by the 80-block grid")
 
     backend_config = BACKEND_CONFIGS[backend_name]
@@ -268,6 +272,21 @@ def run_case(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def run_case_safe(*args, **kwargs) -> dict[str, Any] | None:
+    """Wrap run_case to gracefully skip unsupported backend/batch combos.
+
+    The megakernel batch kernel is bounded by the 80-block grid (batch <= 10);
+    rather than crashing the whole benchmark, log and skip.
+    """
+    try:
+        return run_case(*args, **kwargs)
+    except ValueError as exc:
+        backend = kwargs.get("backend_name") or (args[1] if len(args) > 1 else "?")
+        batch = kwargs.get("batch_size") or (args[6] if len(args) > 6 else "?")
+        print(f"SKIP: {backend} batch={batch}: {exc}", file=sys.stderr)
+        return None
 
 
 def mark_correctness(experiments: list[dict[str, Any]]) -> None:
@@ -474,7 +493,7 @@ def main() -> None:
         for prompt_length in performance_lengths:
             for backend in backends:
                 experiments.append(
-                    run_case(
+                    run_case_safe(
                         args.model,
                         backend,
                         f"perf_p{prompt_length}_b1",
@@ -493,7 +512,7 @@ def main() -> None:
             for batch_size in args.batch_sizes:
                 for backend in backends:
                     experiments.append(
-                        run_case(
+                        run_case_safe(
                             args.model,
                             backend,
                             f"perf_p128_b{batch_size}",
@@ -513,7 +532,7 @@ def main() -> None:
                 mix_lengths = [int(length) for length in mix["prompt_lengths"]]
                 for backend in backends:
                     experiments.append(
-                        run_case(
+                        run_case_safe(
                             args.model,
                             backend,
                             mix["id"],
@@ -533,7 +552,7 @@ def main() -> None:
         for item in workload_payload["correctness"]:
             for backend in backends:
                 experiments.append(
-                    run_case(
+                    run_case_safe(
                         args.model,
                         backend,
                         item["id"],
@@ -549,6 +568,7 @@ def main() -> None:
                     )
                 )
 
+    experiments = [exp for exp in experiments if exp is not None]
     if not experiments:
         parser.error("no workloads selected")
     mark_correctness(experiments)

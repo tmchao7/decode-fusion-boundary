@@ -41,8 +41,19 @@ class MegakernelBackendTests(unittest.TestCase):
             MegakernelBackend.compatibility(config, [seq], is_prefill=False).supported
         )
 
-    def test_accepts_small_greedy_batch(self):
+    def test_rejects_batch_by_default_falls_back_to_cudagraph(self):
+        # Hybrid architecture: batch>1 defaults to cudagraph unless
+        # megakernel_batch_decode explicitly forces the megakernel batch path.
         config = self.make_config(max_num_seqs=8)
+        seq = SimpleNamespace(temperature=0.0)
+        decision = MegakernelBackend.compatibility(
+            config, [seq, seq], is_prefill=False
+        )
+        self.assertFalse(decision.supported)
+        self.assertIn("cudagraph", decision.reason)
+
+    def test_accepts_small_greedy_batch_when_explicitly_enabled(self):
+        config = self.make_config(max_num_seqs=8, megakernel_batch_decode=True)
         seq = SimpleNamespace(temperature=0.0)
         decision = MegakernelBackend.compatibility(
             config, [seq, seq], is_prefill=False

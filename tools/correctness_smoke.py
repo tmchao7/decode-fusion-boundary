@@ -22,12 +22,14 @@ BACKENDS = {
         "enforce_eager": False,
         "megakernel_batch_kernel": "wmma",
         "megakernel_burst": False,
+        "megakernel_batch_decode": True,
     },
     "megakernel-burst": {
         "decode_backend": "megakernel",
         "enforce_eager": False,
         "megakernel_batch_kernel": "wmma",
         "megakernel_burst": True,
+        "megakernel_batch_decode": True,
     },
 }
 

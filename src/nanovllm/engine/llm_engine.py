@@ -96,6 +96,12 @@ class LLMEngine:
                 # The device-side EOS kernel always deactivates on EOS; until
                 # per-seq ignore_eos flags are plumbed through, fall back.
                 return False
+        # Hybrid architecture: batch>1 defaults to cudagraph unless
+        # megakernel_batch_decode explicitly forces the megakernel batch path.
+        if len(self.scheduler.running) > 1 and not getattr(
+            self.config, "megakernel_batch_decode", False
+        ):
+            return False
         return True
 
     def _step_burst(self, metrics: MetricsCollector | None):

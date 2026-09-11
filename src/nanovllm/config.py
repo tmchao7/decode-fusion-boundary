@@ -37,6 +37,12 @@ class Config:
     megakernel_burst: bool = True
     megakernel_burst_cap: int = 64
     megakernel_burst_batch: int = 8
+    # When False (default), batch>1 decode falls back to cudagraph and only
+    # batch=1 uses the megakernel persistent kernel — the hybrid architecture
+    # validated by the crossover scan (docs/07 §9.6: megakernel wins batch=1,
+    # loses batch>=2). Set True to force the megakernel batch (WMMA) path for
+    # batch>1, used for correctness research (tools/correctness_wmma_vs_scalar).
+    megakernel_batch_decode: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
