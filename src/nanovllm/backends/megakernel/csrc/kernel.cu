@@ -123,6 +123,13 @@ struct AtomicGridSync {
         volatile unsigned int *vgen = (volatile unsigned int *)generation;
         while (*vgen <= my_gen) {
         }
+        // Acquire fence: the release-side fence.acq_rel.gpu publishes writes
+        // to GPU scope before the last block increments generation.  Without
+        // this acquire fence, the waiting block sees the new generation but
+        // has no guarantee that those published stores are visible to it.
+        // On Ampere, L2 coherence masks this at some batch sizes (b2/b4) but
+        // not others (b3/b5), producing deterministic early divergence.
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
       }
       local_gen = my_gen + 1;
     }
@@ -525,6 +532,9 @@ __device__ void ldg_attention(
         volatile unsigned int *vf = (volatile unsigned int *)kv_flag;
         while (*vf < (unsigned int)(layer_idx + 1)) {
         }
+        // Acquire fence: see the K/V writes published by block 0's
+        // fence.acq_rel.gpu before the kv_flag signal.
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
       }
       __syncthreads();
     }
@@ -688,6 +698,9 @@ __device__ void ldg_attention(
       volatile unsigned int *vf = (volatile unsigned int *)attn_flag;
       while (*vf < target) {
       }
+      // Acquire fence: see the g_attn_out writes published by the attention
+      // blocks' fence.acq_rel.gpu before they atomicAdd'd attn_flag.
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
     __syncthreads();
   } else {
@@ -965,6 +978,12 @@ __device__ void wmma_gemm(const float *__restrict__ H,
       wmma::load_matrix_sync(b, W + n0 * K + k, K);
 
       wmma::mma_sync(acc, a, b, acc);
+      // Ensure every warp has finished reading s_a before the next k
+      // iteration's fill overwrites it.  Without this, a fast warp can
+      // advance to the next fill and clobber s_a while a slow warp in
+      // the same block is still loading it (deterministic shared-memory
+      // race that only manifests at certain batch sizes / SM schedules).
+      __syncthreads();
     }
     // The batch output buffers are padded to a multiple of 16 rows, so the
     // full-16-row store_matrix_sync (whose padded rows for M<16 are garbage)

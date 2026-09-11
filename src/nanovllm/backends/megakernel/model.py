@@ -596,6 +596,7 @@ class Decoder:
             self._v,
             self._attn_out,
             self._mlp_inter,
+            self._mlp_up,
             self._norm_out,
             self._bmax_vals,
             self._bmax_idxs,
