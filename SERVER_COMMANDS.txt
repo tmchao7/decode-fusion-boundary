@@ -14,6 +14,8 @@ set -euo pipefail
 #   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean A100 Megakernel rebuild
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # controlled A/B benchmark
 #   RUN_MODE=nosync bash SERVER_COMMANDS.txt         # no-sync / burst vs cudagraph
+#   RUN_MODE=account bash SERVER_COMMANDS.txt        # host/device split of decode steps
+#   RUN_MODE=roofline bash SERVER_COMMANDS.txt       # device lower-bound probe + bandwidth
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
@@ -351,11 +353,86 @@ run_nosync_bench() {
     2>&1 | tee results/a100_burst_batch_bench.log
 }
 
-run_profile() {
+run_account() {
   mkdir -p results
-  verify_environment
+  require_model
+  select_gpu
   verify_extension_import
-  # nsys is safe (trace-only, no kernel replay).
+
+  # 1. Device/host split from both ends of the batch range.
+  #    megakernel-wmma/megakernel-burst are bounded by the 80-block grid
+  #    (batch <= 10); batch 16/32 only exist for the cudagraph baseline.
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-cudagraph,megakernel-burst \
+    --prompt-lengths 32 \
+    --batch-sizes 1,2,4,8,10,16,32 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 5 \
+    --json results/a100_account.json \
+    --markdown results/a100_account.md \
+    2>&1 | tee results/a100_account_compare.log
+
+  # 2. Split every row into per-step wall / GPU / host residual and compare
+  #    against the 1.503 GB weight-streaming roofline.
+  #    seq-len 160 == prompt_len 32 + max_tokens 128 for this run.
+  python -m tools.account_decode \
+    results/a100_account.json \
+    --seq-len 160 \
+    --json results/a100_account_breakdown.json \
+    2>&1 | tee results/a100_account_breakdown.md
+
+  # 3. Standalone roofline table for the doc (no GPU state needed).
+  python -m nanovllm.roofline \
+    --batch-sizes 1,2,4,8,10,16,32 \
+    --seq-len 160 \
+    --check-kernel \
+    --json results/a100_roofline_model.json
+
+  # Decision rule (docs/07 section 10): if the fastest backend's step time is
+  # dominated by host residual, the recoverable cost is host-side for BOTH
+  # backends, and the megakernel question is not a device-side race.
+}
+
+run_roofline() {
+  mkdir -p results
+  require_model
+  select_gpu
+
+  # Experiments B (attainable bandwidth) and C (host-free graph replay).
+  # Standalone inline extensions -- no megakernel build required.
+  python -m tools.bench_roofline_a100 \
+    --model "$MODEL" \
+    --sections bandwidth,weights,host,barrier \
+    --target-bytes 1503000000 \
+    --batches 1,8,32 \
+    --grid-blocks 80 \
+    --block-size 512 \
+    --barrier-iterations 336 \
+    --json results/a100_roofline_probe.json \
+    2>&1 | tee results/a100_roofline_probe.log
+
+  # Experiment A: the device-side lower bound. Streams every transformer
+  # weight once per layer with the production barrier count and NO arithmetic.
+  # DECISION RULE (docs/07 section 10.4): <= 1.5 ms/step means the high-batch
+  # device side is recoverable and R3 is worth attempting; > 3 ms/step means
+  # the high-batch crossover is NOT achievable and the rewrite should stop.
+  python -m tools.bench_burst_lower_bound \
+    --model "$MODEL" \
+    --sections probe,graph \
+    --batches 1,8,32 \
+    --grid-blocks 80 \
+    --block-size 512 \
+    --iterations 4 \
+    --replays 50 \
+    --json results/a100_lower_bound.json \
+    2>&1 | tee results/a100_lower_bound.log
+}
+
+run_profile() {
   nsys profile --trace=cuda,nvtx --sample=none \
     --output=results/a100_megakernel_nsys \
     python -m benchmarks.compare \
@@ -443,6 +520,12 @@ case "$RUN_MODE" in
   nosync)
     run_nosync_bench
     ;;
+  account)
+    run_account
+    ;;
+  roofline)
+    run_roofline
+    ;;
   profile)
     select_gpu
     run_profile
@@ -459,7 +542,7 @@ case "$RUN_MODE" in
     ;;
   *)
     echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
-    echo "Use: model, verify, build, correctness, benchmark, profile, sanitize, or all." >&2
+    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, or all." >&2
     exit 2
     ;;
 esac
