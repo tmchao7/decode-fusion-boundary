@@ -20,6 +20,7 @@ from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel  # noqa: E4
 from tools.verdict import (  # noqa: E402
     VERDICT_DEVICE_AT_FLOOR,
     VERDICT_DEVICE_RECOVERABLE,
+    VERDICT_DEVICE_BORDERLINE,
     VERDICT_DEVICE_BOUND_CUDA_GRAPH,
     VERDICT_DEVICE_UNREACHABLE,
     VERDICT_HOST_BOUND_OPPORTUNITY,
@@ -119,7 +120,7 @@ class VerdictBranchTests(unittest.TestCase):
         verdict = compute_verdict(
             roofline=_roofline(1600.0), lower_bound=_lower_bound(2.2)
         )
-        self.assertEqual(verdict.verdict, "DEVICE_BORDERLINE")
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_BORDERLINE)
         self.assertTrue(
             any("narrower justification" in action for action in verdict.actions)
         )

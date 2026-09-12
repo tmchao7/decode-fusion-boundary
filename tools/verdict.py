@@ -62,6 +62,7 @@ VERDICT_NEEDS_CALIBRATION = "NEEDS_CALIBRATION"
 VERDICT_DEVICE_RECOVERABLE = "DEVICE_RECOVERABLE"
 VERDICT_DEVICE_AT_FLOOR = "DEVICE_AT_FLOOR"
 VERDICT_DEVICE_UNREACHABLE = "DEVICE_UNREACHABLE"
+VERDICT_DEVICE_BORDERLINE = "DEVICE_BORDERLINE"
 VERDICT_HOST_BOUND_OPPORTUNITY = "HOST_BOUND_OPPORTUNITY"
 VERDICT_DEVICE_BOUND_CUDA_GRAPH = "DEVICE_BOUND_CUDA_GRAPH"
 
@@ -440,7 +441,7 @@ def compute_verdict(
             "(e.g. also fixing attention/LM head)"
         )
         return Verdict(
-            VERDICT_DEVICE_UNREACHABLE if probe_ms > stop_ms else "DEVICE_BORDERLINE",
+            VERDICT_DEVICE_UNREACHABLE if probe_ms > stop_ms else VERDICT_DEVICE_BORDERLINE,
             f"High-batch device side is borderline: {probe_ms:.3f} ms/step.",
             rationale,
             actions,
