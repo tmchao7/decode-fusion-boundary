@@ -335,7 +335,7 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 
 ### 9.1 megaQwen 与我们的现象几乎完全吻合
 
-公开的 Qwen3-0.6B **megaQwen** 项目（`github.com/Infatoshi/MegaQwen`，RTX 3090）
+公开的 Qwen3-0.6B **megaQwen** 项目（[Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen)，RTX 3090）
 对这个问题有明确表述：
 
 - megakernel 在 **batch=1、短 context** 下明显超过 vLLM/SGLang；
@@ -382,7 +382,7 @@ Piecewise）。它预捕获 1/2/4/8/16/…/256 等 batch shape，按实际 batch
 ### 9.4 生产框架已转向 hybrid，而非「megakernel 万能」
 
 - vLLM：batching + optimized kernels + CUDA Graph + runtime dispatch；
-- Ada-MK（arXiv:2605.11581）：把 MegaKernel 定位在 decode（消除 kernel launch
+- Ada-MK（[arXiv:2605.11581](https://arxiv.org/abs/2605.11581)）：把 MegaKernel 定位在 decode（消除 kernel launch
   与 inter-operator HBM round-trip），但**不停留在固定 megakernel**——做 shared-memory
   constraint modeling、K-dimension splitting、offline DAG search、运行时分支提前到
   compile time，作为 TensorRT-LLM 插件用于低延迟 decode。
@@ -495,7 +495,7 @@ D. MegaKernel + CUDA Graph   ← 二者不互斥：CG 消 CPU launch，mega 消 
 ### 9.9 引用
 
 - megaQwen（Qwen3-0.6B custom CUDA kernel，RTX 3090）：
-  `github.com/Infatoshi/MegaQwen`。**注意：owner 是 Infatoshi，不是
+  [Infatoshi/MegaQwen](https://github.com/Infatoshi/MegaQwen)。**注意：owner 是 Infatoshi，不是
   `NoneBone/megaQwen`（那是另一个项目）**。该仓库 README 的自述数字：
   - b1 decode **530 tok/s**（3.9x vs HuggingFace；TRT-LLM 355、vLLM/SGLang 107）；
   - **带宽利用率仅 5%**（47 GB/s effective vs 936 GB/s peak）；
@@ -506,35 +506,35 @@ D. MegaKernel + CUDA Graph   ← 二者不互斥：CG 消 CPU launch，mega 消 
     并点名"生产框架针对 dynamic shapes / variable batch / long context /
     continuous batching 优化，本实现没有这些"。
 - Ada-MK: Adaptive MegaKernel Optimization via Automated DAG-based Search for LLM
-  Inference：`arXiv:2605.11581`（v1, 2026-05-12；MLIR DAG 离线搜索 + K 维切分 +
+  Inference：[arXiv:2605.11581](https://arxiv.org/abs/2605.11581)（v1, 2026-05-12；MLIR DAG 离线搜索 + K 维切分 +
   shared-memory 约束建模；作为 TensorRT-LLM 插件，L20）。关键数字：
   **kernel launch 开销占 E2E 14.6%**（即 megakernel 可回收的天花板）；
   **single-batch** 吞吐比 vanilla TRT-LLM 高最多 23.6%、比 vLLM 高 50.2%；
   prefill 仍走框架（hybrid），不是"megakernel 万能"。
 - MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs：
-  `arXiv:2512.22219`（OSDI'26）。用 **SM 级图 + 去中心化 in-kernel runtime** 做
+  [arXiv:2512.22219](https://arxiv.org/abs/2512.22219)（[OSDI'26](https://www.usenix.org/conference/osdi26/presentation/cheng)）。用 **SM 级图 + 去中心化 in-kernel runtime** 做
   跨算子软件流水，端到端延迟最多低 1.7x。**这是"去掉逐层 grid.sync"方向的
   最强公开证据**，但要注意它**没有 CUDA Graph 对照**，不能直接读成"megakernel
   在高 batch 打败 cudagraph"。
 - TaxBreak: Unmasking the Hidden Costs of LLM Inference Through Overhead
-  Decomposition：`arXiv:2603.12465`。把 host 开销分解成 framework translation /
+  Decomposition：[arXiv:2603.12465](https://ar5iv.labs.arxiv.org/html/2603.12465)。把 host 开销分解成 framework translation /
   CUDA library translation / kernel launch 三层，并用 Host–Device Balance Index
   判定 host-bound 还是 device-bound；它引用的 framework tax 工作给出了
   **batch 增大后系统从 framework-bound 转为 compute-bound** 的表征。
-- Cohere megakernel serving engine：`cohere.com/blog/megakernels` +
-  `github.com/cohere-ai/cohere-megakernel`（工业界 megakernel serving 的公开实现）。
-- 其他 megakernel 系统（供 §3.3 方向立项参考）：Fleet `arXiv:2604.15379`（multi-die
-  分层任务抽象）、GPUOS `arXiv:2604.17861`（透明 operation fusion / persistent
-  threads）、AutoMegaKernel `arXiv:2606.09682`（自改靶 megakernel 合成）。
-- vLLM CUDA Graph 设计：`docs.vllm.ai/en/latest/design/cuda_graphs/`
+- Cohere megakernel serving engine：[cohere.com/blog/megakernels](https://cohere.com/blog/megakernels) +
+  [cohere-ai/cohere-megakernel](https://github.com/cohere-ai/cohere-megakernel)（工业界 megakernel serving 的公开实现）。
+- 其他 megakernel 系统（供 §3.3 方向立项参考）：Fleet [arXiv:2604.15379](https://ar5iv.labs.arxiv.org/html/2604.15379)（multi-die
+  分层任务抽象）、GPUOS [arXiv:2604.17861](https://arxiv.org/html/2604.17861v1)（透明 operation fusion / persistent
+  threads）、AutoMegaKernel [arXiv:2606.09682](https://huggingface.co/papers/2606.09682)（自改靶 megakernel 合成）。
+- vLLM CUDA Graph 设计：[docs.vllm.ai/en/latest/design/cuda_graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs/)
 - vLLM `CudagraphDispatcher`/`BatchDescriptor`/graph mode（`NONE / PIECEWISE /
   FULL / FULL_DECODE_ONLY / FULL_AND_PIECEWISE`，默认 `FULL_AND_PIECEWISE`）：
   vLLM 最新文档
 - vLLM host 开销相关 issue/PR（说明高并发下 CPU 侧仍是瓶颈）：
-  `github.com/vllm-project/vllm` issue `#27222`（Qwen3-next CPU overhead）、
-  PR `#18698`（cudagraph capture size 逻辑）、PR `#47540`（per-step CPU rebuild）
+  `github.com/vllm-project/vllm` issue [#27222](https://github.com/vllm-project/vllm/issues/27222)（Qwen3-next CPU overhead）、
+  PR [#18698](https://github.com/vllm-project/vllm/pull/18698)（cudagraph capture size 逻辑）、PR [#47540](https://github.com/vllm-project/vllm/pull/47540)（per-step CPU rebuild）
 - vLLM batch=12/20 graph capture 收益（~7x decode）：
-  `github.com/vllm-project/vllm-ascend/issues/16049`
+  [vllm-ascend#16049](https://github.com/vllm-project/vllm-ascend/issues/16049)
 
 > 注：以上引用为 2026-09 检索的公开资料，链接文本与 arXiv 编号按检索当时为准；
 > 引入本仓库时以「方向印证」看待，不作为本机实测依据。**本次核对修正了第 5 版

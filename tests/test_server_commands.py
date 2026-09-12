@@ -218,5 +218,53 @@ class ServerCommandReferenceTests(unittest.TestCase):
                 )
 
 
+class CitationTests(unittest.TestCase):
+    """docs/07 section 9.9 is the external-evidence record; keep it usable."""
+
+    def setUp(self) -> None:
+        self.text = (REPO_ROOT / "docs" / "07_多batch为何打不过cudagraph.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_megaqwen_owner_is_corrected(self) -> None:
+        """The v5 doc credited the wrong GitHub owner."""
+
+        self.assertIn("https://github.com/Infatoshi/MegaQwen", self.text)
+        section = self.text.split("### 9.9")[1]
+        # The wrong owner may only appear next to an explicit correction.
+        markers = ("不是", "错误", "修正")
+        for match in re.finditer(r"NoneBone/megaQwen", section):
+            window = section[max(0, match.start() - 160) : match.end() + 160]
+            self.assertTrue(
+                any(marker in window for marker in markers),
+                "wrong owner appears without a correction marker",
+            )
+
+    def test_every_arxiv_id_is_inside_a_link(self) -> None:
+        """An identifier the reader must paste is not a citation."""
+
+        ids = set(re.findall(r"arXiv:(\d{4}\.\d{4,5})", self.text))
+        self.assertGreaterEqual(len(ids), 4)
+        linked = set(
+            re.findall(r"\[(?:arXiv:)?(\d{4}\.\d{4,5})\]\(https?://", self.text)
+        )
+        for arxiv_id in sorted(ids):
+            with self.subTest(arxiv_id=arxiv_id):
+                self.assertIn(
+                    arxiv_id, linked, f"{arxiv_id} is named but not linked"
+                )
+
+    def test_primary_sources_are_linked(self) -> None:
+        for url in (
+            "https://github.com/Infatoshi/MegaQwen",
+            "https://arxiv.org/abs/2605.11581",
+            "https://arxiv.org/abs/2512.22219",
+            "https://www.usenix.org/conference/osdi26/presentation/cheng",
+            "https://cohere.com/blog/megakernels",
+        ):
+            with self.subTest(url=url):
+                self.assertIn(url, self.text)
+
+
 if __name__ == "__main__":
     unittest.main()
