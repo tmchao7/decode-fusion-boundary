@@ -33,7 +33,7 @@ step is 2.94/3.43/3.55 ms at batch 1/8/32 while its pure GPU time is only
 size merely amortizes.** Whether a batch>1 megakernel can win therefore depends
 entirely on getting its device side back near the 0.97 ms floor, which is what
 `RUN_MODE=roofline` measures *before* any kernel rewrite. See
-[docs/07](docs/07_多batch为何打不过cudagraph.md) §10 for the falsifiable
+[docs/06](docs/07_架构结论_megakernel为何打不过cudagraph.md) §10 for the falsifiable
 decision rule.
 
 ## Repository Layout
@@ -129,7 +129,7 @@ python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
 
 The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
 throughput, CUDA Event time, peak memory, fallback reasons, and correctness.
-Nsight profiling is documented in `docs/server_benchmark.md`.
+Nsight profiling and the server workflow are documented in `docs/08_服务器运行手册.md`.
 
 ## Development Checks
 
@@ -140,13 +140,18 @@ python -m compileall src/nanovllm benchmarks tools
 
 ## 中文项目说明
 
-- [指标说明](docs/01_指标说明.md)：TTFT、TPOT、ITL、E2E、吞吐、显存和正确性口径；
-- [Benchmark 方法](docs/02_Benchmark方法.md)：服务器实验矩阵、运行步骤、结果保存和 Nsight 使用方式；
-- [基线与创新](docs/03_基线与创新.md)：baseline、Megakernel 模块、当前已实现能力和后续边界；
-- [Megakernel 设计笔记](docs/megakernel_design.md)：paged-KV 直连目标和 kernel 演进路径；
-- [服务器运行手册](docs/server_benchmark.md)：A100/V100 环境配置与完整命令；
-- [多 batch 为何打不过 cudagraph](docs/07_多batch为何打不过cudagraph.md)：第 6 版，含 host/device 账本与高并发可行性判定；
-- [高并发判定任务书](docs/09_高并发判定任务书.md)：跑什么 / 看什么 / 怎么判（决定是否投入 R3 的唯一入口）；
+按阅读顺序：
+
+- [01 项目说明](docs/01_项目说明.md)：**先读这个**。最终形态（batch=1 megakernel / batch>1 cudagraph）、项目定位、集成边界；
+- [02 指标说明](docs/02_指标说明.md)：TTFT、TPOT、ITL、E2E、吞吐、显存和正确性口径；
+- [03 Megakernel 设计说明](docs/03_Megakernel设计说明.md)：结构、KV cache 契约、算子覆盖、融合边界、已知边界；
+- [04 基准测试方法](docs/04_基准测试方法.md)：实验矩阵、运行步骤、结果保存、Nsight 用法；
+- [05 对比基线与公平性](docs/05_对比基线与公平性.md)：对照谁、怎么测、三处必须披露的不对称；
+- [06 实际运行数据](docs/06_实际运行数据.md)：已实测 / 待标定 / 待跑 三类数字，含 batch 扫描与 host/device 账本；
+- [07 架构结论：megakernel 为何打不过 cudagraph](docs/07_架构结论_megakernel为何打不过cudagraph.md)：机制拆解 + 外部印证 + 判定规则；
+- [08 服务器运行手册](docs/08_服务器运行手册.md)：A100/V100 环境、RUN_MODE 用法、profiling 注意事项；
+- [09 集成问题清单](docs/09_集成问题清单.md)：P0/P1/P2 待办与已验证项；
+- [10 交接文档](docs/10_交接文档.md)：**下一个 agent 从这里开始**（做了什么、还剩什么、怀疑什么）；
 - [服务器命令清单](SERVER_COMMANDS.txt)：可直接复制执行的服务器命令。
 
 ## Host/Device Accounting and the High-Batch Verdict

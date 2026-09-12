@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 SERVER_COMMANDS = REPO_ROOT / "SERVER_COMMANDS.txt"
-DOCS_09 = REPO_ROOT / "docs" / "09_高并发判定任务书.md"
+DOCS_09 = REPO_ROOT / "docs" / "10_交接文档.md"
 
 # Modules we own; everything else in the file (pip, nsys, nvidia-smi) is not
 # ours to validate.
@@ -203,7 +203,7 @@ class ServerCommandReferenceTests(unittest.TestCase):
         self.assertEqual(extras, [])
 
     def test_docs_promise_files_the_commands_actually_write(self) -> None:
-        """docs/09 tells the user which files to send back; they must be real."""
+        """docs/08 tells the user which files to send back; they must be real."""
 
         promised = set(
             re.findall(r"(a100_[a-z_]+\.(?:json|md|log))", DOCS_09.read_text(encoding="utf-8"))
@@ -214,15 +214,15 @@ class ServerCommandReferenceTests(unittest.TestCase):
                 self.assertIn(
                     filename,
                     self.text,
-                    f"docs/09 promises {filename} but SERVER_COMMANDS never writes it",
+                    f"docs/08 promises {filename} but SERVER_COMMANDS never writes it",
                 )
 
 
 class CitationTests(unittest.TestCase):
-    """docs/07 section 9.9 is the external-evidence record; keep it usable."""
+    """docs/06 section 9.9 is the external-evidence record; keep it usable."""
 
     def setUp(self) -> None:
-        self.text = (REPO_ROOT / "docs" / "07_多batch为何打不过cudagraph.md").read_text(
+        self.text = (REPO_ROOT / "docs" / "07_架构结论_megakernel为何打不过cudagraph.md").read_text(
             encoding="utf-8"
         )
 

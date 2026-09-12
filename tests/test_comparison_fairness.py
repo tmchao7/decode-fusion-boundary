@@ -149,14 +149,29 @@ class CudagraphPaddingDocumentationTests(unittest.TestCase):
         self.assertIn("[1, 2, 4, 8] + list(range(16, max_bs + 1, 16))", source)
         self.assertIn("next(x for x in self.graph_bs if x >= bs)", source)
 
-    def test_padding_table_is_reported_in_docs(self) -> None:
-        """docs/07 must state the padding so the comparison is not read as clean."""
+    def test_padding_is_documented_in_the_fairness_doc(self) -> None:
+        """docs/05 must state the bucket padding so the table is not read as clean."""
 
-        docs = (
-            REPO_ROOT / "docs" / "07_多batch为何打不过cudagraph.md"
+        fairness = (
+            REPO_ROOT / "docs" / "05_对比基线与公平性.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("cudagraph batch padding", docs)
-        self.assertIn("graph_bs", docs)
+        self.assertIn("bucket（桶）", fairness)
+        self.assertIn("graph_bs", fairness)
+        self.assertIn("+60%", fairness)
+
+    def test_asymmetric_acceleration_is_documented(self) -> None:
+        fairness = (
+            REPO_ROOT / "docs" / "05_对比基线与公平性.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("FlashAttention", fairness)
+        self.assertIn("scalar", fairness)
+
+    def test_architecture_doc_still_records_the_fairness_audit(self) -> None:
+        arch = (
+            REPO_ROOT / "docs" / "07_架构结论_megakernel为何打不过cudagraph.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("对比公平性", arch)
+        self.assertIn("graph_bs", arch)
 
 
 if __name__ == "__main__":

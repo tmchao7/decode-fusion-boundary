@@ -366,7 +366,7 @@ kernel，用 cooperative groups 做 grid-wide synchronization**。其作者进�
   occupancy / 同步 / KV cache 访问 / 并行度** → 成熟的 batched cuBLAS/FMHA +
   CUDA Graph 开始占优。
 
-这与 docs/07 第 1 版 §1.3 及本文 §2 的结论一致：**单序列 win 点 = launch 消除，
+这与 docs/06 第 1 版 §1.3 及本文 §2 的结论一致：**单序列 win 点 = launch 消除，
 batch 放大后 GEMM 算力/利用率侧 `crossover` 反超**。
 
 ### 9.3 vLLM 的 CUDA Graph 已远超「普通 graph」
@@ -721,7 +721,7 @@ P1 项）。
   附近，结论必须落在 host 侧；`DEVICE_BOUND_CUDA_GRAPH`——判定还要拿 §10.4 实验 C 的
   `host_free`（消除 host 后 cudagraph 的每步时间）当对手，只有 `probe × 1.25 <
   host_free` 才给 `HOST_BOUND_OPPORTUNITY`，否则即使 probe 很低也判没有 device 侧的
-  赢法。完整用法见 [docs/09](09_高并发判定任务书.md) §3。
+  赢法。完整用法与阈值见本节与 [08](08_服务器运行手册.md) §2。
 
 
 

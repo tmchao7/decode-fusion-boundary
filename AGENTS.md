@@ -8,7 +8,7 @@
 - `examples/basic_generation.py` is the smallest end-to-end inference example; `benchmarks/` contains batch and Megakernel benchmarks.
 - `src/nanovllm/backends/megakernel/` contains the Qwen CUDA kernel, C++ bindings, build helper, and backend adapter; changes there require server-side CUDA tooling.
 - `docs/` contains the paged-KV design, A100/V100 server runbook, and Chinese metric/baseline/benchmark notes; `tools/` contains correctness and visualization utilities.
-- `docs/07_多batch为何打不过cudagraph.md` is the authoritative record for the Megakernel-vs-CUDA-Graph question (currently v6). Before proposing a batch>1 kernel rewrite, read its §10 ledger and §10.4 decision rule: the device side has no headroom to win, so the only recoverable cost is per-step host overhead.
+- `docs/07_架构结论_megakernel为何打不过cudagraph.md` is the authoritative record for the Megakernel-vs-CUDA-Graph question (currently v6). Before proposing a batch>1 kernel rewrite, read its §10 ledger and §10.4 decision rule: the device side has no headroom to win, so the only recoverable cost is per-step host overhead.
 
 ## Build, Test, and Development Commands
 
