@@ -278,8 +278,12 @@ __device__ __forceinline__ void atomic_grid_sync(
   __syncthreads();
 }
 
-__global__ void barrier_probe(unsigned int *counter, unsigned int *generation,
-                              unsigned int nblocks, int iterations) {
+// One block per SM, matching the production decode kernel's occupancy contract
+// (kernel.cu declares __launch_bounds__(LDG_BLOCK_SIZE, 1)), so the cooperative
+// limit and the register pressure match production.
+__global__ void __launch_bounds__(512, 1) barrier_probe(
+    unsigned int *counter, unsigned int *generation, unsigned int nblocks,
+    int iterations) {
   unsigned int local_gen = 0u;
   for (int i = 0; i < iterations; i++) {
     atomic_grid_sync(counter, generation, nblocks, local_gen);
@@ -341,7 +345,16 @@ def bench_barrier(  # pragma: no cover - GPU only
         import torch as _torch
 
         torch = _torch
+    preflight = None
     if module is None:
+        # Fail before compiling if the cooperative grid is not launchable.
+        from tools.bench_burst_lower_bound import cooperative_preflight
+
+        preflight = cooperative_preflight(
+            block_size, grid_blocks, torch_module=torch
+        )
+        if not preflight["ok"]:
+            raise RuntimeError(f"cooperative preflight failed: {preflight['error']}")
         from torch.utils.cpp_extension import load_inline
 
         module = load_inline(
@@ -379,6 +392,7 @@ def bench_barrier(  # pragma: no cover - GPU only
         "us_per_barrier": mean_ms * 1000.0 / iterations,
         "samples_ms": samples,
         "warmup_runs": max(0, warmup),
+        "preflight": preflight,
     }
 
 

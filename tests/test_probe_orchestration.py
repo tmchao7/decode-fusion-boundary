@@ -28,6 +28,7 @@ from nanovllm.roofline import ModelDims  # noqa: E402
 from tools.bench_burst_lower_bound import (  # noqa: E402
     BARRIERS_PER_LAYER,
     bench_lower_bound,
+    cooperative_preflight,
 )
 from tools.bench_roofline_a100 import bench_barrier  # noqa: E402
 from tools.verdict import (  # noqa: E402
@@ -245,6 +246,67 @@ class LowerBoundProbeTests(unittest.TestCase):
         self.assertAlmostEqual(
             report["rows"][0]["weight_stream_gbps"], expected, places=3
         )
+
+
+class _Props:
+    def __init__(self, sm_count: int = 108, cooperative=True) -> None:
+        self.multi_processor_count = sm_count
+        if cooperative is not None:
+            self.cooperativeLaunch = cooperative
+
+
+class _FakeCudaTorch:
+    def __init__(self, props: _Props) -> None:
+        self.cuda = SimpleNamespace(get_device_properties=lambda index: props)
+
+
+class CooperativePreflightTests(unittest.TestCase):
+    """Fail before compiling if the cooperative launch shape is impossible."""
+
+    def test_a100_shape_is_accepted(self) -> None:
+        result = cooperative_preflight(
+            512, 80, torch_module=_FakeCudaTorch(_Props(108))
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["max_grid"], 108)
+        self.assertEqual(result["sm_count"], 108)
+        self.assertIsNone(result["error"])
+
+    def test_grid_above_sm_count_is_rejected_with_the_fix(self) -> None:
+        result = cooperative_preflight(
+            512, 200, torch_module=_FakeCudaTorch(_Props(108))
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("exceeds the cooperative limit 108", result["error"])
+        self.assertIn("--grid-blocks 108", result["error"])
+
+    def test_device_without_cooperative_launch_is_rejected(self) -> None:
+        result = cooperative_preflight(
+            512, 80, torch_module=_FakeCudaTorch(_Props(80, cooperative=False))
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("cooperativeLaunch=False", result["error"])
+
+    def test_missing_flag_is_tolerated(self) -> None:
+        """Older torch builds do not expose cooperativeLaunch."""
+
+        result = cooperative_preflight(
+            512, 80, torch_module=_FakeCudaTorch(_Props(108, cooperative=None))
+        )
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["cooperative_launch_flag"])
+
+    def test_report_records_the_preflight(self) -> None:
+        clock = _FakeClock([1.0])
+        module = _FakeBarrierModule(clock)
+        report = bench_barrier(
+            80, 512, 336, 0, 1,
+            module=module, torch_module=_FakeTorch([1.6]),
+        )
+        # Injected module means no preflight was run, but the key must exist so
+        # downstream consumers can rely on its presence.
+        self.assertIn("preflight", report)
+        self.assertIsNone(report["preflight"])
 
 
 class PipelineTests(unittest.TestCase):

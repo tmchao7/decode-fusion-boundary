@@ -60,6 +60,22 @@ def probe_barrier(source: str) -> str:
     return match.group(0)
 
 
+class LaunchBoundsFidelityTests(unittest.TestCase):
+    """Occupancy contract: both probes must be 1 block/SM like production."""
+
+    def test_kernel_declares_one_block_per_sm(self) -> None:
+        text = KERNEL_CU.read_text(encoding="utf-8")
+        self.assertIn("__launch_bounds__(LDG_BLOCK_SIZE, 1)", text)
+
+    def test_barrier_probe_declares_one_block_per_sm(self) -> None:
+        self.assertIn("__launch_bounds__(512, 1) barrier_probe", _BARRIER_SOURCE)
+
+    def test_lower_bound_probe_declares_one_block_per_sm(self) -> None:
+        self.assertIn(
+            "__launch_bounds__(512, 1) lower_bound_probe", LOWER_BOUND_SOURCE
+        )
+
+
 class BarrierFidelityTests(unittest.TestCase):
     def test_production_barrier_uses_gpu_scope_fence(self) -> None:
         """The reference semantics we are copying."""

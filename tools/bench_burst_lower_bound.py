@@ -266,8 +266,14 @@ def bench_lower_bound(  # pragma: no cover - GPU only
         import torch as _torch
 
         torch = _torch
+        preflight = cooperative_preflight(
+            block_size, grid_blocks, torch_module=torch
+        )
+        if not preflight["ok"]:
+            raise RuntimeError(f"cooperative preflight failed: {preflight['error']}")
         flat, total_bytes = _weight_layout(model_path, dims)
     else:
+        preflight = None
         flat, total_bytes = weights
     bytes_per_layer = (total_bytes // dims.num_layers) & ~15  # 16B aligned
     buffer_bytes = flat.numel() * flat.element_size()
@@ -344,7 +350,7 @@ def bench_lower_bound(  # pragma: no cover - GPU only
     # Real torch frees the weight buffer; the injected-weights path has no torch.
     if torch is not None:
         torch.cuda.empty_cache()
-    return {"bytes_total": total_bytes, "rows": results}
+    return {"bytes_total": total_bytes, "preflight": preflight, "rows": results}
 
 
 # --------------------------------------------------------------------------
@@ -473,6 +479,60 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
 
 def parse_batches(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
+
+
+def cooperative_preflight(
+    block_size: int = 512,
+    grid_blocks: int = 80,
+    *,
+    torch_module: Any = None,
+) -> dict:
+    """Check that the cooperative launch shape is actually launchable.
+
+    ``cudaLaunchCooperativeKernel`` fails outright if the grid exceeds the
+    device's cooperative limit, and the failure surfaces only after the
+    extension has finished compiling.  On a shared server that is a wasted
+    session, so the limit is checked up front and recorded in the report.
+
+    The probe kernels carry ``__launch_bounds__(512, 1)`` -- one block per SM by
+    construction -- so the launchable grid is the SM count.  ``cooperativeLaunch``
+    is reported when the installed torch exposes it; it is absent on older
+    builds, in which case the launch itself is the only check.
+    """
+
+    torch = torch_module
+    if torch is None:
+        import torch as _torch
+
+        torch = _torch
+    props = torch.cuda.get_device_properties(0)
+    sm_count = int(props.multi_processor_count)
+    cooperative = getattr(props, "cooperativeLaunch", None)
+    max_grid = sm_count  # __launch_bounds__(block_size, 1)
+    result = {
+        "block_size": block_size,
+        "requested_grid_blocks": grid_blocks,
+        "sm_count": sm_count,
+        "cooperative_launch_flag": cooperative,
+        "blocks_per_sm": 1,
+        "max_grid": max_grid,
+        "ok": True,
+        "error": None,
+    }
+    if cooperative is False:
+        result["ok"] = False
+        result["error"] = (
+            "device reports cooperativeLaunch=False; the persistent-kernel "
+            "comparison is not meaningful on this GPU"
+        )
+    elif grid_blocks > max_grid:
+        result["ok"] = False
+        result["error"] = (
+            f"requested grid {grid_blocks} exceeds the cooperative limit "
+            f"{max_grid} (1 block/SM x {sm_count} SMs); re-run with "
+            f"--grid-blocks {max_grid}"
+        )
+    return result
 
 
 def probe_read_offsets(
