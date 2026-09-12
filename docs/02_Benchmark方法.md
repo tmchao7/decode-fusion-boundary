@@ -163,6 +163,22 @@ python -m nanovllm.roofline --batch-sizes 1,2,4,8,16,32 --seq-len 160 --check-ke
   `aggregate_requests` 里被 `summarize(..., scale=1000.0)` 乘了 1000（历史遗留），
   **不要**拿它们当毫秒用；用 `*_total` 字段。
 
+`account_decode` 能直接吃两种输入，自动识别：
+
+| 输入 | 来源 | device 列 |
+|---|---|---|
+| `experiments` schema | `benchmarks.compare --json` | **实测** `cuda_decode_time_ms_total / decode_steps` |
+| `records` schema | `tools/bench_burst_batch.py --json`（crossover 扫描） | **roofline 权重下界**（标 `(floor)`），host 残差是下界、GPU 占比是上界；`note` 里的 `serial xN` 会被读成 `serial_chunks` |
+
+两类输入可以一次传多个文件，`render_comparison` 每个 batch 取最快的后端，device
+anchor 优先用实测 GPU 时间，没有则退回 0.967 ms/step 的权重下界。
+
+**标定告警（必须处理，不是工具报错）**：若实测每步 GPU 时间低于权重下界
+（例如 0.77 ms < 0.967 ms，隐含 1952 GB/s > A100 规格 1555 GB/s），工具会打
+`WARNING: ... Calibrate with RUN_MODE=roofline`。这表示该行的 headroom 数字
+**在标定前不能信**（docs/07 §10.4 的矛盾）。`--warnings-as-errors` 只对 cadence
+交叉验证不一致返回非零，标定告警不会让命令失败。
+
 ## 报告要求
 
 每个 A100/V100 报告至少包含：

@@ -385,6 +385,23 @@ run_account() {
     --json results/a100_account_breakdown.json \
     2>&1 | tee results/a100_account_breakdown.md
 
+  # 2b. The same accounting over an already-existing wall-time-only artifact
+  #     (tools/bench_burst_batch.py writes this schema). Rows are anchored to
+  #     the batch-independent weight floor instead of a measured GPU time.
+  #     Skipped when the scan has not been produced on this machine yet.
+  if [ -f results/crossover_scan.json ]; then
+    python -m tools.account_decode \
+      results/a100_account.json \
+      results/crossover_scan.json \
+      --seq-len 160 \
+      --json results/a100_account_breakdown_with_crossover.json \
+      2>&1 | tee results/a100_account_breakdown_with_crossover.md
+  else
+    echo "SKIP 2b: results/crossover_scan.json not found; run" \
+         "'python -m tools.bench_burst_batch --json results/crossover_scan.json'" \
+         "to include the existing crossover data." >&2
+  fi
+
   # 3. Standalone roofline table for the doc (no GPU state needed).
   python -m nanovllm.roofline \
     --batch-sizes 1,2,4,8,10,16,32 \

@@ -1,6 +1,9 @@
 """Tests for tools/account_decode.py (host/device split of decode steps)."""
 
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,10 +13,58 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel  # noqa: E402
 from tools.account_decode import (  # noqa: E402
+    accounting_from_crossover,
     accounting_from_experiment,
+    find_calibration_warnings,
     find_inconsistencies,
+    load_experiments,
     render_comparison,
+    render_markdown,
 )
+
+
+def _crossover_payload() -> dict:
+    """Mirror the schema written by tools/bench_burst_batch.py.
+
+    Values are the documented A100 crossover scan minima (docs/07 section 9.6).
+    """
+
+    return {
+        "gpu": "5",
+        "model": "/models/Qwen3-0.6B",
+        "prompt_length": 32,
+        "max_tokens": 128,
+        "warmup": 2,
+        "runs": 3,
+        "safe_burst_batch": 8,
+        "max_batch_size": 32,
+        "records": [
+            {
+                "batch": 1,
+                "cudagraph": {"ms_per_tok_min": 2.944, "expected_tokens": 128},
+                "burst": {"ms_per_tok_min": 2.241, "expected_tokens": 128},
+                "speedup": 1.31,
+                "verdict": "BEATS",
+                "note": "",
+            },
+            {
+                "batch": 8,
+                "cudagraph": {"ms_per_tok_min": 0.429, "expected_tokens": 1024},
+                "burst": {"ms_per_tok_min": 6.495, "expected_tokens": 1024},
+                "speedup": 0.07,
+                "verdict": "loses",
+                "note": "",
+            },
+            {
+                "batch": 32,
+                "cudagraph": {"ms_per_tok_min": 0.111, "expected_tokens": 4096},
+                "burst": {"ms_per_tok_min": 6.496, "expected_tokens": 4096},
+                "speedup": 0.02,
+                "verdict": "loses",
+                "note": "serial x4",
+            },
+        ],
+    }
 
 
 def _experiment(
@@ -158,6 +209,143 @@ class AccountingTests(unittest.TestCase):
         # The fastest backend at b8 is cudagraph, whose host residual dominates.
         self.assertIn("2.660", table)
         self.assertIn("ceiling tok/s", table)
+
+
+class CrossoverScanTests(unittest.TestCase):
+    """The existing server artifact must be readable without a re-run."""
+
+    def _rows(self) -> list[dict]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "crossover_scan.json"
+            path.write_text(json.dumps(_crossover_payload()), encoding="utf-8")
+            experiments = load_experiments([str(path)])
+        model = RooflineModel(ModelDims(), HardwareSpec())
+        floor = (
+            model.weight_bytes()
+            / (model.hardware.effective_bandwidth_gbps() * 1e9)
+            * 1000.0
+        )
+        return [accounting_from_crossover(exp, floor) for exp in experiments]
+
+    def test_schema_is_auto_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "crossover_scan.json"
+            path.write_text(json.dumps(_crossover_payload()), encoding="utf-8")
+            experiments = load_experiments([str(path)])
+        # two backends x three batches
+        self.assertEqual(len(experiments), 6)
+        self.assertEqual(
+            {exp["backend"] for exp in experiments},
+            {"torch-cudagraph", "megakernel-burst"},
+        )
+        self.assertTrue(
+            all(
+                exp["summary"]["crossover_source"].endswith("crossover_scan.json")
+                for exp in experiments
+            )
+        )
+
+    def test_documented_batch8_rows(self) -> None:
+        rows = [row for row in self._rows() if row and row["batch_size"] == 8]
+        by_backend = {row["backend"]: row for row in rows}
+        cg = by_backend["torch-cudagraph"]
+        burst = by_backend["megakernel-burst"]
+        # tpot_ms * batch == ms/token * 8 for both backends
+        self.assertAlmostEqual(cg["ms_per_step_wall"], 0.429 * 8, places=3)
+        self.assertAlmostEqual(burst["ms_per_step_wall"], 6.495 * 8, places=3)
+        # Device time comes from the floor, so the host residual is a bound.
+        self.assertEqual(cg["device_source"], "floor")
+        self.assertGreater(cg["host_residual_ms"], 2.0)
+        self.assertLess(cg["host_residual_ms"], 3.0)
+
+    def test_serial_note_is_captured(self) -> None:
+        rows = [row for row in self._rows() if row and row["batch_size"] == 32]
+        burst = next(row for row in rows if row["backend"] == "megakernel-burst")
+        self.assertEqual(burst["serial_chunks"], 4)
+        cg = next(row for row in rows if row["backend"] == "torch-cudagraph")
+        self.assertEqual(cg["serial_chunks"], 1)
+
+    def test_markdown_labels_floor_rows(self) -> None:
+        rows = [row for row in self._rows() if row]
+        model = RooflineModel(ModelDims(), HardwareSpec())
+        text = render_markdown(rows, model)
+        self.assertIn("(floor)", text)
+        self.assertIn("device-less", text.replace("wall-time-only", "device-less"))
+
+    def test_comparison_table_prefers_cudagraph_at_batch8(self) -> None:
+        rows = [row for row in self._rows() if row]
+        model = RooflineModel(ModelDims(), HardwareSpec())
+        table = render_comparison(rows, model)
+        # b1 row must name the megakernel burst as fastest, b8 the cudagraph run.
+        lines = [line for line in table.splitlines() if line.startswith("| 1 |")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("megakernel-burst", lines[0])
+
+
+class CalibrationWarningTests(unittest.TestCase):
+    """0.77 ms/step for 1.503 GB implies 1952 GB/s, above the A100 spec."""
+
+    def _row(self, gpu_ms: float) -> dict:
+        return accounting_from_experiment(
+            _experiment(
+                backend="torch-cudagraph",
+                backend_actual="torch",
+                batch_size=8,
+                decode_steps=4,
+                ms_per_step_wall=3.432,
+                ms_per_step_gpu=gpu_ms,
+            )
+        )
+
+    def test_below_floor_is_flagged(self) -> None:
+        row = self._row(0.77)
+        assert row is not None
+        warnings = find_calibration_warnings(
+            [row], RooflineModel(ModelDims(), HardwareSpec())
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1952 GB/s", warnings[0])
+        self.assertIn("RUN_MODE=roofline", warnings[0])
+
+    def test_above_floor_is_not_flagged(self) -> None:
+        row = self._row(1.5)
+        assert row is not None
+        self.assertEqual(
+            find_calibration_warnings(
+                [row], RooflineModel(ModelDims(), HardwareSpec())
+            ),
+            [],
+        )
+
+    def test_floor_rows_are_never_flagged(self) -> None:
+        rows = [row for row in CrossoverScanTests()._rows() if row]
+        self.assertEqual(
+            find_calibration_warnings(rows, RooflineModel(ModelDims(), HardwareSpec())),
+            [],
+        )
+
+    def test_cli_exit_code_ignores_calibration_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scan.json"
+            path.write_text(json.dumps(_crossover_payload()), encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tools.account_decode",
+                    str(path),
+                    "--warnings-as-errors",
+                ],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                env={
+                    "PYTHONPATH": f"{REPO_ROOT / 'src'}:{REPO_ROOT}",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
+        # Crossover rows carry no cadence cross-check, so nothing is a hard error.
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

@@ -7,9 +7,11 @@
 >   2.2-2.8 ms"、"batch≈243 才转算力 bound"算成可证伪的账；给出三句话判语
 >   （**device 侧翻盘不可行，E2E 侧可赚的全是 host**），并列出三个便宜的证伪
 >   实验（device 下界 probe / 可达带宽标定 / host 消除上界）。新增
->   `src/nanovllm/roofline.py`（含 26 个单测）与 `tools/account_decode.py`。
->   同时**修正引用错误**：megaQwen 的 owner 是 `Infatoshi` 而非 `NoneBone`，
->   并补齐其原始自述数字；补引 MPK(OSDI'26) / TaxBreak / Cohere megakernel 等。
+>   `src/nanovllm/roofline.py`（含 26 个单测）与 `tools/account_decode.py`
+>   （含 15 个单测，能吃 compare 与 crossover 两种 JSON，并对"实测低于物理下界"
+>   主动打标定告警）。同时**修正引用错误**：megaQwen 的 owner 是 `Infatoshi`
+>   而非 `NoneBone`，并补齐其原始自述数字；补引 MPK(OSDI'26) / TaxBreak /
+>   Cohere megakernel 等。
 > - 第 5 版新增 **§3.5 nsys 实测纯 GPU kernel 时间分解**（4 组配置 b1/b8 × mega/cg），
 >   用四个实测比值坐实根因：b1 mega 纯 kernel 慢于 cg 2.6x 但 E2E 反超（launch 消除）；
 >   b8 mega 纯 kernel 慢 133x；b8/b1 mega kernel 增长 54x vs cg 1.04x（SM 空转）。
@@ -637,5 +639,25 @@ megakernel 若能追平 device 侧: 0.97 + ~0.3 (barrier) + ~0 = ~1.3 ms/step
 "cudagraph 已贴带宽墙"这一条只能算"强假设"而不是"已证事实"**——
 但无论哪个方向被证实，"可赚的是 host 开销"这个结论都不变（因为无论 device 侧
 是 0.74 还是 1.5 ms，host 残差都在 1.5-2.8 ms 量级）。
+
+### 10.5 复现方式（不需要重跑就能先看现有数据）
+
+- `tools/account_decode.py` 直接吃两类 JSON：`benchmarks.compare --json`（有实测
+  per-step GPU 时间）和 `tools/bench_burst_batch.py --json`（crossover 扫描，只有
+  墙钟，按 0.967 ms 权重下界锚定并标 `(floor)`）。一次可以传多个文件。
+- 用已有数字跑一遍（本地纯 Python，不需要 GPU）：
+
+  ```bash
+  python -m tools.account_decode results/a100_account.json \
+    results/crossover_scan.json --seq-len 160
+  ```
+
+- 工具会主动打**标定告警**：凡是实测 per-step GPU 时间低于权重下界的行（例如
+  0.77 ms，隐含 1952 GB/s），都会提示先跑 `RUN_MODE=roofline` 的带宽标定。
+  这类告警**不是**工具错误（`--warnings-as-errors` 只对 cadence 不一致失败），
+  而是"这一行的 headroom 在标定前别信"的强制提示。
+- 服务器上一条命令：`RUN_MODE=account bash SERVER_COMMANDS.txt`（会跑对比 +
+  账本 + roofline 表；`crossover_scan.json` 存在时自动并入）。
+
 
 
