@@ -35,6 +35,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -250,11 +251,24 @@ def bench_lower_bound(  # pragma: no cover - GPU only
     iterations: int,
     warmup: int,
     runs: int,
+    *,
+    module: Any = None,
+    weights: tuple[Any, int] | None = None,
 ) -> dict:
-    import torch
-    from torch.utils.cpp_extension import load_inline
+    """Measure the device-side lower bound.
 
-    flat, total_bytes = _weight_layout(model_path, dims)
+    ``module`` and ``weights`` are injection seams so the launch loop, the
+    buffer-size guard and the failure handling can be tested without a GPU.
+    """
+
+    torch = None
+    if weights is None:
+        import torch as _torch
+
+        torch = _torch
+        flat, total_bytes = _weight_layout(model_path, dims)
+    else:
+        flat, total_bytes = weights
     bytes_per_layer = (total_bytes // dims.num_layers) & ~15  # 16B aligned
     buffer_bytes = flat.numel() * flat.element_size()
     # Each layer must start at a distinct buffer offset, otherwise the probe
@@ -267,17 +281,20 @@ def bench_lower_bound(  # pragma: no cover - GPU only
             f"probe needs buffer_bytes ({buffer_bytes}) > bytes_per_layer "
             f"({bytes_per_layer}) to stream distinct weights per layer"
         )
-    module = load_inline(
-        name="ldg_lower_bound_probe",
-        cpp_sources=(
-            "double run_lower_bound_probe(const void*, unsigned long long, "
-            "unsigned long long, int, int, int, int, int);"
-        ),
-        cuda_sources=_PROBE_SOURCE,
-        functions=["run_lower_bound_probe"],
-        extra_cuda_cflags=["-O3", "-arch=sm_80"],
-        verbose=False,
-    )
+    if module is None:
+        from torch.utils.cpp_extension import load_inline
+
+        module = load_inline(
+            name="ldg_lower_bound_probe",
+            cpp_sources=(
+                "double run_lower_bound_probe(const void*, unsigned long long, "
+                "unsigned long long, int, int, int, int, int);"
+            ),
+            cuda_sources=_PROBE_SOURCE,
+            functions=["run_lower_bound_probe"],
+            extra_cuda_cflags=["-O3", "-arch=sm_80"],
+            verbose=False,
+        )
 
     results: list[dict] = []
     for batch in batches:
@@ -324,7 +341,9 @@ def bench_lower_bound(  # pragma: no cover - GPU only
             }
         )
     del flat
-    torch.cuda.empty_cache()
+    # Real torch frees the weight buffer; the injected-weights path has no torch.
+    if torch is not None:
+        torch.cuda.empty_cache()
     return {"bytes_total": total_bytes, "rows": results}
 
 
@@ -332,9 +351,27 @@ def bench_lower_bound(  # pragma: no cover - GPU only
 # C. host-free graph replay
 # --------------------------------------------------------------------------
 def bench_host_free_graph(  # pragma: no cover - GPU only
-    dims: ModelDims, batches: list[int], replays: int, warmup: int, runs: int
+    dims: ModelDims,
+    batches: list[int],
+    replays: int,
+    warmup: int,
+    runs: int,
+    *,
+    torch_module: Any = None,
 ) -> list[dict]:
-    import torch
+    """Measure the host overlay: the same graph replayed with/without sync.
+
+    ``torch_module`` is an injection seam for tests.  The result is the ground
+    truth for the per-step host cost of the cudagraph path: the synced replay is
+    the status quo (one host round trip per step) and the burst replay queues all
+    replays back to back.
+    """
+
+    torch = torch_module
+    if torch is None:
+        import torch as _torch
+
+        torch = _torch
 
     results: list[dict] = []
     for batch in batches:

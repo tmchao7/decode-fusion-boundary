@@ -37,6 +37,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -319,18 +320,38 @@ extern "C" double run_barrier_probe(int grid_blocks, int block_size,
 
 
 def bench_barrier(  # pragma: no cover - GPU only
-    grid_blocks: int, block_size: int, iterations: int, warmup: int, runs: int
+    grid_blocks: int,
+    block_size: int,
+    iterations: int,
+    warmup: int,
+    runs: int,
+    *,
+    module: Any = None,
+    torch_module: Any = None,
 ) -> dict:
-    from torch.utils.cpp_extension import load_inline
+    """Time the grid-wide barrier at the production grid shape.
 
-    module = load_inline(
-        name="ldg_barrier_probe",
-        cpp_sources="double run_barrier_probe(int, int, int);",
-        cuda_sources=_BARRIER_SOURCE,
-        functions=["run_barrier_probe"],
-        extra_cuda_cflags=["-O3", "-arch=sm_80"],
-        verbose=False,
-    )
+    ``module`` and ``torch_module`` are injection seams: on the server they are
+    built here, but tests pass fakes so the measurement loop, error handling and
+    statistics are exercised without a GPU.
+    """
+
+    torch = torch_module
+    if torch is None:
+        import torch as _torch
+
+        torch = _torch
+    if module is None:
+        from torch.utils.cpp_extension import load_inline
+
+        module = load_inline(
+            name="ldg_barrier_probe",
+            cpp_sources="double run_barrier_probe(int, int, int);",
+            cuda_sources=_BARRIER_SOURCE,
+            functions=["run_barrier_probe"],
+            extra_cuda_cflags=["-O3", "-arch=sm_80"],
+            verbose=False,
+        )
 
     def run() -> float:
         start = torch.cuda.Event(enable_timing=True)
@@ -357,6 +378,7 @@ def bench_barrier(  # pragma: no cover - GPU only
         "mean_ms": mean_ms,
         "us_per_barrier": mean_ms * 1000.0 / iterations,
         "samples_ms": samples,
+        "warmup_runs": max(0, warmup),
     }
 
 
