@@ -32,6 +32,35 @@ QWEN3_CONTRACT = {
 }
 
 
+def wmma_batch_limit(default: int = MAX_BATCH_SIZE) -> int:
+    """Real batch limit of the WMMA batch kernel, or ``default`` if unknown.
+
+    ``MAX_BATCH_SIZE`` is the *compile-time* ceiling (``-DLDG_MAX_BATCH``) and
+    the binding's ``TORCH_CHECK`` accepts 1-32, but the kernel partitions its
+    resident cooperative grid across sequences and aborts the launch unless each
+    sequence gets ``LDG_ATTN_BLOCKS`` blocks.  With the default 80-block grid
+    and ``LDG_ATTN_BLOCKS=8`` that is batch <= 10.  Querying the kernel keeps
+    this guard in sync with the real occupancy instead of hard-coding 10.
+
+    Returns ``default`` when the extension or CUDA is unavailable, which keeps
+    the compatibility check usable on the CPU-only test path; the binding still
+    rejects an unsupported batch with a clear error at execution time.
+    """
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return default
+        from .build import get_extension
+
+        extension = get_extension()
+        limit = int(extension.wmma_max_supported_batch())
+    except Exception:
+        return default
+    return limit if 0 < limit <= default else default
+
+
 @dataclass(frozen=True)
 class Compatibility:
     supported: bool
@@ -80,6 +109,21 @@ class MegakernelBackend:
                 False,
                 f"Megakernel v1 supports batch sizes from 1 to {max_batch_size}",
             )
+        # The WMMA batch kernel partitions its cooperative grid per sequence and
+        # needs LDG_ATTN_BLOCKS blocks each, so it supports far fewer sequences
+        # than MAX_BATCH_SIZE.  Reject here so the batch falls back to
+        # torch-cudagraph with a clear reason instead of the launch aborting and
+        # the caller reading the previous step's tokens.
+        if _get_attr(config, "megakernel_batch_kernel", "scalar") == "wmma":
+            wmma_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
+            if len(seqs) > wmma_limit:
+                return Compatibility(
+                    False,
+                    "Megakernel WMMA batch decode supports at most "
+                    f"{wmma_limit} sequences (grid partitioned per sequence with "
+                    "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
+                    "larger batches",
+                )
         if _get_attr(config, "tensor_parallel_size", 1) != 1:
             return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
 

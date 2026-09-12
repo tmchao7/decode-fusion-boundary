@@ -271,7 +271,8 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | 纯 barrier 成本（336 次全网格） | ✅ 本机已跑 | 0.547 ms/token（1.63 µs/barrier） |
 | WMMA tile 覆盖（QKV/O/Gate/Up/Down） | ✅ 代码确认 | 已全 WMMA（§3.1） |
 | 剩余 scalar（Attention/LM head） | ✅ 代码确认 | 仍 scalar（§3.2） |
-| batch 上限（LDG_ATTN_BLOCKS=8） | ✅ build/agent 确认 | ≈10，batch=16 不跑 |
+| batch 上限（LDG_ATTN_BLOCKS=8） | ✅ 本轮代码核实 + 已加守卫 | **80/8 = 10**（不是 `LDG_MAX_BATCH=32`）；超限现在会被 `backend.compatibility()` 回退到 cudagraph，binding 里也有 `TORCH_CHECK` |
+| **批次超限的静默错答**（第 7 轮修复） | ✅ 已修 + 源码不变式测试 | 修复前：launch 只在 stderr 打印后 `return`，void binding 仍报成功，Python 把**上一步的 token** 当新输出读走；现在三层守卫（backend/binding/kernel backstop） |
 | E2E 多 batch A/B（bench_burst_batch.py） | 服务器已跑 | batch=8 9.66 vs 0.461（21x） |
 | ncu kernel 时间分解 / SM 占用 | ✅ nsys 替代（ncu 对 cooperative kernel 致 driver hang） | b8 mega kernel 133x 慢于 cg；b8/b1 增长 54x vs cg 1.04x（§3.5） |
 | LM head 接 WMMA 后 A/B | 待跑 | 验证 scalar LM head 占比 |

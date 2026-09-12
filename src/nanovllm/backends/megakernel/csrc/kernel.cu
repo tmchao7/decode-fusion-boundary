@@ -2284,6 +2284,65 @@ static int ldg_resident_grid_blocks(Kernel kernel, int requested) {
   return min(requested, resident_blocks);
 }
 
+// Largest batch the WMMA batch kernel can actually launch.  The kernel splits
+// the resident grid across sequences and needs LDG_ATTN_BLOCKS blocks per
+// sequence for attention, so batch is bounded by grid_blocks / LDG_ATTN_BLOCKS
+// -- typically 80/8 = 10, far below LDG_MAX_BATCH=32.  Exposed so the Python
+// backend and the torch binding can reject unsupported batches up front instead
+// of the launch printing to stderr and returning with stale output tokens.
+extern "C" int ldg_wmma_max_supported_batch(int requested_blocks) {
+  int grid = ldg_resident_grid_blocks(ldg_decode_kernel_batch_wmma,
+                                      requested_blocks > 0 ? requested_blocks
+                                                           : LDG_NUM_BLOCKS);
+  if (grid < LDG_ATTN_BLOCKS) {
+    return 0;
+  }
+  return grid / LDG_ATTN_BLOCKS;
+}
+
+// Check the batch against the real cooperative limit before consuming the
+// decode state.  The launch helpers return void, so a guard that only prints to
+// stderr would let the Python caller read the previous step's tokens out of the
+// output buffer and treat them as fresh output -- a silent wrong answer.  The
+// Python backend and the torch binding both know this limit up front (see
+// ldg_wmma_max_supported_batch), so reaching this check means a caller bypassed
+// them; keep it as a backstop and make the limit explicit in the message.
+static bool ldg_batch_is_launchable(int batch_size, int grid_blocks) {
+  const char *reason = nullptr;
+  char message[256];
+  if (batch_size <= 0) {
+    reason = "batch_size must be positive";
+  } else if (grid_blocks < LDG_ATTN_BLOCKS) {
+    snprintf(message, sizeof(message),
+             "resident grid %d is below LDG_ATTN_BLOCKS=%d, so the cooperative "
+             "launch cannot run",
+             grid_blocks, LDG_ATTN_BLOCKS);
+    reason = message;
+  } else {
+    int blocks_per_seq = grid_blocks / batch_size;
+    if (blocks_per_seq < LDG_ATTN_BLOCKS) {
+      snprintf(message, sizeof(message),
+               "batch=%d needs >= %d blocks/seq but the grid only provides %d, "
+               "so the maximum batch for this grid is %d; use torch-cudagraph "
+               "for larger batches",
+               batch_size, LDG_ATTN_BLOCKS, blocks_per_seq,
+               grid_blocks / LDG_ATTN_BLOCKS);
+      reason = message;
+    }
+  }
+  if (reason == nullptr) {
+    return true;
+  }
+  fprintf(stderr, "Megakernel WMMA batch: %s\n", reason);
+  // This helper returns void, so stderr alone would leave the caller reading the
+  // previous step's tokens as fresh output.  The observable rejection is done
+  // before the launch by the torch binding (check_wmma_batch_supported) and by
+  // MegakernelBackend.compatibility(); this backstop only covers a caller that
+  // bypassed both, and it deliberately does not fake a CUDA error.
+  (void)cudaGetLastError();
+  return false;
+}
+
 static inline void ldg_configure_kernel_attributes(); // forward decl
 
 // Decode state is reset by the host on the same stream immediately before each
@@ -2440,12 +2499,10 @@ extern "C" void launch_ldg_decode_batch_wmma(
   }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_batch_wmma, LDG_NUM_BLOCKS);
-  int blocks_per_seq = grid_blocks / batch_size;
-  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
-    fprintf(stderr, "Megakernel WMMA batch needs >= %d blocks/seq (occupancy %d for %d seqs)\n",
-            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
+  if (!ldg_batch_is_launchable(batch_size, grid_blocks)) {
     return;
   }
+  int blocks_per_seq = grid_blocks / batch_size;
   grid_blocks = blocks_per_seq * batch_size;
   void *kernel_args[] = {
       LDG_ARG(embed_weight),       LDG_ARG(layer_weights),
@@ -2743,12 +2800,10 @@ extern "C" void launch_ldg_generate_nosync_paged_batch(
   }
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_batch_wmma, LDG_NUM_BLOCKS);
-  int blocks_per_seq = grid_blocks / batch_size;
-  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
-    fprintf(stderr, "Megakernel WMMA batch no-sync needs >= %d blocks/seq (occupancy %d for %d seqs)\n",
-            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
+  if (!ldg_batch_is_launchable(batch_size, grid_blocks)) {
     return;
   }
+  int blocks_per_seq = grid_blocks / batch_size;
   grid_blocks = blocks_per_seq * batch_size;
 
   static int *d_step_counter = nullptr;

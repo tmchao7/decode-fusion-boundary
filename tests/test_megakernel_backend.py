@@ -1,7 +1,9 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from nanovllm.backends.megakernel import MegakernelBackend
+from nanovllm.backends.megakernel.backend import wmma_batch_limit
 
 
 class MegakernelBackendTests(unittest.TestCase):
@@ -204,6 +206,80 @@ class MegakernelBackendTests(unittest.TestCase):
         self.assertEqual(saved_steps, 3)
         self.assertEqual(saved_eos, 999)
 
+
+
+class WmmaBatchLimitTests(unittest.TestCase):
+    """The WMMA batch kernel supports far fewer sequences than MAX_BATCH_SIZE.
+
+    The kernel partitions its resident cooperative grid per sequence and needs
+    LDG_ATTN_BLOCKS blocks each, so an 80-block grid supports batch <= 10 while
+    MAX_BATCH_SIZE is 32.  Without this guard the launch aborts, the void
+    binding reports success, and the caller reads the previous step's tokens.
+    """
+
+    def make_config(self, **overrides):
+        hf_config = SimpleNamespace(
+            model_type="qwen3",
+            hidden_size=1024,
+            intermediate_size=3072,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            vocab_size=151936,
+            head_dim=128,
+        )
+        values = dict(
+            decode_backend="megakernel",
+            tensor_parallel_size=1,
+            max_num_seqs=32,
+            megakernel_batch_kernel="wmma",
+            megakernel_batch_decode=True,
+            hf_config=hf_config,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def _seqs(self, count):
+        return [SimpleNamespace(temperature=0.0) for _ in range(count)]
+
+    def test_limit_falls_back_to_compile_time_ceiling_without_cuda(self):
+        # The CPU-only path must stay usable: no extension, no CUDA.
+        self.assertEqual(wmma_batch_limit(), 32)
+
+    def test_rejects_batch_above_the_kernel_limit(self):
+        config = self.make_config(max_num_seqs=32)
+        with mock.patch(
+            "nanovllm.backends.megakernel.backend.wmma_batch_limit",
+            return_value=10,
+        ):
+            decision = MegakernelBackend.compatibility(
+                config, self._seqs(11), is_prefill=False
+            )
+        self.assertFalse(decision.supported)
+        self.assertIn("at most 10 sequences", decision.reason)
+
+    def test_accepts_batch_at_the_kernel_limit(self):
+        config = self.make_config(max_num_seqs=32)
+        with mock.patch(
+            "nanovllm.backends.megakernel.backend.wmma_batch_limit",
+            return_value=10,
+        ):
+            decision = MegakernelBackend.compatibility(
+                config, self._seqs(10), is_prefill=False
+            )
+        self.assertTrue(decision.supported, decision.reason)
+
+    def test_scalar_kernel_is_not_subject_to_the_wmma_limit(self):
+        config = self.make_config(megakernel_batch_kernel="scalar")
+        with mock.patch(
+            "nanovllm.backends.megakernel.backend.wmma_batch_limit",
+            return_value=10,
+        ):
+            decision = MegakernelBackend.compatibility(
+                config, self._seqs(11), is_prefill=False
+            )
+        # 11 <= max_num_seqs=32, and the scalar kernel keeps the wider limit.
+        self.assertTrue(decision.supported, decision.reason)
 
 if __name__ == "__main__":
     unittest.main()
