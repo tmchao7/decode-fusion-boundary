@@ -410,7 +410,9 @@ def render_markdown(verdict: Verdict) -> str:
     ]
     lines += [f"- {item}" for item in verdict.rationale] or ["- (none)"]
     lines += ["", "## Actions", ""]
-    lines += [f"1. {item}" for item in verdict.actions] or ["1. (none)"]
+    lines += [f"{index}. {item}" for index, item in enumerate(verdict.actions, start=1)] or [
+        "1. (none)"
+    ]
     calibration = verdict.calibration
     lines += [
         "",
