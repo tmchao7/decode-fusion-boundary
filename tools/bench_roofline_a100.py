@@ -245,49 +245,60 @@ def bench_host_step(  # pragma: no cover - GPU only
 # --------------------------------------------------------------------------
 _BARRIER_SOURCE = r"""
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
 
+// Structurally identical to the production AtomicGridSync in kernel.cu:
+//  - acquire/release fences at GPU scope (fence.acq_rel.gpu), not __threadfence,
+//    because __threadfence only orders the executing thread's accesses and the
+//    production barrier relies on the acquire/release pair to publish WMMA
+//    store_matrix_sync output across SMs;
+//  - the *local* generation is captured before arriving and compared with `<=`,
+//    which tolerates a fast peer advancing the generation more than once
+//    between a waiter's read and its comparison (the `==` form can miss an
+//    increment entirely).
+// Keep this in sync with kernel.cu; tests/test_probe_fidelity.py guards it.
 __device__ __forceinline__ void atomic_grid_sync(
-    unsigned int *counter, unsigned int *sense, unsigned int nblocks,
-    unsigned int *generation) {
-  __threadfence();
+    unsigned int *counter, unsigned int *generation, unsigned int nblocks,
+    unsigned int local_gen) {
   __syncthreads();
+  asm volatile("fence.acq_rel.gpu;" ::: "memory");
   if (threadIdx.x == 0) {
-    unsigned int gen = *generation;
     unsigned int arrived = atomicAdd(counter, 1u);
     if (arrived == nblocks - 1) {
       *counter = 0u;
-      __threadfence();
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
       atomicAdd(generation, 1u);
     } else {
-      while (*generation == gen) { __nanosleep(64); }
+      volatile unsigned int *vgen = (volatile unsigned int *)generation;
+      while (*vgen <= local_gen) {
+      }
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
   }
   __syncthreads();
 }
 
-__global__ void barrier_probe(unsigned int *counter, unsigned int *sense,
+__global__ void barrier_probe(unsigned int *counter, unsigned int *generation,
                               unsigned int nblocks, int iterations) {
-  unsigned int generation = 0u;
+  unsigned int local_gen = 0u;
   for (int i = 0; i < iterations; i++) {
-    atomic_grid_sync(counter, sense, nblocks, &generation);
+    atomic_grid_sync(counter, generation, nblocks, local_gen);
+    local_gen += 1u;
   }
 }
 
 extern "C" double run_barrier_probe(int grid_blocks, int block_size,
                                     int iterations) {
   if (grid_blocks <= 0 || block_size <= 0 || iterations <= 0) return -1.0;
-  unsigned int *counter = nullptr, *sense = nullptr;
+  unsigned int *counter = nullptr, *generation = nullptr;
   if (cudaMalloc(&counter, sizeof(unsigned int)) != cudaSuccess) return -2.0;
-  if (cudaMalloc(&sense, sizeof(unsigned int)) != cudaSuccess) {
+  if (cudaMalloc(&generation, sizeof(unsigned int)) != cudaSuccess) {
     cudaFree(counter);
     return -3.0;
   }
   cudaMemset(counter, 0, sizeof(unsigned int));
-  cudaMemset(sense, 0, sizeof(unsigned int));
+  cudaMemset(generation, 0, sizeof(unsigned int));
 
-  void *args[] = {&counter, &sense, (void *)&grid_blocks, &iterations};
+  void *args[] = {&counter, &generation, (void *)&grid_blocks, &iterations};
   dim3 grid(grid_blocks), block(block_size);
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -300,7 +311,7 @@ extern "C" double run_barrier_probe(int grid_blocks, int block_size,
   float ms = 0.0f;
   cudaEventElapsedTime(&ms, start, stop);
   cudaFree(counter);
-  cudaFree(sense);
+  cudaFree(generation);
   if (err != cudaSuccess) return -4.0;
   return (double)ms;
 }

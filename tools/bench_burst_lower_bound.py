@@ -59,20 +59,32 @@ _PROBE_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-// Grid-wide barrier identical in structure to the production AtomicGridSync.
+// Structurally identical to the production AtomicGridSync in kernel.cu:
+//  - acquire/release fences at GPU scope (fence.acq_rel.gpu), not __threadfence,
+//    because the production barrier relies on the acquire/release pair to
+//    publish cross-SM writes;
+//  - the local generation is captured before arriving and compared with `<=`,
+//    which tolerates a fast peer advancing it more than once (the `==` form can
+//    miss an increment).
+// The probe does no arithmetic and writes nothing cross-SM, but the barrier
+// cost must match production or the measured floor is not the real one.
+// Keep in sync with kernel.cu; tests/test_probe_fidelity.py guards it.
 __device__ __forceinline__ void atomic_grid_sync(
-    unsigned int *counter, unsigned int *generation, unsigned int nblocks) {
-  __threadfence();
+    unsigned int *counter, unsigned int *generation, unsigned int nblocks,
+    unsigned int local_gen) {
   __syncthreads();
+  asm volatile("fence.acq_rel.gpu;" ::: "memory");
   if (threadIdx.x == 0) {
-    unsigned int gen = *generation;
     unsigned int arrived = atomicAdd(counter, 1u);
     if (arrived == nblocks - 1) {
       *counter = 0u;
-      __threadfence();
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
       atomicAdd(generation, 1u);
     } else {
-      while (*generation == gen) { __nanosleep(64); }
+      volatile unsigned int *vgen = (volatile unsigned int *)generation;
+      while (*vgen <= local_gen) {
+      }
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
   }
   __syncthreads();
@@ -124,6 +136,7 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
       buffer_bytes > bytes_per_layer ? buffer_bytes - bytes_per_layer : 0ull;
   unsigned long long base_offset = 0ull;
   float sink = 0.0f;
+  unsigned int local_gen = 0u;
   const unsigned long long step_clock_start = clock64();
   for (int iter = 0; iter < iterations; ++iter) {
     for (int layer = 0; layer < nlayers; ++layer) {
@@ -132,7 +145,9 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
       base_offset += bytes_per_layer;
       if (base_offset > max_base_offset) base_offset = 0ull;
       for (int b = 0; b < barriers_per_layer; ++b) {
-        atomic_grid_sync(counter, sync_generation, (unsigned int)nblocks);
+        atomic_grid_sync(counter, sync_generation, (unsigned int)nblocks,
+                         local_gen);
+        local_gen += 1u;
       }
     }
   }
