@@ -145,4 +145,6 @@ python -m compileall src/nanovllm benchmarks tools
 - [基线与创新](docs/03_基线与创新.md)：baseline、Megakernel 模块、当前已实现能力和后续边界；
 - [Megakernel 设计笔记](docs/megakernel_design.md)：paged-KV 直连目标和 kernel 演进路径；
 - [服务器运行手册](docs/server_benchmark.md)：A100/V100 环境配置与完整命令；
+- [多 batch 为何打不过 cudagraph](docs/07_多batch为何打不过cudagraph.md)：第 6 版，含 host/device 账本与高并发可行性判定；
+- [高并发判定任务书](docs/09_高并发判定任务书.md)：跑什么 / 看什么 / 怎么判（决定是否投入 R3 的唯一入口）；
 - [服务器命令清单](SERVER_COMMANDS.txt)：可直接复制执行的服务器命令。
