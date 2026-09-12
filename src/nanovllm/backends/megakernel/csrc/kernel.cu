@@ -558,25 +558,29 @@ __device__ void ldg_attention(
     const float *q_head = q + qh * HEAD_DIM;
     float *out_head = attn_out + qh * HEAD_DIM;
 
+    // 128-element QK dot products.  This must be a full HEAD_DIM reduction:
+    // each position's score is sum_{d<128} q[d]*k[d], and each output element
+    // is a weighted sum over ALL positions of the corresponding v element.
+    // Splitting HEAD_DIM across lanes is not a legal decomposition here -- the
+    // online softmax needs one score per position and the PV accumulation needs
+    // per-dimension partials that cannot be recombined without also knowing
+    // which positions each partial covered.
     float max_score = -INFINITY;
     float sum_exp = 0.0f;
     float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    int q_idx = lane_id * 4;
-    float q_local[4];
-    q_local[0] = q_head[q_idx + 0];
-    q_local[1] = q_head[q_idx + 1];
-    q_local[2] = q_head[q_idx + 2];
-    q_local[3] = q_head[q_idx + 3];
+    const int q_idx = lane_id * 4;
+    float q_local[4] = {q_head[q_idx + 0], q_head[q_idx + 1],
+                        q_head[q_idx + 2], q_head[q_idx + 3]};
 
-    // Each warp processes a subset of cache positions
     for (int pos = warp_id; pos < cache_len; pos += LDG_NUM_WARPS) {
       const __nv_bfloat16 *k_pos = ldg_kv_ptr(
           k_cache, kv_head, pos, max_seq_len, block_table, block_size);
       const __nv_bfloat16 *v_pos = ldg_kv_ptr(
           v_cache, kv_head, pos, max_seq_len, block_table, block_size);
 
-      // Q @ K with __ldg
+      // Full Q @ K over HEAD_DIM: each lane covers its own 4 dimensions, then a
+      // warp reduction produces the complete dot product.
       float score = 0.0f;
       uint2 k_u2 = __ldg(reinterpret_cast<const uint2 *>(k_pos + q_idx));
       __nv_bfloat16 *k_ptr = reinterpret_cast<__nv_bfloat16 *>(&k_u2);
@@ -592,6 +596,8 @@ __device__ void ldg_attention(
       float exp_diff = fast_exp(old_max - max_score);
       sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
 
+      // PV for this lane's 4 output dimensions, weighted by this position's
+      // softmax weight (already uniform across the warp).
       float weight = fast_exp(score - max_score);
       uint2 v_u2 = __ldg(reinterpret_cast<const uint2 *>(v_pos + q_idx));
       __nv_bfloat16 *v_ptr = reinterpret_cast<__nv_bfloat16 *>(&v_u2);
@@ -601,53 +607,44 @@ __device__ void ldg_attention(
       out_acc[3] = out_acc[3] * exp_diff + weight * __bfloat162float(v_ptr[3]);
     }
 
-    // Store each warp's partial results to shared memory
+    // Combine per-warp online-softmax states.  Warps partition the positions,
+    // so all warps cover the same output dimensions (this lane's 4) and the
+    // standard max/rescale merge is exact.
     if (lane_id == 0) {
       s_max_score[warp_id] = max_score;
       s_sum_exp[warp_id] = sum_exp;
     }
-    int out_base = lane_id * 4;
-    s_out_acc[warp_id][out_base + 0] = out_acc[0];
-    s_out_acc[warp_id][out_base + 1] = out_acc[1];
-    s_out_acc[warp_id][out_base + 2] = out_acc[2];
-    s_out_acc[warp_id][out_base + 3] = out_acc[3];
+    s_out_acc[warp_id][q_idx + 0] = out_acc[0];
+    s_out_acc[warp_id][q_idx + 1] = out_acc[1];
+    s_out_acc[warp_id][q_idx + 2] = out_acc[2];
+    s_out_acc[warp_id][q_idx + 3] = out_acc[3];
     __syncthreads();
 
-    // Warp 0 combines results from all warps
     if (warp_id == 0) {
-      // Find global max across all warps
-      float global_max = s_max_score[0];
-      for (int w = 1; w < LDG_NUM_WARPS; w++) {
-        if (s_max_score[w] >
-            -INFINITY) { // Only consider warps that processed positions
+      float global_max = -INFINITY;
+      for (int w = 0; w < LDG_NUM_WARPS; w++) {
+        if (s_max_score[w] > -INFINITY) {
           global_max = fmaxf(global_max, s_max_score[w]);
         }
       }
 
-      // Rescale and sum the partial results
       float total_sum_exp = 0.0f;
       float final_out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
       for (int w = 0; w < LDG_NUM_WARPS; w++) {
-        if (s_max_score[w] >
-            -INFINITY) { // Only consider warps that processed positions
+        if (s_max_score[w] > -INFINITY) {
           float scale = fast_exp(s_max_score[w] - global_max);
           total_sum_exp += s_sum_exp[w] * scale;
-
-          int base = lane_id * 4;
-          final_out[0] += s_out_acc[w][base + 0] * scale;
-          final_out[1] += s_out_acc[w][base + 1] * scale;
-          final_out[2] += s_out_acc[w][base + 2] * scale;
-          final_out[3] += s_out_acc[w][base + 3] * scale;
+          final_out[0] += s_out_acc[w][q_idx + 0] * scale;
+          final_out[1] += s_out_acc[w][q_idx + 1] * scale;
+          final_out[2] += s_out_acc[w][q_idx + 2] * scale;
+          final_out[3] += s_out_acc[w][q_idx + 3] * scale;
         }
       }
 
-      // Write final normalized output
-      int base = lane_id * 4;
-      out_head[base + 0] = ldg_round_bf16(final_out[0] / total_sum_exp);
-      out_head[base + 1] = ldg_round_bf16(final_out[1] / total_sum_exp);
-      out_head[base + 2] = ldg_round_bf16(final_out[2] / total_sum_exp);
-      out_head[base + 3] = ldg_round_bf16(final_out[3] / total_sum_exp);
+      out_head[q_idx + 0] = ldg_round_bf16(final_out[0] / total_sum_exp);
+      out_head[q_idx + 1] = ldg_round_bf16(final_out[1] / total_sum_exp);
+      out_head[q_idx + 2] = ldg_round_bf16(final_out[2] / total_sum_exp);
+      out_head[q_idx + 3] = ldg_round_bf16(final_out[3] / total_sum_exp);
     }
     __syncthreads();
   }
