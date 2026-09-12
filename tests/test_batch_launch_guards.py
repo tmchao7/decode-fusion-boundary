@@ -56,6 +56,71 @@ class CompileTimeCeilingTests(unittest.TestCase):
                 self.assertEqual(int(limit), ceiling)
 
 
+class KernelFlagDefaultTests(unittest.TestCase):
+    """``kernel.cu``'s ``#ifndef`` fallbacks must equal ``build.py``'s defaults.
+
+    The JIT build always passes these as ``-D`` flags, so the fallbacks are dead
+    in the normal path -- which is exactly what makes them dangerous. Any other
+    compile path (a manual ``nvcc`` line, a reduced reproduction, another
+    frontend) silently gets *different* constants: the fallback for
+    ``LDG_ATTN_BLOCKS`` was ``NUM_Q_HEADS`` (16) against a build default of 8,
+    which silently halves the supported batch, and ``LDG_PREFETCH_QK`` fell back
+    to 1 against a build default of 0, which silently enables the prefetch path
+    that the shipped configuration turns off.
+    """
+
+    # Names that are compile-time constexprs in kernel.cu rather than literals.
+    CONSTEXPRS = {"NUM_Q_HEADS": 16, "NUM_KV_HEADS": 8, "LDG_NUM_WARPS": 16}
+
+    def _kernel_defaults(self) -> dict[str, int]:
+        kernel = read(KERNEL_CU)
+        defaults: dict[str, int] = {}
+        for name, value in re.findall(
+            r"#ifndef\s+(LDG_[A-Z0-9_]+)\s*\n#define\s+\1\s+([^\n/]+)", kernel
+        ):
+            value = value.strip()
+            if value in self.CONSTEXPRS:
+                defaults[name] = self.CONSTEXPRS[value]
+            elif value.isdigit():
+                defaults[name] = int(value)
+        return defaults
+
+    def _build_defaults(self) -> dict[str, int]:
+        build = read(BUILD_PY)
+        return {
+            name: int(default)
+            for name, default in re.findall(
+                r"_env_int\('(LDG_[A-Z0-9_]+)',\s*(\d+)\)", build
+            )
+        }
+
+    def test_every_tunable_flag_agrees(self) -> None:
+        kernel_defaults = self._kernel_defaults()
+        build_defaults = self._build_defaults()
+        self.assertTrue(build_defaults, "build.py defines no LDG_* env defaults")
+        for name, build_default in sorted(build_defaults.items()):
+            with self.subTest(flag=name):
+                self.assertIn(
+                    name,
+                    kernel_defaults,
+                    f"{name} has no #ifndef fallback in kernel.cu",
+                )
+                self.assertEqual(
+                    kernel_defaults[name],
+                    build_default,
+                    f"{name}: kernel.cu fallback {kernel_defaults[name]} != "
+                    f"build.py default {build_default}",
+                )
+
+    def test_attn_blocks_fallback_keeps_the_documented_batch_limit(self) -> None:
+        """LDG_ATTN_BLOCKS decides the batch limit (grid / LDG_ATTN_BLOCKS)."""
+
+        attn = self._kernel_defaults().get("LDG_ATTN_BLOCKS")
+        self.assertEqual(attn, 8)
+        grid = self._build_defaults()["LDG_NUM_BLOCKS"]
+        self.assertEqual(grid // attn, 10)
+
+
 class RealLimitTests(unittest.TestCase):
     def test_kernel_derives_the_limit_from_the_grid(self) -> None:
         kernel = read(KERNEL_CU)
