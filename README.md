@@ -16,6 +16,26 @@ The repository currently contains three execution paths:
 Megakernel requests that are unsupported or run on V100 fall back to the
 standard backend and are marked as non-comparable in benchmark reports.
 
+## Where Megakernel Wins (measured, and where it does not)
+
+The megakernel removes per-step host/launch overhead by fusing the whole
+Transformer decode into one cooperative kernel with device-side EOS. On A100
+with Qwen3-0.6B it beats `torch-cudagraph` at **batch=1** (1.04-1.31x E2E), but
+loses badly at **batch>1** (b8: 6.50 vs 0.43 ms/token), so the default dispatch
+is hybrid: batch=1 megakernel, batch>1 cudagraph.
+
+The analytical reason is in `src/nanovllm/roofline.py`: a decode step must
+stream **1.503 GB** of bf16 weights, which at ~1555 GB/s is a **0.97 ms/step**
+HBM floor shared by *any* implementation, and the step only turns
+compute-bound around batch≈243. `tools/account_decode.py` shows the cudagraph
+step is 2.94/3.43/3.55 ms at batch 1/8/32 while its pure GPU time is only
+0.74/0.77/0.77 ms -- i.e. **~2.5 ms of every step is host overhead that batch
+size merely amortizes.** Whether a batch>1 megakernel can win therefore depends
+entirely on getting its device side back near the 0.97 ms floor, which is what
+`RUN_MODE=roofline` measures *before* any kernel rewrite. See
+[docs/07](docs/07_多batch为何打不过cudagraph.md) §10 for the falsifiable
+decision rule.
+
 ## Repository Layout
 
 ```text

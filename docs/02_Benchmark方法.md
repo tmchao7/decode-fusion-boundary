@@ -127,6 +127,42 @@ nsys profile --trace=cuda,nvtx \
 
 重点查看 `nano_vllm_decode_step` 和 `megakernel_decode` 范围内的 kernel launch、CUDA API、memcpy 和 GPU 时间。
 
+解析与 roofline 核对（`--roofline` 会把每步 kernel 时间换算成"隐含权重带宽"，
+用来判断这个时间在物理上是否可能覆盖整个 decode step）：
+
+```bash
+python -m tools.parse_nsys_kernel results/a100_nsys.sqlite \
+  --decode-steps 49 --memory --roofline
+```
+
+注意 `nsys profile --trace=cuda` **不采集 DRAM 计数器**；需要 GPU metrics 采样
+（`--gpu-metrics-device` / `--enable-gpu-metrics`，视 nsys 版本）。工具在缺表时
+明确输出 `UNAVAILABLE` 并提示替代方案（`tools.bench_roofline_a100 --sections bandwidth`），
+不会静默报 0。
+
+## 第六步：host/device 账本与 roofline（判定"能不能更快"）
+
+性能表只给"多快"，不给"还能快多少"。第六步把每个 decode step 拆成 device 时间与
+host 残差，并和权重带宽下界对比：
+
+```bash
+python -m tools.account_decode results/a100_account.json --seq-len 160 \
+  --json results/a100_account_breakdown.json
+python -m nanovllm.roofline --batch-sizes 1,2,4,8,16,32 --seq-len 160 --check-kernel
+```
+
+口径（务必区分，两个字段的命名历史上有坑）：
+
+- `summary.decode_time_ms_total`：所有请求的 **decode 墙钟之和**（毫秒）。一个 decode
+  step 给每条序列各出 1 个 token，且所有序列共享同一步，所以
+  **每步墙钟 = decode_time_ms_total / (request_count × decode_steps)**。
+- `summary.cuda_decode_time_ms_total`：同上口径的 **纯 GPU 时间**（CudaEvent 计时）。
+- `tpot_ms`：**每序列**每 token 时间，即 TPOT；因此 `tpot_ms × batch == 每步墙钟`，
+  可以与上一条交叉验证（差异 >5% 时 `account_decode` 会 WARNING）。
+- 注意 `summary.decode_time_ms` / `cuda_decode_time_ms` 这两个字段在
+  `aggregate_requests` 里被 `summarize(..., scale=1000.0)` 乘了 1000（历史遗留），
+  **不要**拿它们当毫秒用；用 `*_total` 字段。
+
 ## 报告要求
 
 每个 A100/V100 报告至少包含：
@@ -138,4 +174,8 @@ nsys profile --trace=cuda,nvtx \
 5. peak memory；
 6. fallback 原因；
 7. A/B 的 absolute delta、improvement percentage 和 speedup；
-8. Nsight 采集的 kernel launches/token 和内存系统指标。
+8. Nsight 采集的 kernel launches/token 和内存系统指标；
+9. **每步墙钟 / 每步 GPU / host 残差 / GPU 占比**（`tools.account_decode`）；
+10. **相对 `roofline.py` 权重下界的差距**（`tools.account_decode` 的 comparison 表
+    自动产出；与物理规格冲突时报告必须显式标注，而不是当成功）。
+

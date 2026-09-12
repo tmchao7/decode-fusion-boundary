@@ -321,11 +321,19 @@ megakernel 被钉在「与 cudagraph 完全相同的逐步 cadence」上，只�
 | ✅ | R2：batch + WMMA no-sync（`ldg_update_step_batch`、设备侧 EOS） | `kernel.cu`、`model.py.generate_paged_batch` | 已并入 29796bd；batch 1/2/4/8 == 逐步 WMMA；EOS 截断正确 |
 | ✅ | **burst 路径强接入 engine**（`schedule_burst` → `generate_paged_batch` → `postprocess_burst`） | `llm_engine.py`、`scheduler.py`、`model_runner.py`、`backend.py`、`block_manager.py`、`config.py`、`compare.py`、`bench_nosync.py` | 66 unittest 通过；`megakernel-burst` 后端可在 engine 端到端运行 |
 | ✅ | **单序列 `ldg_update_step` 设备侧 EOS** + **hybrid dispatch** | `kernel.cu:1928`、`torch_bindings.cpp`、`model.py:500`、`backend.py:233` | batch=1 burst 2.53 ms/tok **1.16x BEATS cudagraph**；A100 实测 2026-09-10 |
-| P0 | **R3：单 launch 内多 token 循环**（LM head 融合进 grid）——batch>1 击败 cudagraph 的必经之路 | `kernel.cu` | batch=2/4/8 E2E ms/tok < cudagraph；纯 GPU kernel 时间 < cudagraph kernel 总和 |
+| P0 | **roofline / host-device 账本落地**（`roofline.py` + `tools/account_decode.py` + `RUN_MODE=account`） | `src/nanovllm/roofline.py`、`tools/account_decode.py`、`SERVER_COMMANDS.txt` | ✅ 代码+单测已落地；待 A100 出 `results/a100_account_breakdown.json` 复现 host 残差 2.2-2.8 ms |
+| **P0（门）** | **R3 前置门：device 下界 probe + 可达带宽标定 + host 消除上界**（docs/07 §10.4 实验 A/B/C） | `tools/bench_roofline_a100.py`、`tools/bench_burst_lower_bound.py`、`RUN_MODE=roofline` | **probe ≤1.5 ms/step 才启动 R3；>3 ms/step 则判定高并发翻盘不可行并停止重构**；同时解释 0.74 ms ⇒ 2.03 TB/s 的规格冲突 |
+| P0 | **R3：单 launch 内多 token 循环**（LM head 融合进 grid）——**前置门通过后**才做 | `kernel.cu` | batch=2/4/8 E2E ms/tok < cudagraph；纯 GPU kernel 时间 < cudagraph kernel 总和 |
 | P1 | attention 用 tensor-core（QK/PV WMMA） | `kernel.cu` `ldg_attention` | ncu memory throughput ≥ 70% 峰值 |
 | P2 | sampling（temperature>0）接入 | `backend.py:86-91`、kernel | 与 torch sampler 数值一致 |
 | P2 | V100 FP16 路径（sm_70 WMMA 是 fp16） | `kernel.cu`、`build.py` | V100 correctness + perf |
 | P2 | tensor_parallel>1 | `backend.py:83`、weight 切分 | 与 nano-vLLM TP 对齐 |
+
+> **为什么给 R3 加前置门**：docs/07 §10 用 roofline 证明 device 侧的下界是
+> 1.503 GB / 1555 GB/s = **0.97 ms/step**，而 cuBLAS 的 batched GEMM 已经贴着这堵墙
+> （0.74-0.77 ms/step，b1→b8 基本不变）。因此 R3 的目标**不是**"Kernel 比 cuBLAS
+> 快"，而是"把 batch>1 的 device 侧从 98.5 ms 拉回 ~1 ms，从而兑现 host 消除的
+> E2E 收益"。probe 如果不支持这个量级，R3 的几百行 kernel 重构会白写。
 
 ## 6. 验证与回归基线（每个 P0 改造都要跑）
 
@@ -338,9 +346,11 @@ megakernel 被钉在「与 cudagraph 完全相同的逐步 cadence」上，只�
    megakernel 三路）+ `tools/bench_nosync.py`（batch 版扩展）。
    记录：batch=1/2/4/8、prompt 32/128/512、decode_tok_s、tpot_ms、纯 GPU kernel
    时间（ncu）。
-4. **server 落地**：按 AGENTS.md「Server Command File Rule」只更新
-   `SERVER_COMMANDS.txt`，`RUN_MODE=benchmark` / `profile`，A100 跑完写
-   `results/a100.json` + `python -m tools.plot_metrics`。
+4. **host/device 账本**：`RUN_MODE=account` → `tools/account_decode.py`；每个 perf
+   结论都要带上"每步墙钟 / 每步 GPU / host 残差 / GPU 占比"四个数（docs/02 §报告要求）。
+5. **server 落地**：按 AGENTS.md「Server Command File Rule」只更新
+   `SERVER_COMMANDS.txt`，`RUN_MODE=benchmark` / `profile` / `account` / `roofline`，
+   A100 跑完写 `results/a100.json` + `python -m tools.plot_metrics`。
 
 ## 7. 风险与不要做的事（汇总）
 

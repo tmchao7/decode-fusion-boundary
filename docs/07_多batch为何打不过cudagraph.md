@@ -1,7 +1,15 @@
-# 多 batch 场景为何打不过 cudagraph：证据与根因分析（第 5 版）
+# 多 batch 场景为何打不过 cudagraph：证据与根因分析（第 6 版）
 
-> 更新日期：2026-09-11（第 5 版）
+> 更新日期：2026-09-11（第 6 版）
 >
+> - 第 6 版新增 **§10 host/device 账本 + 高并发可行性判定**：把"每步必须流的权重
+>   1.503 GB / 下界 0.97 ms"、"cudagraph 每步 GPU 只占 21-25%、host 残差
+>   2.2-2.8 ms"、"batch≈243 才转算力 bound"算成可证伪的账；给出三句话判语
+>   （**device 侧翻盘不可行，E2E 侧可赚的全是 host**），并列出三个便宜的证伪
+>   实验（device 下界 probe / 可达带宽标定 / host 消除上界）。新增
+>   `src/nanovllm/roofline.py`（含 26 个单测）与 `tools/account_decode.py`。
+>   同时**修正引用错误**：megaQwen 的 owner 是 `Infatoshi` 而非 `NoneBone`，
+>   并补齐其原始自述数字；补引 MPK(OSDI'26) / TaxBreak / Cohere megakernel 等。
 > - 第 5 版新增 **§3.5 nsys 实测纯 GPU kernel 时间分解**（4 组配置 b1/b8 × mega/cg），
 >   用四个实测比值坐实根因：b1 mega 纯 kernel 慢于 cg 2.6x 但 E2E 反超（launch 消除）；
 >   b8 mega 纯 kernel 慢 133x；b8/b1 mega kernel 增长 54x vs cg 1.04x（SM 空转）。
@@ -41,6 +49,13 @@
 cudagraph 的「独立 kernel launch + 整块 GPU(108 SM 全部)服务每个 batched GEMM」在
 batch>1 下把 SM 用满、张量核全开，且每个 GEMM 独立、不被层间 barrier 串行化。
 这是**资源使用模型**的根本不对称，不是调参能解决的。
+
+> **第 6 版补一句更硬的账（详见 §10）**：device 侧其实**没有翻盘空间**——每步必须流
+> 1.503 GB 权重，HBM 墙是 0.97 ms/step（1555 GB/s），而 cudagraph 的 batched cuBLAS
+> 在 b1→b8 已经是 0.74→0.77 ms/step，贴着这堵墙。它的 tok/s 随 batch 涨，涨的是
+> **把固定 ~2.5 ms/step 的 host 开销摊薄**，不是 GPU 变快。所以高并发下的真实命题是
+> 「谁能把每步 host 从 2.5 ms 压到 0」，megakernel 的对手不是 cudagraph 的算力，
+> 而是它自己 batch>1 时那 98.5 ms/step 的 device 侧。
 
 ## 1. 「单 batch 击败 cudagraph」的真相（不变）
 
@@ -242,6 +257,11 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 对照 cudagraph batch=8：cuBLAS 用满 108 SM、张量核全开、无 padding、每 GEMM 独立不
 被 barrier 串行。**每一项都是 cudagraph 的优势项**，叠加成 ~21x。
 
+> **第 6 版补充**：上面这张分解解释的是"megakernel 为什么慢"，但没有回答"赢需要
+> 多快"。第 6 版 §10 把它换算成绝对下界：megakernel 只要把 device 侧从 98.5 ms
+> 拉回 ~1 ms（§10.1 的 1.503 GB / 0.97 ms HBM 墙 + barrier），就能靠消除 host
+> 在高并发 E2E 反超；但它**不需要、也不可能**在 device 侧超过 cuBLAS。
+
 ## 6. 验证清单（已跑 / 待跑）
 
 | 实验 | 状态 | 结果 |
@@ -256,15 +276,26 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | **crossover 扫描**（batch 1/2/3/4/5/6/7/8/10/16/32 双轨 ms/tok + tok/s） | ✅ A100 已跑 | 拐点在 batch=1→2（§9.6）；b1 1.31x BEATS，b≥2 单调劣化到 b32 0.02x |
 | **batch-aware 审计**（batch 是否直映 CTA/warp、tile/KV/mapping） | 部分完成 | 已确认每 GEMM 仅 4-12/80 block 干活（§9.7） |
 | 四象限对照（eager / CG / mega / mega+CG） | 待跑 | 区分 launch 消除 vs kernel 内效率（§9.8） |
+| **roofline 模型 + host/device 账本**（`roofline.py` / `tools/account_decode.py`） | ✅ 已落地（本地 26+6 单测） | 每步权重 1.503 GB、下界 0.97 ms；已量化 host 残差 2.2-2.8 ms（§10） |
+| **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | 待跑（`tools/bench_burst_lower_bound.py`） | **判据：≤1.5 ms 才做 R3；>3 ms 判定高并发翻盘不可行（§10.4）** |
+| **实验 B：可达带宽标定**（1.503 GB `__ldg` 流式读） | 待跑（`tools/bench_roofline_a100.py`） | 解决"0.74 ms ⇒ 2.03 TB/s 超规格"的矛盾（§10.4） |
+| **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | 待跑（`tools/bench_burst_lower_bound.py`） | 给出 host 全消除后 cudagraph 的上界（§9.8 象限 D） |
 
 ## 7. 结论（更新为可执行判语）
 
 1. **多 batch 的败局是资源使用模型问题，不是调参/张量核覆盖问题**。即便 QKV+O+MLP
    全上张量核，fixed-grid 按序列切分 + 每层全网格 barrier + 每 GEMM 少数 block 干活，
    决定了 batch>1 无法通过「优化某个 kernel」翻盘。
-2. **唯一可持续的战略胜利点是 batch=1**：走 persistent kernel + 设备侧 EOS，靠消除
-   launch 间隙 1.04-1.16x 微胜（docs/06 §0 实测）。
-3. **务实集成（✅ 已落地）**：batch=1 走 megakernel persistent；batch>1 回退 cudagraph
+2. **device 侧本身没有翻盘空间（第 6 版新增定量判语）**：每步必须流 1.503 GB 权重，
+   在 1555 GB/s 下界 0.97 ms/step，而 batch≈243 之前都是 memory bound。cudagraph 的
+   batched cuBLAS 已经贴着这堵墙（0.74-0.77 ms/step，且 b1→b8 几乎不变），所以
+   "把某个 GEMM 写得更快"在数学上没有余量。胜负不在 device 侧。
+3. **唯一可持续的战略胜利点是消除每步 host 开销**：batch=1 走 persistent kernel +
+   设备侧 EOS，靠消除 launch 间隙 1.04-1.31x 微胜（docs/06 §0 实测）；而高并发下
+   cudagraph 每步仍在付 ~2.5 ms host（§10.2），**这部分对两条路径都同样可赚**。
+   所以真实命题是"谁能把每步 host 从 2.5 ms 压到 0"，不是"megakernel 比 cudagraph
+   算得快"。
+4. **务实集成（✅ 已落地）**：batch=1 走 megakernel persistent；batch>1 回退 cudagraph
    （megakernel 批处理路径不占优，不值得付出层间串行 + 多 launch 的代价）。WMMA batch
    保留为显式开关 `megakernel_batch_decode=True` 供正确性研究。`MegakernelBackend.
    compatibility()`（`backend.py:93-100`）默认对 batch>1 返回 not supported →
@@ -272,8 +303,11 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
    同步拒绝 batch>1 burst。`megakernel-wmma` / `megakernel-burst` 后端（`compare.py`、
    `correctness_smoke.py`）显式开启该开关以走 megakernel batch 路径。67 unittest 通过 +
    GPU 实测：默认 batch=2 FALLBACK、batch=1 supported、开启后 batch=2 走 megakernel。
-4. 若要彻底翻盘只能**去掉逐层 grid.sync**、改成每层软件流水/隐式同步 + 让每个 batched
-   GEMM 用满全 grid（向 cudagraph 靠拢）——工作量大且不确定（docs/06 R3 的方向）。
+5. 高并发若要翻盘，**必须先把 batch>1 的 device 侧从 98.5 ms 拉回 ~1 ms**（跨过
+   "固定 grid 按序列切分 + 逐层 grid.sync 串行"），而不是去超过 cuBLAS。方向是
+   去掉逐层 grid.sync 改软件流水/隐式同步 + 让 batched GEMM 用满全 grid（docs/06 R3，
+   MPK 方向）——**两个数量级的工作量且不保证成功**，所以先用 §10.4 的三个便宜实验
+   做证伪门。
 
 ## 8. 不要做的事
 
@@ -281,7 +315,12 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
   这是本轮审查最有价值的纠正。
 - **不要**把 barrier 原始成本当成 ~7-8ms 主开销——实测 pure barrier 仅 0.55ms，
   真正成本是它强制的层间串行潜伏期 + SM 空转。
+- **不要**说"高并发下 device 侧还有几倍余量"——除非 §10.4 实验 B/C 推翻了
+  "cudagraph 已贴带宽墙"这个强假设。0.74 ms 对应 2.03 TB/s 已超过 A100 规格，
+  这个矛盾必须先解决，否则数字读法会出错。
 - **不要**在 batch≥8 上承诺 speedup——并行 batch 上限 ≈10，架构上没有吞吐优势。
+- **不要**在 §10.4 实验 A 出结果之前动 `kernel.cu` 的 batch 路径（probe 若 >3 ms/step，
+  这条路就判死，重构的几百行会白写）。
 - **不要**把 `results/a100_nosync_compare.md` 的数字当 burst 性能（那走的是
   `ignore_eos=True` 的 step-wise 回退）。
 
@@ -293,7 +332,8 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 
 ### 9.1 megaQwen 与我们的现象几乎完全吻合
 
-公开的 Qwen3-0.6B **megaQwen** 项目对这个问题有明确表述：
+公开的 Qwen3-0.6B **megaQwen** 项目（`github.com/Infatoshi/MegaQwen`，RTX 3090）
+对这个问题有明确表述：
 
 - megakernel 在 **batch=1、短 context** 下明显超过 vLLM/SGLang；
 - 生产框架针对 **dynamic batch / variable batch size / long context /
@@ -451,14 +491,151 @@ D. MegaKernel + CUDA Graph   ← 二者不互斥：CG 消 CPU launch，mega 消 
 
 ### 9.9 引用
 
-- megaQwen（Qwen3-0.6B custom CUDA kernel）：
-  `github.com/NoneBone/megaQwen`
+- megaQwen（Qwen3-0.6B custom CUDA kernel，RTX 3090）：
+  `github.com/Infatoshi/MegaQwen`。**注意：owner 是 Infatoshi，不是
+  `NoneBone/megaQwen`（那是另一个项目）**。该仓库 README 的自述数字：
+  - b1 decode **530 tok/s**（3.9x vs HuggingFace；TRT-LLM 355、vLLM/SGLang 107）；
+  - **带宽利用率仅 5%**（47 GB/s effective vs 936 GB/s peak）；
+  - **140+ 次 `grid.sync()`/token，每次 ~0.7 µs ≈ 100 µs 同步开销**，作者判定
+    "~530 tok/s 是 batch=1 bf16 cooperative megakernel 的架构天花板"；
+  - 位置 1 时 525 tok/s，位置 200 退化到 422 tok/s（experiments/RESULTS.md 到 158）；
+  - 显式承认优势来自**窄区间**：`batch=1, short context, static shapes`，
+    并点名"生产框架针对 dynamic shapes / variable batch / long context /
+    continuous batching 优化，本实现没有这些"。
 - Ada-MK: Adaptive MegaKernel Optimization via Automated DAG-based Search for LLM
-  Inference（TensorRT-LLM 插件，L20 single-batch）：`arXiv:2605.11581`
+  Inference：`arXiv:2605.11581`（v1, 2026-05-12；MLIR DAG 离线搜索 + K 维切分 +
+  shared-memory 约束建模；作为 TensorRT-LLM 插件，L20）。关键数字：
+  **kernel launch 开销占 E2E 14.6%**（即 megakernel 可回收的天花板）；
+  **single-batch** 吞吐比 vanilla TRT-LLM 高最多 23.6%、比 vLLM 高 50.2%；
+  prefill 仍走框架（hybrid），不是"megakernel 万能"。
+- MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs：
+  `arXiv:2512.22219`（OSDI'26）。用 **SM 级图 + 去中心化 in-kernel runtime** 做
+  跨算子软件流水，端到端延迟最多低 1.7x。**这是"去掉逐层 grid.sync"方向的
+  最强公开证据**，但要注意它**没有 CUDA Graph 对照**，不能直接读成"megakernel
+  在高 batch 打败 cudagraph"。
+- TaxBreak: Unmasking the Hidden Costs of LLM Inference Through Overhead
+  Decomposition：`arXiv:2603.12465`。把 host 开销分解成 framework translation /
+  CUDA library translation / kernel launch 三层，并用 Host–Device Balance Index
+  判定 host-bound 还是 device-bound；它引用的 framework tax 工作给出了
+  **batch 增大后系统从 framework-bound 转为 compute-bound** 的表征。
+- Cohere megakernel serving engine：`cohere.com/blog/megakernels` +
+  `github.com/cohere-ai/cohere-megakernel`（工业界 megakernel serving 的公开实现）。
+- 其他 megakernel 系统（供 §3.3 方向立项参考）：Fleet `arXiv:2604.15379`（multi-die
+  分层任务抽象）、GPUOS `arXiv:2604.17861`（透明 operation fusion / persistent
+  threads）、AutoMegaKernel `arXiv:2606.09682`（自改靶 megakernel 合成）。
 - vLLM CUDA Graph 设计：`docs.vllm.ai/en/latest/design/cuda_graphs/`
-- vLLM `CudagraphDispatcher`/`BatchDescriptor`/graph mode：vLLM 最新文档
+- vLLM `CudagraphDispatcher`/`BatchDescriptor`/graph mode（`NONE / PIECEWISE /
+  FULL / FULL_DECODE_ONLY / FULL_AND_PIECEWISE`，默认 `FULL_AND_PIECEWISE`）：
+  vLLM 最新文档
+- vLLM host 开销相关 issue/PR（说明高并发下 CPU 侧仍是瓶颈）：
+  `github.com/vllm-project/vllm` issue `#27222`（Qwen3-next CPU overhead）、
+  PR `#18698`（cudagraph capture size 逻辑）、PR `#47540`（per-step CPU rebuild）
 - vLLM batch=12/20 graph capture 收益（~7x decode）：
   `github.com/vllm-project/vllm-ascend/issues/16049`
 
-> 注：以上引用为 2026-09-11 检索的公开资料，链接文本与 arXiv 编号按检索当时为准；
-> 引入本仓库时以「方向印证」看待，不作为本机实测依据。
+> 注：以上引用为 2026-09 检索的公开资料，链接文本与 arXiv 编号按检索当时为准；
+> 引入本仓库时以「方向印证」看待，不作为本机实测依据。**本次核对修正了第 5 版
+> 之前把 megaQwen 记为 `NoneBone/megaQwen` 的错误，并补齐了它的原始自述数字。**
+
+## 10. host/device 账本 + 高并发可行性判定（第 6 版新增）
+
+第 5 版把多 batch 败因归结为"固定 grid 按序列切分 + 每层 barrier + 每 GEMM 少数
+block 干活"——这些都对，但**没有回答"device 侧还剩多少可赚"**。本节把账算清楚。
+模型代码在 `src/nanovllm/roofline.py`（纯 Python + 单元测试），账本工具在
+`tools/account_decode.py`（读 `benchmarks.compare --json` 的输出）。
+
+### 10.1 每步必须流的权重：1.503 GB（batch 无关）
+
+按 `kernel.cu` 的常量手算（`roofline.py` 的测试锁定了这个数）：
+
+| 项 | 参数量 | bf16 字节 |
+|---|---:|---:|
+| 28 层（qkv 4.19M + o 2.10M + mlp 9.44M + 2×RMSNorm）/层 = 15.731M | 440.5M | 0.881 GB |
+| embedding（151936×1024，每一步只 gather 一行） | 155.6M | 0.311 GB |
+| LM head（151936×1024） | 155.6M | 0.311 GB |
+| **合计** | **751.6M** | **1.503 GB** |
+
+**decode 每步的算术强度极低**（b1/seq224 约 0.83 FLOP/byte，远低于 A100 的
+~200 FLOP/byte 机器平衡点），所以任一步的价值都落在 `max(权重流式读, 张量核算力)`
+上。用 1555 GB/s（A100 HBM2e 规格）算：
+
+| batch | 权重下界 | 张量核下界(312 TFLOP/s) | 判决 |
+|------:|--------:|-----------------------:|:-----|
+| 1 | 0.97 ms | 0.004 ms | memory |
+| 8 | 0.97 ms | 0.031 ms | memory |
+| 32 | 0.97 ms | 0.122 ms | memory |
+| 243 | 0.97 ms | 0.97 ms | **crossover** |
+
+**只有到 batch≈243 才会变成算力 bound**（且这还只是按峰值 312 TFLOP/s 算；实测
+cuBLAS 路径只有个位数 TFLOP/s，所以现实里全程都是权重带宽 bound）。
+
+> 结论一句话：**在这台硬件上，任何"完美"的 decode 实现（不管是不是 megakernel）
+> 的 device 侧下界，就是同一堵 0.97 ms/step 的 HBM 墙。** megakernel 与
+> cudagraph 在 device 侧争的不是"效率上界"，而是"谁更接近这堵墙"。
+
+### 10.2 实测账本：GPU 只占每步的 ~21-25%
+
+`tpis`（`compare.py` 的 TPOT）是**每序列**每 token 时间；一个 decode step 给 batch
+里每条序列各出 1 个 token，所以 **每步墙钟 = ms/tok × batch**。用 docs 里已有的
+数字反推：
+
+| batch | cg 每步墙钟 | cg 每步纯 GPU（nsys） | host/launch 残差 | GPU 占比 |
+|------:|-----------:|----------------------:|-----------------:|--------:|
+| 1 | 2.94 ms | 0.74 ms | **2.20 ms** | 25.2% |
+| 8 | 3.43 ms | 0.77 ms | **2.66 ms** | 22.4% |
+| 32 | 3.55 ms | 0.77 ms | **2.78 ms** | 21.7% |
+
+两个此前没被点破的事实：
+
+1. **cudagraph 的每步墙钟几乎不随 batch 变化（2.94→3.55 ms）**，而 tok/s 从
+   ~340（b1）涨到 ~9000（b32）。它涨的不是 GPU 效率，而是**把固定的 ~2.5 ms/step
+   host 成本摊薄**。cudagraph 的 device 侧从 b1 起就已经吃满（0.74→0.77 ms 基本不变）。
+2. 你的 batch=1 胜局（E2E 2.24 vs 2.94）**同样来自把 2.2 ms host 压掉**——而且
+   megakernel 的纯 kernel 反而慢 2.6x（1.89 vs 0.74 ms）。**两件事是同一个机制。**
+
+### 10.3 高并发下能不能赢：一个可证伪的判语
+
+把上两节合起来，高并发下 megakernel 的可赢空间只有一处：
+
+```text
+每步墙钟 = max(device 侧: 权重流 + barrier 开销, 下界 0.97 ms)
+         + host 侧: ~2.5 ms（cudagraph 每步都付；persistent megakernel 可压到 ~0）
+
+cudagraph 现状 b8: 0.77 (device) + 2.66 (host) = 3.43 ms/step  -> 902 tok/s
+megakernel 若能追平 device 侧: 0.97 + ~0.3 (barrier) + ~0 = ~1.3 ms/step
+                              -> ~6100 tok/s（约 6.8x）
+```
+
+**判语（三句话）**：
+
+1. **device 侧翻盘不可行**：两者共享同一堵 0.97 ms 的 HBM 墙，而 cuBLAS 的
+   batched GEMM 在 M≤32 时已经贴着这堵墙（0.74-0.77 ms/step）。想靠"把某个
+   GEMM 写得更快"赢 cudagraph，数学上没有余量。
+2. **E2E 侧翻盘有量级**：但**全部来自消灭每步 ~2.5 ms 的 host 开销**，而这部分
+   cudagraph 同样在付——所以真正的对手不是"megakernel vs cudagraph"，而是
+   "谁能把每步 host 从 2.5 ms 压到 0"。megakernel 已经把答案做出来了（b1 的
+   persistent + 设备侧 EOS），问题是**它的 device 侧在 batch>1 时慢了 128x**
+   （b8：98.5 vs 0.77 ms），把 host 的红利全吃掉了。
+3. **所以高并发下唯一有意义的目标**是：**把 batch>1 的 device 侧从 98.5 ms
+   拉回 ~1 ms**（即跨过"固定 grid 按序列切分 + 逐层 barrier 串行"这道坎），
+   而不是去追求 device 侧超过 cuBLAS。这道坎就是 docs/06 的 R3（去逐层
+   grid.sync，MPK 方向），量级上是**两个数量级的工作量**，且不保证成功。
+
+### 10.4 必须先做的证伪实验（成本很低，决定后面做不做）
+
+在动 kernel 之前，先用两个便宜实验判定"device 侧能不能拉回 ~1 ms"：
+
+| 实验 | 怎么测 | 判据 |
+|---|---|---|
+| **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** |
+| **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.503 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来解释 10.2 里"0.74 ms 意味着 2.03 TB/s（超过 A100 规格）"这个矛盾——**要么 nsys 的 0.74 只覆盖了部分 kernel，要么这台机器的实际带宽高于规格** |
+| **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快"，同时说明 §9.8 象限 D（CG 无法把 N 步塞进一个 graph） |
+
+**10.2 的表里有一个必须解决的内部矛盾**：0.74 ms/step 流 1.503 GB 需要
+2.03 TB/s，超过 A100 HBM2e 的 1.555 TB/s 规格。`tools/account_decode.py` 与
+`tools/bench_roofline_a100.py` 的 A/B/C 三个实验就是来解决它的。**在解决之前，
+"cudagraph 已贴带宽墙"这一条只能算"强假设"而不是"已证事实"**——
+但无论哪个方向被证实，"可赚的是 host 开销"这个结论都不变（因为无论 device 侧
+是 0.74 还是 1.5 ms，host 残差都在 1.5-2.8 ms 量级）。
+
+
