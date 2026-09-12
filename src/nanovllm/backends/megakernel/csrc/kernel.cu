@@ -2145,7 +2145,12 @@ __global__ void ldg_update_step_batch(
         continue;
       int tok = lm_output[s];
       output_log[s * max_steps + step] = tok;
-      if (tok == eos_token) {
+      // eos_token < 0 means "never deactivate" (ignore_eos), matching
+      // ldg_update_step above.  This is what lets the burst path serve
+      // ignore_eos workloads, which is what makes the megakernel-vs-cudagraph
+      // A/B fair: the controlled benchmark suites run with ignore_eos=True, so
+      // before this the burst could never be exercised by them.
+      if (eos_token >= 0 && tok == eos_token) {
         d_active[s] = 0;
       } else {
         d_tokens[s] = tok;

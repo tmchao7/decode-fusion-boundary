@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.burst_policy import burst_batch_eligibility
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.metrics import CudaEventTimer, MetricsCollector, nvtx_range
@@ -17,6 +18,7 @@ from nanovllm.utils.distributed import build_init_method
 
 
 class LLMEngine:
+
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
@@ -73,13 +75,11 @@ class LLMEngine:
         return seq
 
     def _should_burst(self) -> bool:
-        """Whether the next ``step`` can use the no-sync megakernel burst path."""
-        if not getattr(self.config, "megakernel_burst", False):
-            return False
-        if self.config.decode_backend != "megakernel":
-            return False
-        if self.config.megakernel_batch_kernel != "wmma":
-            return False
+        """Whether the next ``step`` can use the no-sync megakernel burst path.
+
+        Runtime preconditions (extension healthy, nothing waiting) plus the
+        pure batch-shape policy in :func:`burst_batch_eligibility`.
+        """
         mr = self.model_runner
         if mr.megakernel is None or mr.megakernel.disabled_reason:
             return False
@@ -87,22 +87,10 @@ class LLMEngine:
             return False
         if self.scheduler.waiting:
             return False
-        if not self.scheduler.running:
-            return False
-        for seq in self.scheduler.running:
-            if not seq.is_greedy:
-                return False
-            if seq.ignore_eos:
-                # The device-side EOS kernel always deactivates on EOS; until
-                # per-seq ignore_eos flags are plumbed through, fall back.
-                return False
-        # Hybrid architecture: batch>1 defaults to cudagraph unless
-        # megakernel_batch_decode explicitly forces the megakernel batch path.
-        if len(self.scheduler.running) > 1 and not getattr(
-            self.config, "megakernel_batch_decode", False
-        ):
-            return False
-        return True
+        eligible, _ = burst_batch_eligibility(
+            self.config, self.scheduler.running
+        )
+        return eligible
 
     def _step_burst(self, metrics: MetricsCollector | None):
         """Execute one no-sync burst and return ``(outputs, num_tokens)``."""

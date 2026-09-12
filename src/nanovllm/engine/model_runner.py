@@ -9,6 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.backends.megakernel import MegakernelBackend
+from nanovllm.engine.burst_policy import burst_eos_token
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -193,7 +194,16 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        # Pad with physical block 0, not -1.  Short sequences get their table
+        # right-padded so the batch is rectangular.  The torch path is safe
+        # either way (flash-attn bounds every read with cache_seqlens, and the
+        # CUDA-graph path zeroes its own block_tables buffer), but the megakernel
+        # consumes this tensor directly and addresses KV slots as
+        # `block_table[position // block_size] * ...`.  A -1 there indexes
+        # *before* the cache allocation, so a read past a sequence's own length
+        # (or any future shared cache_len) becomes an out-of-bounds device read.
+        # Block 0 is allocated to every sequence, so it is always a valid target.
+        block_tables = [seq.block_table + [0] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -357,9 +367,15 @@ class ModelRunner:
         table is fixed for the whole span. Returns ``[seq][max_steps]`` raw
         token log; the scheduler ``postprocess_burst`` truncates at EOS /
         max_tokens.
+
+        When every selected sequence ignores EOS, pass the -1 sentinel so the
+        device-side update never deactivates and the burst runs the full
+        ``max_steps``. ``_should_burst`` only selects such a batch when *all*
+        sequences ignore EOS, so a single batch-wide flag is sufficient.
         """
         self.last_backend_used = "torch"
         self.last_fallback_reason = None
+        eos_token = burst_eos_token(self.config, seqs)
         try:
             with nvtx_range("megakernel_burst"):
                 block_tables = self.prepare_block_tables(seqs)
@@ -367,7 +383,7 @@ class ModelRunner:
                     seqs,
                     block_tables,
                     max_steps,
-                    self.config.eos,
+                    eos_token,
                 )
         except Exception as exc:
             # The kernel has already started (and may have written to the

@@ -642,6 +642,58 @@ megakernel 若能追平 device 侧: 0.97 + ~0.3 (barrier) + ~0 = ~1.3 ms/step
 但无论哪个方向被证实，"可赚的是 host 开销"这个结论都不变（因为无论 device 侧
 是 0.74 还是 1.5 ms，host 残差都在 1.5-2.8 ms 量级）。
 
+### 10.6 对比公平性审计（第 8 轮新增）
+
+"megakernel vs cudagraph" 的两张表（`benchmarks/compare.py` 的 A/B 表、
+`tools/bench_burst_batch.py` 的 crossover 表）**测的不是同一条 megakernel 路径**，
+这会让结论被误读。以下三点必须在报告里写清。
+
+**(a) 主 A/B 表从未真正测到 burst 路径（已修）**
+
+`megakernel-burst` 后端配置了 `megakernel_burst=True`，但 `_should_burst` 原先
+**只要有一条序列 `ignore_eos=True` 就回退**；而 `benchmarks/compare.py` 的
+performance / realistic 两个套件都用 `ignore_eos=True`（为了固定生成长度）。
+结果是：主表里的 megakernel 走的是 **step-wise 路径（每步一次主机同步）**，
+根本不是它最强的那条路。而 crossover 表用的是 `ignore_eos=False` 的 burst 路径。
+→ **两张表的 megakernel 不是同一个东西。**
+
+修复：设备侧 EOS 现在把 `eos_token < 0` 当作"永不停止"，`_should_burst` 允许
+**整批都 ignore_eos** 的批走 burst（混合批仍回退，因为设备侧 EOS 标志是批级、
+无法表达逐序列语义），`run_burst` 在这种批上传 `-1`。判定逻辑抽到
+`src/nanovllm/engine/burst_policy.py`（torch-free，可单测）。
+
+**(b) cudagraph batch padding（cudagraph batch padding）**
+
+torch 路径按 `graph_bs = [1, 2, 4, 8] + range(16, max_bs + 1, 16)`
+（`model_runner.py` 的 `capture_cudagraph`）预捕获，replay 时取第一个 `>=` 实际
+batch 的 graph（`next(x for x in self.graph_bs if x >= bs)`）。所以 **非桶大小的批要
+付 padding**：batch=10 会 replay graph 16，计算量 +60%；batch=9..15 同理。
+这是 vLLM 的标准做法、是**合法**的，但对比时必须说清：megakernel 是**精确 batch**，
+cudagraph 是**向上取桶**。要公平比较就得选桶大小（1/2/4/8/16/32）做点，
+或者把 padding 折算进 cudagraph 的每 token 成本。
+
+**(c) 硬件加速资源的覆盖不对称**
+
+| 算子 | cudagraph（torch） | megakernel（WMMA batch） |
+|---|---|---|
+| QKV/O/Gate/Up/Down | cuBLAS（tensor core） | WMMA m16n16k16（tensor core） |
+| Attention QK/PV | **FlashAttention（tensor core）** | **scalar** |
+| LM head | **cuBLAS（tensor core）** | **scalar FMA + 融合 argmax** |
+
+也就是说：**megakernel 是在"两个最大的算子仍用 scalar"的前提下和"全 tensor core +
+FMHA"的 cudagraph 比**。这一点让"megakernel 打不过"的结论更保守（对 megakernel
+有利的解读是：它还没用满硬件），但也说明**如果目标是公平比较 kernel 质量，应该先
+把 attention 和 LM head 也上张量核**，再谈 batch>1 的架构问题（docs/06 的 R3 之前，
+P1 项）。
+
+**(d) 复现口径**
+
+- burst 路径需要 `ignore_eos=False`（crossover 表）或整批 `ignore_eos=True`（现已支持）；
+- `tools/bench_burst_batch.py` 已设 `megakernel_batch_decode=True`，所以 batch≤10
+  走的是**真并行** batch kernel（不是串行 burst）；
+- batch>8 因 `burst_batch=8` 被拆成多次串行 burst（`serial_chunks`），比较时按
+  "每 step 处理多少序列"折算，不要直接比 ms/tok。
+
 ### 10.5 复现方式（不需要重跑就能先看现有数据）
 
 - `tools/account_decode.py` 直接吃两类 JSON：`benchmarks.compare --json`（有实测

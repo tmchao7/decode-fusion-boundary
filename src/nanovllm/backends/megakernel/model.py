@@ -514,8 +514,10 @@ class Decoder:
         ``[start_position, start_position + num_tokens)`` must already be
         allocated (the block table is fixed over the span). When
         ``eos_token >= 0`` the kernel deactivates on EOS and writes -1
-        sentinels for the remaining steps; the caller truncates. Returns the
-        raw token list (with -1 past EOS) after a single host sync.
+        sentinels for the remaining steps; the caller truncates.  When
+        ``eos_token < 0`` (ignore_eos) it never deactivates, so all
+        ``num_tokens`` steps run.  Returns the raw token list (with -1 past
+        EOS) after a single host sync.
         """
         if not self._paged:
             raise RuntimeError("generate_paged() requires paged KV cache mode")
