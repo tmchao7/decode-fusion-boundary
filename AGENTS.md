@@ -8,7 +8,9 @@
 - `examples/basic_generation.py` is the smallest end-to-end inference example; `benchmarks/` contains batch and Megakernel benchmarks.
 - `src/nanovllm/backends/megakernel/` contains the Qwen CUDA kernel, C++ bindings, build helper, and backend adapter; changes there require server-side CUDA tooling.
 - `docs/` contains the paged-KV design, A100/V100 server runbook, and Chinese metric/baseline/benchmark notes; `tools/` contains correctness and visualization utilities.
-- `docs/07_架构结论_megakernel为何打不过cudagraph.md` is the authoritative record for the Megakernel-vs-CUDA-Graph question (currently v6). Before proposing a batch>1 kernel rewrite, read its §10 ledger and §10.4 decision rule: the device side has no headroom to win, so the only recoverable cost is per-step host overhead.
+- `docs/` is an ordered 10-document set. **`docs/10_交接文档.md` is the entry point for a new agent**: it records what each recent round did (with commits), the ordered next steps, what not to do, and a ranked list of unverified/suspicious items. Update it at the end of every round.
+- `docs/07_架构结论_megakernel为何打不过cudagraph.md` is the authoritative root-cause record for the Megakernel-vs-CUDA-Graph question (currently v6). Before proposing a batch>1 kernel rewrite, read its §10 ledger and §10.4 decision rule: the device side has no headroom to win, so the only recoverable cost is per-step host overhead.
+- `docs/06_实际运行数据.md` separates **measured** / **needs-calibration** / **pending** numbers; never mix them. `docs/05_对比基线与公平性.md` lists the three asymmetries (burst vs step-wise path, cudagraph bucket padding, scalar attention+LM head) that the comparison must disclose.
 
 ## Build, Test, and Development Commands
 
