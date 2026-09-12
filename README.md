@@ -148,3 +148,22 @@ python -m compileall src/nanovllm benchmarks tools
 - [多 batch 为何打不过 cudagraph](docs/07_多batch为何打不过cudagraph.md)：第 6 版，含 host/device 账本与高并发可行性判定；
 - [高并发判定任务书](docs/09_高并发判定任务书.md)：跑什么 / 看什么 / 怎么判（决定是否投入 R3 的唯一入口）；
 - [服务器命令清单](SERVER_COMMANDS.txt)：可直接复制执行的服务器命令。
+
+## Host/Device Accounting and the High-Batch Verdict
+
+`tools/account_decode.py` splits each measured decode step into wall time, GPU
+time and host residual (and reads both the `benchmarks.compare` and
+`bench_burst_batch` JSON schemas). `tools/verdict.py` turns the probe outputs
+into a reproducible binary verdict — `DEVICE_RECOVERABLE`, `DEVICE_AT_FLOOR`,
+`DEVICE_UNREACHABLE`, `DEVICE_BORDERLINE`, `NEEDS_CALIBRATION` or
+`NEEDS_DATA` — with the thresholds locked by `tests/test_verdict.py`.
+
+```bash
+python -m nanovllm.roofline --batch-sizes 1,8,32 --seq-len 160 --check-kernel
+python -m tools.account_decode results/a100_account.json --seq-len 160
+python -m tools.verdict --results-dir results
+```
+
+The verdict tool deliberately reports `NEEDS_DATA` rather than guessing when a
+probe has not run, and `DEVICE_AT_FLOOR` when the measured device time already
+sits near the floor (probe fast does not imply a win).

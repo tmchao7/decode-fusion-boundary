@@ -1,0 +1,305 @@
+"""Tests for tools/verdict.py: the mechanical high-batch decision.
+
+The thresholds are the contract in docs/09, so they are tested against
+synthetic evidence covering every branch of the verdict tree -- including the
+cases that must *refuse* to promise a speedup.
+"""
+
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT))
+
+from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel  # noqa: E402
+from tools.verdict import (  # noqa: E402
+    VERDICT_DEVICE_AT_FLOOR,
+    VERDICT_DEVICE_RECOVERABLE,
+    VERDICT_DEVICE_UNREACHABLE,
+    VERDICT_NEEDS_CALIBRATION,
+    VERDICT_NEEDS_DATA,
+    compute_verdict,
+    render_markdown,
+)
+
+FLOOR_MS = 0.967  # 1.503 GB / 1555 GB/s
+
+
+def _lower_bound(ms_per_step: float, batches=(1, 8, 32)) -> dict:
+    return {
+        "lower_bound_probe": {
+            "rows": [
+                {
+                    "batch_size": batch,
+                    "ms_per_step_mean": ms_per_step,
+                    "verdict": "x",
+                }
+                for batch in batches
+            ]
+        }
+    }
+
+
+def _roofline(bandwidth_gbps: float | None, barrier_ms: float = 0.548) -> dict:
+    report = {
+        "device": {"spec_bandwidth_gbps": 1555.0},
+        "barrier": {"ms_per_step_estimate": barrier_ms},
+    }
+    if bandwidth_gbps is not None:
+        report["bandwidth"] = {"best_gbps": bandwidth_gbps}
+    return report
+
+
+def _account(gpu_ms: float, host_ms: float, backend: str = "megakernel-burst",
+             batch: int = 8) -> dict:
+    return {
+        "rows": [
+            {
+                "workload_id": f"crossover_b{batch}",
+                "backend_actual": backend,
+                "batch_size": batch,
+                "ms_per_step_wall": gpu_ms + host_ms,
+                "ms_per_step_gpu": gpu_ms,
+                "host_residual_ms": host_ms,
+                "device_source": "measured",
+            }
+        ]
+    }
+
+
+class VerdictBranchTests(unittest.TestCase):
+    def test_no_probe_is_needs_data(self) -> None:
+        verdict = compute_verdict(roofline=_roofline(1600.0))
+        self.assertEqual(verdict.verdict, VERDICT_NEEDS_DATA)
+        self.assertIn("has not run", verdict.headline)
+
+    def test_probe_without_bandwidth_is_needs_calibration(self) -> None:
+        """A recoverable-looking floor is still untrustworthy uncalibrated."""
+
+        verdict = compute_verdict(
+            roofline=_roofline(None), lower_bound=_lower_bound(1.2)
+        )
+        self.assertEqual(verdict.verdict, VERDICT_NEEDS_CALIBRATION)
+        self.assertIn("1.200", verdict.headline)
+
+    def test_probe_above_stop_threshold_is_unreachable(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0), lower_bound=_lower_bound(4.0)
+        )
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_UNREACHABLE)
+        self.assertTrue(
+            any("stop the batch>1 kernel rewrite" in action for action in verdict.actions)
+        )
+
+    def test_probe_between_thresholds_is_borderline(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0), lower_bound=_lower_bound(2.2)
+        )
+        self.assertEqual(verdict.verdict, "DEVICE_BORDERLINE")
+        self.assertTrue(
+            any("narrower justification" in action for action in verdict.actions)
+        )
+
+    def test_recoverable_probe_with_real_gap_is_recoverable(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_RECOVERABLE)
+        self.assertAlmostEqual(verdict.device.probe_ms_per_step, 1.1, places=3)
+        self.assertAlmostEqual(verdict.device.measured_ms_per_step, 98.5, places=3)
+
+    def test_recoverable_probe_but_device_at_floor_reports_host_only(self) -> None:
+        """Honesty guard: no device-side promise when the gap is already closed."""
+
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=1.2, host_ms=2.5),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_AT_FLOOR)
+        self.assertIn("host overhead", verdict.headline)
+        self.assertTrue(
+            any("host overhead" in action for action in verdict.actions)
+        )
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_contradiction_detected_from_documented_074ms(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+        )
+        self.assertTrue(verdict.calibration.contradiction_present)
+        self.assertAlmostEqual(
+            verdict.calibration.implied_bandwidth_gbps, 2031.0, delta=5.0
+        )
+
+    def test_contradiction_absent_when_device_is_above_floor(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=2.0, host_ms=1.5),
+        )
+        self.assertFalse(verdict.calibration.contradiction_present)
+        self.assertIsNone(verdict.calibration.implied_bandwidth_gbps)
+
+    def test_measured_bandwidth_resolves_calibration(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1750.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+        )
+        self.assertTrue(verdict.calibration.resolved)
+        self.assertEqual(verdict.calibration.measured_bandwidth_gbps, 1750.0)
+        self.assertTrue(any("NOT reachable" in note for note in verdict.calibration.notes))
+
+    def test_needs_calibration_mentions_the_implied_rate(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(None),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_NEEDS_CALIBRATION)
+        self.assertTrue(any("2031" in action for action in verdict.actions))
+
+
+class DeviceRowSelectionTests(unittest.TestCase):
+    def test_megakernel_rows_preferred_over_cudagraph(self) -> None:
+        account = {
+            "rows": [
+                {**_account(0.77, 2.66, backend="torch", batch=8)["rows"][0]},
+                {**_account(98.5, 1.0, backend="megakernel-burst", batch=8)["rows"][0]},
+            ]
+        }
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=account,
+        )
+        self.assertEqual(verdict.device.measured_backend, "megakernel-burst")
+        self.assertAlmostEqual(verdict.device.measured_ms_per_step, 98.5, places=3)
+
+    def test_batch1_is_ignored_for_the_batch_gt_1_question(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=1.89, host_ms=0.4, backend="megakernel", batch=1),
+        )
+        self.assertIsNone(verdict.device.measured_ms_per_step)
+
+    def test_probe_floor_uses_the_fastest_row(self) -> None:
+        lower_bound = {
+            "lower_bound_probe": {
+                "rows": [
+                    {"batch_size": 1, "ms_per_step_mean": 1.30},
+                    {"batch_size": 8, "ms_per_step_mean": 1.05},
+                    {"batch_size": 32, "ms_per_step_mean": 1.12},
+                ]
+            }
+        }
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0), lower_bound=lower_bound
+        )
+        self.assertAlmostEqual(verdict.device.probe_ms_per_step, 1.05, places=3)
+        self.assertEqual(verdict.device.probe_batch_sizes, [1, 8, 32])
+
+
+class ReportTests(unittest.TestCase):
+    def test_markdown_carries_verdict_evidence_and_actions(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0), lower_bound=_lower_bound(4.0)
+        )
+        text = render_markdown(verdict)
+        self.assertIn(VERDICT_DEVICE_UNREACHABLE, text)
+        self.assertIn("## Evidence", text)
+        self.assertIn("## Actions", text)
+        self.assertIn("device lower bound probe", text)
+
+    def test_json_round_trips_all_fields(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        payload = json.loads(json.dumps(verdict.to_dict()))
+        self.assertEqual(payload["verdict"], VERDICT_DEVICE_RECOVERABLE)
+        self.assertAlmostEqual(payload["device"]["probe_ms_per_step"], 1.1, places=3)
+        self.assertIn("calibration", payload)
+
+
+class CliTests(unittest.TestCase):
+    def _write(self, directory: Path, name: str, payload: dict) -> None:
+        (directory / name).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_cli_defaults_to_results_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results = Path(tmpdir)
+            self._write(results, "a100_roofline_probe.json", _roofline(1600.0))
+            self._write(results, "a100_lower_bound.json", _lower_bound(4.0))
+            self._write(
+                results, "a100_account_breakdown.json", _account(98.5, 1.0)
+            )
+            out = results / "verdict.json"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tools.verdict",
+                    "--results-dir",
+                    str(results),
+                    "--json",
+                    str(out),
+                ],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                env={
+                    "PYTHONPATH": f"{REPO_ROOT / 'src'}:{REPO_ROOT}",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
+            self.assertIn(proc.returncode, (0, 1), proc.stderr)
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(payload["verdict"], VERDICT_DEVICE_UNREACHABLE)
+
+    def test_cli_without_inputs_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc = subprocess.run(
+                [sys.executable, "-m", "tools.verdict", "--results-dir", tmpdir],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                env={
+                    "PYTHONPATH": f"{REPO_ROOT / 'src'}:{REPO_ROOT}",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("no probe inputs found", proc.stderr)
+
+
+class ThresholdAlignmentTests(unittest.TestCase):
+    def test_thresholds_match_the_documented_floor(self) -> None:
+        model = RooflineModel(ModelDims(), HardwareSpec())
+        floor = model.weight_bytes() / (
+            model.hardware.effective_bandwidth_gbps() * 1e9
+        ) * 1000.0
+        self.assertAlmostEqual(floor, FLOOR_MS, places=3)
+        # The recoverable threshold must sit above the physical floor, and the
+        # stop threshold above that, or the decision tree is nonsensical.
+        from tools.verdict import RECOVERABLE_MS, STOP_MS
+
+        self.assertGreater(RECOVERABLE_MS, floor)
+        self.assertGreater(STOP_MS, RECOVERABLE_MS)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -282,6 +282,7 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | 待跑（`tools/bench_burst_lower_bound.py`） | **判据：≤1.5 ms 才做 R3；>3 ms 判定高并发翻盘不可行（§10.4）** |
 | **实验 B：可达带宽标定**（1.503 GB `__ldg` 流式读） | 待跑（`tools/bench_roofline_a100.py`） | 解决"0.74 ms ⇒ 2.03 TB/s 超规格"的矛盾（§10.4） |
 | **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | 待跑（`tools/bench_burst_lower_bound.py`） | 给出 host 全消除后 cudagraph 的上界（§9.8 象限 D） |
+| **二值判定工具**（`tools/verdict.py` + `tests/test_verdict.py`） | ✅ 已落地（18 个单测覆盖全部分支） | 六种 verdict 枚举；probe/带宽/账号任一缺失即 `NEEDS_DATA`，不猜结论 |
 
 ## 7. 结论（更新为可执行判语）
 
@@ -658,6 +659,12 @@ megakernel 若能追平 device 侧: 0.97 + ~0.3 (barrier) + ~0 = ~1.3 ms/step
   而是"这一行的 headroom 在标定前别信"的强制提示。
 - 服务器上一条命令：`RUN_MODE=account bash SERVER_COMMANDS.txt`（会跑对比 +
   账本 + roofline 表；`crossover_scan.json` 存在时自动并入）。
+- **判定由代码给出，不由人读日志给出**：`tools/verdict.py` 读这三个 JSON，按 §10.4
+  的阈值输出 `DEVICE_RECOVERABLE / DEVICE_AT_FLOOR / DEVICE_UNREACHABLE /
+  DEVICE_BORDERLINE / NEEDS_CALIBRATION / NEEDS_DATA` 六种枚举之一，并附证据与行动；
+  阈值分支由 `tests/test_verdict.py` 的 18 个测试锁定。其中 `DEVICE_AT_FLOOR` 是
+  诚实护栏：probe 快 ≠ 有收益，若现有 kernel 已在下界附近，结论必须落在 host 侧。
+  完整用法见 [docs/09](09_高并发判定任务书.md) §3。
 
 
 

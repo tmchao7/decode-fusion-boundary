@@ -409,6 +409,19 @@ run_account() {
     --check-kernel \
     --json results/a100_roofline_model.json
 
+  # 4. Compute the binary verdict from whatever probe data exists.  Missing
+  #    inputs are reported as NEEDS_DATA instead of guessing, so this can run
+  #    before or after RUN_MODE=roofline.  Exit code is 0 for a
+  #    recoverable/at-floor verdict and 1 otherwise; the JSON is the contract.
+  set +e
+  python -m tools.verdict \
+    --results-dir results \
+    --json results/a100_verdict.json \
+    --markdown results/a100_verdict.md \
+    2>&1 | tee results/a100_verdict.log
+  echo "verdict exit code: ${PIPESTATUS[0]} (see results/a100_verdict.md)"
+  set -e
+
   # Decision rule (docs/07 section 10): if the fastest backend's step time is
   # dominated by host residual, the recoverable cost is host-side for BOTH
   # backends, and the megakernel question is not a device-side race.
@@ -447,9 +460,27 @@ run_roofline() {
     --replays 50 \
     --json results/a100_lower_bound.json \
     2>&1 | tee results/a100_lower_bound.log
+
+  # Compute the binary verdict now that both probe inputs exist.  Missing
+  # inputs report NEEDS_DATA rather than guessing.
+  set +e
+  python -m tools.verdict \
+    --results-dir results \
+    --json results/a100_verdict.json \
+    --markdown results/a100_verdict.md \
+    2>&1 | tee results/a100_verdict.log
+  echo "verdict exit code: ${PIPESTATUS[0]}"
+  set -e
+
+  echo "Send back results/a100_verdict.json plus a100_roofline_probe.log," \
+       "a100_lower_bound.log and (after RUN_MODE=account) a100_account_breakdown.md."
 }
 
 run_profile() {
+  mkdir -p results
+  verify_environment
+  verify_extension_import
+  # nsys is safe (trace-only, no kernel replay).
   nsys profile --trace=cuda,nvtx --sample=none \
     --output=results/a100_megakernel_nsys \
     python -m benchmarks.compare \

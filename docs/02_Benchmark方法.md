@@ -181,7 +181,9 @@ anchor 优先用实测 GPU 时间，没有则退回 0.967 ms/step 的权重下�
 
 完整的"跑什么 / 看什么 / 怎么判"见 [docs/09 高并发判定任务书](09_高并发判定任务书.md)；
 它把 `RUN_MODE=roofline` 与 `RUN_MODE=account` 的产出文件、判据阈值和停止规则写在
-一处，是决定是否投入 R3 的唯一入口。
+一处，是决定是否投入 R3 的唯一入口。判定本身由 `tools/verdict.py` 机械计算
+（输入上面三个 JSON，输出 `results/a100_verdict.json` + `.md`），阈值与分支由
+`tests/test_verdict.py` 锁定，因此结论可复现、不依赖人工读日志。
 
 ## 报告要求
 

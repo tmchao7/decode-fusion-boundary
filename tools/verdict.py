@@ -1,0 +1,494 @@
+"""Compute the high-batch Megakernel verdict from the A100 probe outputs.
+
+docs/09 defines three experiments with hard thresholds.  This tool applies
+them mechanically so the verdict is reproducible rather than hand-derived from
+a log, and so the thresholds can be unit tested on synthetic evidence.
+
+Inputs (all written by ``RUN_MODE=roofline`` / ``RUN_MODE=account``)::
+
+    results/a100_roofline_probe.json   # bandwidth, real weights, host, barrier
+    results/a100_lower_bound.json      # device lower bound probe + host-free graph
+    results/a100_account_breakdown.json  # per-step host/device ledger
+
+The decision hierarchy follows docs/09:
+
+1. **Bandwidth calibration first.**  If the measured per-step device time is
+   below the weight floor, the timing cannot cover a whole step (or the device
+   exceeds its spec bandwidth).  Until the measured attainable bandwidth is
+   known, no headroom claim is trustworthy and the verdict is
+   ``NEEDS_CALIBRATION``.
+2. **Device lower bound is the gate.**  ``<= 1.5`` ms/step means the batch>1
+   device side is recoverable and the R3 rewrite is worth attempting; ``> 3``
+   ms/step means the high-batch crossover is not achievable and the rewrite
+   must stop.
+3. **Measured vs probe** distinguishes "headroom is in the device side" from
+   "the device side is already there, so only host overhead remains".
+
+Honesty rules baked in: the verdict only claims what the data supports.  A
+recoverable probe does *not* by itself promise a speedup unless the measured
+Megakernel device time is clearly above the probe floor; and the device-side
+statement is always conditional on the calibration outcome.
+
+Usage::
+
+    python -m tools.verdict --roofline results/a100_roofline_probe.json \
+        --lower-bound results/a100_lower_bound.json \
+        --account results/a100_account_breakdown.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel  # noqa: E402
+
+# docs/09 section 2 thresholds, in ms per decode step.
+RECOVERABLE_MS = 1.5
+STOP_MS = 3.0
+
+# A measured device time within this factor of the probe floor means the device
+# side is already at its lower bound, so there is no device-side work left.
+DEVICE_AT_FLOOR_RATIO = 1.25
+
+VERDICT_NEEDS_DATA = "NEEDS_DATA"
+VERDICT_NEEDS_CALIBRATION = "NEEDS_CALIBRATION"
+VERDICT_DEVICE_RECOVERABLE = "DEVICE_RECOVERABLE"
+VERDICT_DEVICE_AT_FLOOR = "DEVICE_AT_FLOOR"
+VERDICT_DEVICE_UNREACHABLE = "DEVICE_UNREACHABLE"
+
+
+@dataclass
+class Calibration:
+    measured_bandwidth_gbps: float | None = None
+    spec_bandwidth_gbps: float | None = None
+    implied_bandwidth_gbps: float | None = None
+    contradiction_present: bool = False
+    resolved: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DeviceEvidence:
+    probe_ms_per_step: float | None = None
+    probe_batch_sizes: list[int] = field(default_factory=list)
+    measured_ms_per_step: float | None = None
+    measured_backend: str | None = None
+    measured_batch: int | None = None
+    measured_host_residual_ms: float | None = None
+    barrier_ms_per_step: float | None = None
+
+
+@dataclass
+class Verdict:
+    verdict: str
+    headline: str
+    rationale: list[str]
+    actions: list[str]
+    calibration: Calibration
+    device: DeviceEvidence
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "headline": self.headline,
+            "rationale": self.rationale,
+            "actions": self.actions,
+            "calibration": asdict(self.calibration),
+            "device": asdict(self.device),
+        }
+
+
+def _load(path: str | None) -> dict | None:
+    if not path:
+        return None
+    candidate = Path(path)
+    if not candidate.exists():
+        return None
+    return json.loads(candidate.read_text(encoding="utf-8"))
+
+
+def _bandwidth_gbps(roofline: dict | None) -> float | None:
+    if not roofline:
+        return None
+    measured = (roofline.get("bandwidth") or {}).get("best_gbps")
+    if measured:
+        return float(measured)
+    return (roofline.get("roofline_with_measured_bandwidth") or {}).get(
+        "bandwidth_gbps"
+    )
+
+
+def _probe_ms_per_step(lower_bound: dict | None) -> tuple[float | None, list[int]]:
+    if not lower_bound:
+        return None, []
+    rows = ((lower_bound.get("lower_bound_probe") or {}).get("rows")) or []
+    usable = [
+        row
+        for row in rows
+        if isinstance(row.get("ms_per_step_mean"), (int, float))
+        and row["ms_per_step_mean"] > 0
+    ]
+    if not usable:
+        return None, []
+    batches = [int(row.get("batch_size") or 0) for row in usable]
+    # The floor is batch-independent (weights are shared), so take the fastest
+    # observed row as the probe's answer.
+    return min(float(row["ms_per_step_mean"]) for row in usable), batches
+
+
+def _measured_device_row(
+    account: dict | None, model: RooflineModel
+) -> tuple[dict | None, float | None]:
+    """Pick the measured batch>1 row with the largest device time.
+
+    That is the row a batch>1 fused kernel would have to replace, so it is the
+    right comparison for "is the device side already at the floor?".
+    """
+
+    if not account:
+        return None, None
+    rows = account.get("rows") or []
+    # Megakernel rows when present, else any batch>1 row with a measured GPU time.
+    candidates = [
+        row
+        for row in rows
+        if int(row.get("batch_size") or 0) > 1
+        and row.get("device_source") == "measured"
+        and (row.get("ms_per_step_gpu") or 0) > 0
+    ]
+    if not candidates:
+        return None, None
+    megakernel = [row for row in candidates if "megakernel" in str(row.get("backend_actual"))]
+    pool = megakernel or candidates
+    row = max(pool, key=lambda item: item["ms_per_step_gpu"])
+    floor_ms = (
+        model.weight_bytes()
+        / (model.hardware.effective_bandwidth_gbps() * 1e9)
+        * 1000.0
+    )
+    implied = model.weight_bytes() / (row["ms_per_step_gpu"] / 1000.0) / 1e9
+    return row, implied if row["ms_per_step_gpu"] < floor_ms else None
+
+
+def compute_verdict(
+    *,
+    roofline: dict | None = None,
+    lower_bound: dict | None = None,
+    account: dict | None = None,
+    model: RooflineModel | None = None,
+    recoverable_ms: float = RECOVERABLE_MS,
+    stop_ms: float = STOP_MS,
+) -> Verdict:
+    model = model or RooflineModel(ModelDims(), HardwareSpec())
+    spec_bw = model.hardware.effective_bandwidth_gbps()
+    weight_gb = model.weight_bytes() / 1e9
+    spec_floor_ms = model.weight_bytes() / (spec_bw * 1e9) * 1000.0
+
+    measured_bw = _bandwidth_gbps(roofline)
+    probe_ms, probe_batches = _probe_ms_per_step(lower_bound)
+    measured_row, implied_bw = _measured_device_row(account, model)
+
+    calibration = Calibration(
+        measured_bandwidth_gbps=measured_bw,
+        spec_bandwidth_gbps=spec_bw,
+        implied_bandwidth_gbps=implied_bw,
+        contradiction_present=implied_bw is not None and implied_bw > spec_bw,
+    )
+    # The contradiction counts as resolved once the attainable bandwidth is
+    # measured: either it explains the implied rate, or it proves the timing
+    # only covered part of the step.
+    calibration.resolved = measured_bw is not None
+    if measured_bw is None:
+        calibration.notes.append(
+            "no measured bandwidth: run RUN_MODE=roofline and pass "
+            "--roofline results/a100_roofline_probe.json"
+        )
+    elif calibration.contradiction_present:
+        reachable = measured_bw >= implied_bw
+        calibration.notes.append(
+            f"recorded device time implies {implied_bw:.0f} GB/s while the "
+            f"measured attainable bandwidth is {measured_bw:.0f} GB/s: that rate "
+            f"is {'reachable' if reachable else 'NOT reachable'} on this machine, "
+            "so the recorded timing "
+            + (
+                "covers the whole step and the device really is at the HBM wall"
+                if reachable
+                else "cannot cover a whole step (it only timed part of the kernels)"
+            )
+        )
+
+    device = DeviceEvidence(
+        probe_ms_per_step=probe_ms,
+        probe_batch_sizes=probe_batches,
+        measured_ms_per_step=(
+            float(measured_row["ms_per_step_gpu"]) if measured_row else None
+        ),
+        measured_backend=(
+            str(measured_row.get("backend_actual")) if measured_row else None
+        ),
+        measured_batch=(int(measured_row["batch_size"]) if measured_row else None),
+        measured_host_residual_ms=(
+            float(measured_row["host_residual_ms"]) if measured_row else None
+        ),
+        barrier_ms_per_step=(
+            float((roofline or {}).get("barrier", {}).get("ms_per_step_estimate"))
+            if (roofline or {}).get("barrier", {}).get("ms_per_step_estimate")
+            else None
+        ),
+    )
+
+    rationale: list[str] = []
+    actions: list[str] = []
+
+    if probe_ms is None:
+        rationale.append(
+            "no device lower-bound probe result: the decisive experiment has not "
+            "run, so no high-batch verdict can be issued"
+        )
+        actions.append("run RUN_MODE=roofline and pass --lower-bound")
+        if not calibration.resolved:
+            return Verdict(
+                VERDICT_NEEDS_DATA,
+                "Insufficient data: the device lower-bound probe has not run.",
+                rationale,
+                actions,
+                calibration,
+                device,
+            )
+        return Verdict(
+            VERDICT_NEEDS_DATA,
+            "Insufficient data: bandwidth is calibrated but the device "
+            "lower-bound probe has not run.",
+            rationale,
+            actions,
+            calibration,
+            device,
+        )
+
+    rationale.append(
+        f"device lower bound probe: {probe_ms:.3f} ms/step "
+        f"(no arithmetic, 28 layers of weight streaming + 12 barriers/layer; "
+        f"batches {probe_batches or 'n/a'})"
+    )
+    rationale.append(
+        f"roofline weight floor: {weight_gb:.3f} GB/step at {spec_bw:.0f} GB/s = "
+        f"{spec_floor_ms:.3f} ms"
+    )
+    if device.barrier_ms_per_step is not None:
+        rationale.append(
+            f"barrier budget from the microbenchmark: "
+            f"{device.barrier_ms_per_step:.3f} ms/step (336 grid syncs)"
+        )
+
+    if not calibration.resolved:
+        actions.append(
+            "resolve the calibration first: the recorded device time implies "
+            f"{implied_bw:.0f} GB/s, above the {spec_bw:.0f} GB/s spec"
+            if calibration.contradiction_present
+            else "run RUN_MODE=roofline for the bandwidth section"
+        )
+        return Verdict(
+            VERDICT_NEEDS_CALIBRATION,
+            f"Device side is {probe_ms:.3f} ms/step, but the bandwidth "
+            "contradiction is unresolved, so no headroom claim is trustworthy yet.",
+            rationale,
+            actions,
+            calibration,
+            device,
+        )
+
+    if probe_ms > stop_ms:
+        rationale.append(
+            f"probe {probe_ms:.3f} ms/step > stop threshold {stop_ms:.3f} ms/step: "
+            "a fused kernel cannot even stream the weights faster than this, so "
+            "the batch>1 device side is not recoverable"
+        )
+        actions += [
+            "stop the batch>1 kernel rewrite (docs/07 section 8)",
+            "record the measured floor in docs/07 section 10 and docs/08",
+            "redirect effort to the per-step host overhead, which both backends pay",
+        ]
+        return Verdict(
+            VERDICT_DEVICE_UNREACHABLE,
+            f"High-batch device-side crossover is NOT achievable: the no-arithmetic "
+            f"device floor is already {probe_ms:.3f} ms/step.",
+            rationale,
+            actions,
+            calibration,
+            device,
+        )
+
+    if probe_ms > recoverable_ms:
+        rationale.append(
+            f"probe {probe_ms:.3f} ms/step sits between the recoverable "
+            f"({recoverable_ms:.1f} ms) and stop ({stop_ms:.1f} ms) thresholds"
+        )
+        actions.append(
+            "only attempt R3 with an explicit, narrower justification "
+            "(e.g. also fixing attention/LM head)"
+        )
+        return Verdict(
+            VERDICT_DEVICE_UNREACHABLE if probe_ms > stop_ms else "DEVICE_BORDERLINE",
+            f"High-batch device side is borderline: {probe_ms:.3f} ms/step.",
+            rationale,
+            actions,
+            calibration,
+            device,
+        )
+
+    rationale.append(
+        f"probe {probe_ms:.3f} ms/step <= recoverable threshold "
+        f"{recoverable_ms:.1f} ms/step: a fused kernel could plausibly reach the "
+        "HBM wall at batch>1"
+    )
+    if device.measured_ms_per_step is None:
+        rationale.append(
+            "no measured batch>1 device time available, so the remaining gap "
+            "between the current kernel and the probe floor is unknown"
+        )
+        actions.append(
+            "run RUN_MODE=account and pass --account to size the device-side gap"
+        )
+    else:
+        gap = device.measured_ms_per_step / probe_ms if probe_ms > 0 else float("inf")
+        rationale.append(
+            f"measured batch>1 device time {device.measured_ms_per_step:.3f} ms/step "
+            f"({device.measured_backend}, batch={device.measured_batch}) = "
+            f"{gap:.1f}x the probe floor"
+        )
+        if gap <= DEVICE_AT_FLOOR_RATIO:
+            if device.measured_host_residual_ms is not None:
+                rationale.append(
+                    f"but the recoverable cost is still host-side: "
+                    f"{device.measured_host_residual_ms:.3f} ms/step on that row"
+                )
+            actions.append(
+                "the device side is already at its floor; the remaining win is "
+                "host overhead, not kernel work"
+            )
+            return Verdict(
+                VERDICT_DEVICE_AT_FLOOR,
+                f"Device side is already at the floor ({gap:.1f}x probe); "
+                "only host overhead remains.",
+                rationale,
+                actions,
+                calibration,
+                device,
+            )
+        actions += [
+            "size the R3 rewrite against the probe floor and the barrier budget",
+            "keep the change behind megakernel_batch_decode=True and re-run "
+            "tools/correctness_wmma_vs_scalar.py (PASS/CASCADE/FAIL)",
+        ]
+
+    return Verdict(
+        VERDICT_DEVICE_RECOVERABLE,
+        f"Device-side recovery is plausible: probe floor {probe_ms:.3f} ms/step "
+        f"vs a {stop_ms:.1f} ms stop threshold.",
+        rationale,
+        actions,
+        calibration,
+        device,
+    )
+
+
+def render_markdown(verdict: Verdict) -> str:
+    lines = [
+        f"# High-batch Megakernel verdict: `{verdict.verdict}`",
+        "",
+        f"**{verdict.headline}**",
+        "",
+        "## Evidence",
+        "",
+    ]
+    lines += [f"- {item}" for item in verdict.rationale] or ["- (none)"]
+    lines += ["", "## Actions", ""]
+    lines += [f"1. {item}" for item in verdict.actions] or ["1. (none)"]
+    calibration = verdict.calibration
+    lines += [
+        "",
+        "## Calibration",
+        "",
+        f"- measured attainable bandwidth: "
+        f"{'n/a' if calibration.measured_bandwidth_gbps is None else f'{calibration.measured_bandwidth_gbps:.0f} GB/s'}",
+        f"- spec bandwidth: {calibration.spec_bandwidth_gbps:.0f} GB/s",
+        f"- implied by recorded device time: "
+        f"{'n/a' if calibration.implied_bandwidth_gbps is None else f'{calibration.implied_bandwidth_gbps:.0f} GB/s'}",
+        f"- contradiction present: {calibration.contradiction_present}",
+        f"- resolved: {calibration.resolved}",
+    ]
+    for note in calibration.notes:
+        lines.append(f"- note: {note}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--roofline", default=None, help="a100_roofline_probe.json")
+    parser.add_argument("--lower-bound", dest="lower_bound", default=None,
+                        help="a100_lower_bound.json")
+    parser.add_argument("--account", default=None,
+                        help="a100_account_breakdown.json")
+    parser.add_argument("--results-dir", default=None,
+                        help="default the three inputs to this results/ directory")
+    parser.add_argument("--bandwidth-gbps", type=float, default=None,
+                        help="override the model's spec bandwidth")
+    parser.add_argument("--json", dest="json_out")
+    parser.add_argument("--markdown", dest="markdown_out")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    results_dir = Path(args.results_dir) if args.results_dir else None
+
+    def resolve(explicit: str | None, filename: str) -> str | None:
+        if explicit:
+            return explicit
+        if results_dir and (results_dir / filename).exists():
+            return str(results_dir / filename)
+        return None
+
+    roofline = _load(resolve(args.roofline, "a100_roofline_probe.json"))
+    lower_bound = _load(resolve(args.lower_bound, "a100_lower_bound.json"))
+    account = _load(resolve(args.account, "a100_account_breakdown.json"))
+    if roofline is None and lower_bound is None and account is None:
+        print(
+            "no probe inputs found; run RUN_MODE=roofline / RUN_MODE=account first "
+            "(or pass --results-dir)",
+            file=sys.stderr,
+        )
+        return 2
+
+    hardware = HardwareSpec()
+    if args.bandwidth_gbps:
+        hardware = HardwareSpec(bandwidth_gbps=args.bandwidth_gbps)
+    model = RooflineModel(ModelDims(), hardware)
+    verdict = compute_verdict(
+        roofline=roofline, lower_bound=lower_bound, account=account, model=model
+    )
+    markdown = render_markdown(verdict)
+    print(markdown)
+    if args.json_out:
+        Path(args.json_out).write_text(
+            json.dumps(verdict.to_dict(), indent=2), encoding="utf-8"
+        )
+    if args.markdown_out:
+        Path(args.markdown_out).write_text(markdown, encoding="utf-8")
+
+    # Exit code encodes the verdict class so a scripted pipeline can branch.
+    return 0 if verdict.verdict in (
+        VERDICT_DEVICE_RECOVERABLE,
+        VERDICT_DEVICE_AT_FLOOR,
+    ) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
