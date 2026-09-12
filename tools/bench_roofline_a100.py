@@ -268,33 +268,26 @@ __device__ __forceinline__ void atomic_grid_sync(
 }
 
 __global__ void barrier_probe(unsigned int *counter, unsigned int *sense,
-                              unsigned int nblocks, int iterations,
-                              unsigned long long *out) {
+                              unsigned int nblocks, int iterations) {
   unsigned int generation = 0u;
-  unsigned long long start = clock64();
   for (int i = 0; i < iterations; i++) {
     atomic_grid_sync(counter, sense, nblocks, &generation);
   }
-  unsigned long long elapsed = clock64() - start;
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    out[0] = elapsed;
-    out[1] = (unsigned long long)iterations;
-  }
 }
 
-extern "C" int run_barrier_probe(int grid_blocks, int block_size,
-                                 int iterations, double *ms_out,
-                                 double *us_per_barrier_out) {
+extern "C" double run_barrier_probe(int grid_blocks, int block_size,
+                                    int iterations) {
+  if (grid_blocks <= 0 || block_size <= 0 || iterations <= 0) return -1.0;
   unsigned int *counter = nullptr, *sense = nullptr;
-  unsigned long long *out = nullptr;
-  if (cudaMalloc(&counter, sizeof(unsigned int)) != cudaSuccess) return 1;
-  if (cudaMalloc(&sense, sizeof(unsigned int)) != cudaSuccess) return 2;
-  if (cudaMalloc(&out, 2 * sizeof(unsigned long long)) != cudaSuccess) return 3;
+  if (cudaMalloc(&counter, sizeof(unsigned int)) != cudaSuccess) return -2.0;
+  if (cudaMalloc(&sense, sizeof(unsigned int)) != cudaSuccess) {
+    cudaFree(counter);
+    return -3.0;
+  }
   cudaMemset(counter, 0, sizeof(unsigned int));
   cudaMemset(sense, 0, sizeof(unsigned int));
-  cudaMemset(out, 0, 2 * sizeof(unsigned long long));
 
-  void *args[] = {&counter, &sense, (void *)&grid_blocks, &iterations, &out};
+  void *args[] = {&counter, &sense, (void *)&grid_blocks, &iterations};
   dim3 grid(grid_blocks), block(block_size);
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -306,14 +299,10 @@ extern "C" int run_barrier_probe(int grid_blocks, int block_size,
   cudaEventSynchronize(stop);
   float ms = 0.0f;
   cudaEventElapsedTime(&ms, start, stop);
-  if (err != cudaSuccess) {
-    cudaFree(counter); cudaFree(sense); cudaFree(out);
-    return 4;
-  }
-  *ms_out = (double)ms;
-  *us_per_barrier_out = (double)ms * 1000.0 / (double)iterations;
-  cudaFree(counter); cudaFree(sense); cudaFree(out);
-  return 0;
+  cudaFree(counter);
+  cudaFree(sense);
+  if (err != cudaSuccess) return -4.0;
+  return (double)ms;
 }
 """
 
@@ -325,7 +314,7 @@ def bench_barrier(  # pragma: no cover - GPU only
 
     module = load_inline(
         name="ldg_barrier_probe",
-        cpp_sources="int run_barrier_probe(int, int, int, double*, double*);",
+        cpp_sources="double run_barrier_probe(int, int, int);",
         cuda_sources=_BARRIER_SOURCE,
         functions=["run_barrier_probe"],
         extra_cuda_cflags=["-O3", "-arch=sm_80"],
@@ -336,11 +325,12 @@ def bench_barrier(  # pragma: no cover - GPU only
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        status = module.run_barrier_probe(grid_blocks, block_size, iterations)
+        kernel_ms = module.run_barrier_probe(grid_blocks, block_size, iterations)
         end.record()
         torch.cuda.synchronize()
-        if status != 0:
-            raise RuntimeError(f"barrier probe failed with cuda status {status}")
+        if kernel_ms < 0:
+            raise RuntimeError(f"barrier probe failed with cuda status {kernel_ms}")
+        # Prefer the host-side event delta; the in-kernel value is a check.
         return float(start.elapsed_time(end))
 
     samples = []

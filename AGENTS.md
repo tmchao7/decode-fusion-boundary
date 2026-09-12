@@ -4,9 +4,11 @@
 
 - `src/nanovllm/` is the installable Python package. Core runtime flow lives in `engine/` (scheduling, blocks, model execution), reusable operators in `layers/`, model definitions in `models/`, and shared helpers in `utils/`.
 - `src/nanovllm/config.py`, `llm.py`, and `sampling_params.py` define the public configuration and inference API.
+- `src/nanovllm/roofline.py` is the pure-Python decode-step roofline model (weight bytes, HBM floor, host/device split). It has no torch dependency, is unit tested in `tests/test_roofline.py`, and its model dimensions are contract-tested against `kernel.cu` — change both together or the test fails.
 - `examples/basic_generation.py` is the smallest end-to-end inference example; `benchmarks/` contains batch and Megakernel benchmarks.
 - `src/nanovllm/backends/megakernel/` contains the Qwen CUDA kernel, C++ bindings, build helper, and backend adapter; changes there require server-side CUDA tooling.
 - `docs/` contains the paged-KV design, A100/V100 server runbook, and Chinese metric/baseline/benchmark notes; `tools/` contains correctness and visualization utilities.
+- `docs/07_多batch为何打不过cudagraph.md` is the authoritative record for the Megakernel-vs-CUDA-Graph question (currently v6). Before proposing a batch>1 kernel rewrite, read its §10 ledger and §10.4 decision rule: the device side has no headroom to win, so the only recoverable cost is per-step host overhead.
 
 ## Build, Test, and Development Commands
 
@@ -31,7 +33,9 @@ Use four spaces, standard Python formatting, and readable type annotations where
 
 ## Server Command File Rule
 
-Every command intended for execution on the remote A100/V100 server must be written to the single checked-in `SERVER_COMMANDS.txt`; do not create additional `*_COMMANDS.txt` files. Select a phase with `RUN_MODE` (`model`, `verify`, `build`, `correctness`, `benchmark`, `profile`, or `all`). Before giving a new server command to the user, update, validate, commit, and push this file. Use literal Bash syntax with the required repository/model paths, mirror settings, GPU selection, timeouts, and phase prerequisites. Do not rely on chat-only command blocks.
+Every command intended for execution on the remote A100/V100 server must be written to the single checked-in `SERVER_COMMANDS.txt`; do not create additional `*_COMMANDS.txt` files. Select a phase with `RUN_MODE` (`model`, `verify`, `build`, `correctness`, `benchmark`, `nosync`, `account`, `roofline`, `profile`, `sanitize`, or `all`). Before giving a new server command to the user, update, validate, commit, and push this file. Use literal Bash syntax with the required repository/model paths, mirror settings, GPU selection, timeouts, and phase prerequisites. Do not rely on chat-only command blocks.
+
+`RUN_MODE=account` produces the per-step host/device ledger (`tools/account_decode.py`) and `RUN_MODE=roofline` runs the device lower-bound and bandwidth probes (`tools/bench_roofline_a100.py`, `tools/bench_burst_lower_bound.py`). The roofline probe's verdict decides whether a batch>1 megakernel rewrite is attempted at all, so run it before touching `kernel.cu`.
 
 After the user runs `git pull --ff-only` on the server, they should be able to run `bash SERVER_COMMANDS.txt` or `RUN_MODE=<phase> bash SERVER_COMMANDS.txt` directly. Keep server-generated results, logs, model weights, and profiler reports ignored by Git.
 

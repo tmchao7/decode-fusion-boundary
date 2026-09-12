@@ -78,6 +78,35 @@ __device__ __forceinline__ void atomic_grid_sync(
   __syncthreads();
 }
 
+// Stream exactly `bytes` starting at `base`, 16 bytes per thread per step.
+// Never runs past `base + bytes`: the loop tests the *end* of each vector
+// read, and the trailing partial vector (if any) is covered separately.  This
+// matters because the probe deliberately points `base` at interior offsets to
+// wrap the weight buffer.
+__device__ __forceinline__ float stream_exact(
+    const char *__restrict__ base, unsigned long long bytes, int block_id,
+    int nblocks, int block_size) {
+  const unsigned long long stride = (unsigned long long)block_size * 16ull;
+  const unsigned long long start =
+      (unsigned long long)(block_id * block_size + threadIdx.x) * 16ull;
+  const unsigned long long grid_step = (unsigned long long)nblocks * stride;
+  float sink = 0.0f;
+  for (unsigned long long off = start; off + 16ull <= bytes; off += grid_step) {
+    const uint4 raw = *reinterpret_cast<const uint4 *>(base + off);
+    sink += (float)(raw.x ^ raw.y ^ raw.z ^ raw.w);
+  }
+  // Cover the tail beyond the last full vector with a scalar read.
+  if (bytes % 16ull != 0ull) {
+    const unsigned long long tail_start = bytes - (bytes % 16ull);
+    const unsigned long long tail_grid = (unsigned long long)nblocks * block_size;
+    for (unsigned long long i = (unsigned long long)(block_id * block_size + threadIdx.x);
+         i < bytes - tail_start; i += tail_grid) {
+      sink += (float)(unsigned char)base[tail_start + i];
+    }
+  }
+  return sink;
+}
+
 // One cooperative pass over `nlayers` layers' worth of weights, with
 // `barriers_per_layer` grid syncs per layer and no arithmetic.
 __global__ void __launch_bounds__(512, 1) lower_bound_probe(
@@ -88,21 +117,20 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
   const int block_id = blockIdx.x;
   const int nblocks = gridDim.x;
   const int block_size = blockDim.x;
+  // Largest 16B-aligned start that still lets a full bytes_per_layer read fit
+  // inside the buffer.  Decode reserves a 256-token KV block, so the real
+  // weight footprint is always strictly smaller than the buffer.
+  const unsigned long long max_base_offset =
+      buffer_bytes > bytes_per_layer ? buffer_bytes - bytes_per_layer : 0ull;
+  unsigned long long base_offset = 0ull;
   float sink = 0.0f;
   const unsigned long long step_clock_start = clock64();
   for (int iter = 0; iter < iterations; ++iter) {
     for (int layer = 0; layer < nlayers; ++layer) {
-      // Wrap so that no read runs past the allocation: the same weight bytes
-      // are streamed once per layer, which is exactly a decode step's traffic.
-      const unsigned long long base_offset = (unsigned long long)layer * bytes_per_layer;
-      const char *base = weights + (base_offset % buffer_bytes);
-      unsigned long long remaining = bytes_per_layer;
-      unsigned long long off = (unsigned long long)(block_id * block_size + threadIdx.x) * 16ull;
-      const unsigned long long grid_step = (unsigned long long)nblocks * block_size * 16ull;
-      for (; off + 16ull <= remaining; off += grid_step) {
-        const uint4 raw = *reinterpret_cast<const uint4 *>(base + off);
-        sink += (float)(raw.x ^ raw.y ^ raw.z ^ raw.w);
-      }
+      const char *base = weights + base_offset;
+      sink += stream_exact(base, bytes_per_layer, block_id, nblocks, block_size);
+      base_offset += bytes_per_layer;
+      if (base_offset > max_base_offset) base_offset = 0ull;
       for (int b = 0; b < barriers_per_layer; ++b) {
         atomic_grid_sync(counter, sync_generation, (unsigned int)nblocks);
       }
@@ -115,20 +143,31 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
   }
 }
 
-extern "C" int run_lower_bound_probe(
+// Returns the per-step time in ms on success, a negative code on failure.
+// Returning a double (rather than a double* out-param) keeps the C++ shim
+// trivially bindable: torch's load_inline has no converter for `double*`.
+extern "C" double run_lower_bound_probe(
     const void *weights, unsigned long long bytes_per_layer,
     unsigned long long buffer_bytes, int nlayers, int barriers_per_layer,
-    int grid_blocks, int block_size, int iterations, double *ms_per_step_out) {
-  if (weights == nullptr || nlayers <= 0 || grid_blocks <= 0 || buffer_bytes == 0)
-    return 1;
+    int grid_blocks, int block_size, int iterations) {
+  if (weights == nullptr || nlayers <= 0 || grid_blocks <= 0 ||
+      buffer_bytes == 0 || iterations <= 0)
+    return -1.0;
   unsigned int *counter = nullptr, *generation = nullptr;
   unsigned long long *out = nullptr;
-  if (cudaMalloc(&counter, sizeof(unsigned int)) != cudaSuccess) return 2;
-  if (cudaMalloc(&generation, sizeof(unsigned int)) != cudaSuccess) return 3;
-  if (cudaMalloc(&out, sizeof(unsigned long long) * grid_blocks) != cudaSuccess)
-    return 4;
+  if (cudaMalloc(&counter, sizeof(unsigned int)) != cudaSuccess) return -2.0;
+  if (cudaMalloc(&generation, sizeof(unsigned int)) != cudaSuccess) {
+    cudaFree(counter);
+    return -3.0;
+  }
+  if (cudaMalloc(&out, sizeof(unsigned long long) * grid_blocks) != cudaSuccess) {
+    cudaFree(counter);
+    cudaFree(generation);
+    return -4.0;
+  }
   cudaMemset(counter, 0, sizeof(unsigned int));
   cudaMemset(generation, 0, sizeof(unsigned int));
+  cudaMemset(out, 0, sizeof(unsigned long long) * grid_blocks);
 
   void *args[] = {(void *)&weights, &bytes_per_layer, &buffer_bytes, &nlayers,
                   &barriers_per_layer, &counter, &generation, &out,
@@ -147,9 +186,8 @@ extern "C" int run_lower_bound_probe(
   cudaFree(counter);
   cudaFree(generation);
   cudaFree(out);
-  if (err != cudaSuccess) return 5;
-  *ms_per_step_out = (double)ms / (double)iterations;
-  return 0;
+  if (err != cudaSuccess) return -5.0;
+  return (double)ms / (double)iterations;
 }
 """
 
@@ -204,11 +242,21 @@ def bench_lower_bound(  # pragma: no cover - GPU only
     flat, total_bytes = _weight_layout(model_path, dims)
     bytes_per_layer = (total_bytes // dims.num_layers) & ~15  # 16B aligned
     buffer_bytes = flat.numel() * flat.element_size()
+    # Each layer must start at a distinct buffer offset, otherwise the probe
+    # would re-read the same addresses 28x and report L2-hit bandwidth instead
+    # of HBM bandwidth.  For Qwen3-0.6B the weight buffer is 0.88 GB against a
+    # 40 MB L2, so this holds comfortably -- but fail loudly rather than
+    # produce a meaningless floor if a future model breaks the assumption.
+    if buffer_bytes <= bytes_per_layer:
+        raise RuntimeError(
+            f"probe needs buffer_bytes ({buffer_bytes}) > bytes_per_layer "
+            f"({bytes_per_layer}) to stream distinct weights per layer"
+        )
     module = load_inline(
         name="ldg_lower_bound_probe",
         cpp_sources=(
-            "int run_lower_bound_probe(const void*, unsigned long long, "
-            "unsigned long long, int, int, int, int, int, double*);"
+            "double run_lower_bound_probe(const void*, unsigned long long, "
+            "unsigned long long, int, int, int, int, int);"
         ),
         cuda_sources=_PROBE_SOURCE,
         functions=["run_lower_bound_probe"],
@@ -231,6 +279,11 @@ def bench_lower_bound(  # pragma: no cover - GPU only
                 flat.data_ptr(), bytes_per_layer, buffer_bytes, dims.num_layers,
                 BARRIERS_PER_LAYER, grid_blocks, block_size, iterations,
             )
+            if ms < 0:
+                raise RuntimeError(
+                    f"lower-bound probe failed with cuda status {ms} "
+                    f"(grid={grid_blocks} block={block_size})"
+                )
             samples.append(float(ms))
         mean_ms = statistics.fmean(samples)
         results.append(
@@ -368,6 +421,41 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
 
 def parse_batches(value: str) -> list[int]:
     return [int(part) for part in value.split(",") if part.strip()]
+
+
+def probe_read_offsets(
+    size: int, block_size: int, nblocks: int, vector_bytes: int = 16
+) -> dict[str, list[int]]:
+    """Mirror :c:`stream_exact`'s access pattern for the whole grid.
+
+    Returns ``{"vector": [...], "tail": [...]}``.  A ``vector`` offset is the
+    start of a ``vector_bytes`` read and must satisfy
+    ``offset + vector_bytes <= size``; a ``tail`` offset is a single byte and
+    must satisfy ``offset < size``.  Block 16-byte reads are *not* issued into
+    the trailing partial vector -- those bytes are covered by the scalar tail
+    loop instead, exactly like the CUDA code.
+
+    Kept in Python so a CPU test can prove the probe covers exactly ``size``
+    bytes and never steps outside ``[0, size)`` -- the probe wraps the weight
+    buffer, so an off-by-one here would read out of bounds on the GPU.
+    """
+
+    stride = block_size * vector_bytes
+    grid_step = nblocks * stride
+    vector_region = size - (size % vector_bytes)
+    vector_offsets: list[int] = []
+    for thread in range(block_size * nblocks):
+        start = thread * vector_bytes
+        if start + vector_bytes > vector_region:
+            break
+        vector_offsets.extend(range(start, vector_region, grid_step))
+    tail_offsets: list[int] = []
+    for thread in range(block_size * nblocks):
+        offset = vector_region + thread
+        if offset >= size:
+            break
+        tail_offsets.append(offset)
+    return {"vector": sorted(vector_offsets), "tail": sorted(tail_offsets)}
 
 
 def main(argv: list[str] | None = None) -> int:
