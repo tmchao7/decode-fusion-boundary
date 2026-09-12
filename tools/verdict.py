@@ -62,6 +62,12 @@ VERDICT_NEEDS_CALIBRATION = "NEEDS_CALIBRATION"
 VERDICT_DEVICE_RECOVERABLE = "DEVICE_RECOVERABLE"
 VERDICT_DEVICE_AT_FLOOR = "DEVICE_AT_FLOOR"
 VERDICT_DEVICE_UNREACHABLE = "DEVICE_UNREACHABLE"
+VERDICT_HOST_BOUND_OPPORTUNITY = "HOST_BOUND_OPPORTUNITY"
+VERDICT_DEVICE_BOUND_CUDA_GRAPH = "DEVICE_BOUND_CUDA_GRAPH"
+
+# If the measured host-free per-step time is this close to the probe floor, the
+# cudagraph path has no host overhead worth removing and no device headroom.
+DEVICE_BOUND_RATIO = 1.25
 
 
 @dataclass
@@ -83,6 +89,29 @@ class DeviceEvidence:
     measured_batch: int | None = None
     measured_host_residual_ms: float | None = None
     barrier_ms_per_step: float | None = None
+    # Experiment C: the host-free graph replay, i.e. the measured opponent a
+    # batch>1 persistent megakernel would have to beat once the host is gone.
+    host_free_ms_per_step: float | None = None
+    host_free_batches: list[int] = field(default_factory=list)
+    host_inclusive_ms_per_step: float | None = None
+
+
+@dataclass
+class HostOverlay:
+    measured_host_ms_per_step: float | None = None
+    host_inclusive_ms_per_step: float | None = None
+    host_free_ms_per_step: float | None = None
+    # The measured device work a persistent kernel would replace.
+    remaining_device_ms_per_step: float | None = None
+    # True when removing the per-step host round trip (always at least one
+    # cudaGraphLaunch + sampling + scheduler step) would save a material amount
+    # of time.  This is a statement about the host *overlay*, not a claim that
+    # measured cudagraph is host-bound device-wise.
+    host_overlay_material: bool | None = None
+    # True only if the no-arithmetic device floor is below the host-free time it
+    # would have to beat, i.e. a kernel launched with no host round trip at all
+    # would win on device work.
+    megakernel_could_win: bool | None = None
 
 
 @dataclass
@@ -93,6 +122,7 @@ class Verdict:
     actions: list[str]
     calibration: Calibration
     device: DeviceEvidence
+    host_overlay: HostOverlay = field(default_factory=HostOverlay)
 
     def to_dict(self) -> dict:
         return {
@@ -102,6 +132,7 @@ class Verdict:
             "actions": self.actions,
             "calibration": asdict(self.calibration),
             "device": asdict(self.device),
+            "host_overlay": asdict(self.host_overlay),
         }
 
 
@@ -177,6 +208,65 @@ def _measured_device_row(
     return row, implied if row["ms_per_step_gpu"] < floor_ms else None
 
 
+def _host_free_evidence(
+    lower_bound: dict | None,
+) -> tuple[float | None, float | None, list[int]]:
+    """Return (host_free_ms_per_step, host_inclusive_ms_per_step, batches)."""
+
+    if not lower_bound:
+        return None, None, []
+    rows = lower_bound.get("host_free_graph") or []
+    free, inclusive, batches = [], [], []
+    for row in rows:
+        value = row.get("ms_per_step_host_free")
+        if isinstance(value, (int, float)) and value > 0:
+            free.append(float(value))
+            batches.append(int(row.get("batch_size") or 0))
+            host_inclusive = row.get("ms_per_step_host_inclusive")
+            if isinstance(host_inclusive, (int, float)) and host_inclusive > 0:
+                inclusive.append(float(host_inclusive))
+    if not free:
+        return None, None, []
+    return (
+        min(free),
+        min(inclusive) if inclusive else None,
+        batches,
+    )
+
+
+def _build_host_overlay(
+    *,
+    host_free_ms: float | None,
+    host_inclusive_ms: float | None,
+    probe_ms: float | None,
+) -> HostOverlay:
+    """Quantify the measured opponent: how much of cudagraph is host overhead.
+
+    ``host_inclusive - host_free`` is the per-step cost that exists only because
+    the host must drive each step.  A persistent kernel removes exactly that
+    and nothing else, so a batch>1 megakernel can only win if its own device
+    work is at most ``host_free``.
+    """
+
+    overlay = HostOverlay(
+        host_inclusive_ms_per_step=host_inclusive_ms,
+        host_free_ms_per_step=host_free_ms,
+    )
+    if host_free_ms is None:
+        return overlay
+    if host_inclusive_ms is not None:
+        overlay.measured_host_ms_per_step = host_inclusive_ms - host_free_ms
+        overlay.host_overlay_material = overlay.measured_host_ms_per_step > 0.5
+    overlay.remaining_device_ms_per_step = host_free_ms
+    if probe_ms is not None:
+        # A persistent kernel still has to beat the host-free graph time, which
+        # already contains the same device work without the per-step host round
+        # trip.  It wins on device work only if the no-arithmetic floor is below
+        # that time even after allowing this margin for implementation loss.
+        overlay.megakernel_could_win = probe_ms * DEVICE_BOUND_RATIO < host_free_ms
+    return overlay
+
+
 def compute_verdict(
     *,
     roofline: dict | None = None,
@@ -194,6 +284,9 @@ def compute_verdict(
     measured_bw = _bandwidth_gbps(roofline)
     probe_ms, probe_batches = _probe_ms_per_step(lower_bound)
     measured_row, implied_bw = _measured_device_row(account, model)
+    host_free_ms, host_inclusive_ms, host_free_batches = _host_free_evidence(
+        lower_bound
+    )
 
     calibration = Calibration(
         measured_bandwidth_gbps=measured_bw,
@@ -242,6 +335,14 @@ def compute_verdict(
             if (roofline or {}).get("barrier", {}).get("ms_per_step_estimate")
             else None
         ),
+        host_free_ms_per_step=host_free_ms,
+        host_free_batches=host_free_batches,
+        host_inclusive_ms_per_step=host_inclusive_ms,
+    )
+    overlay = _build_host_overlay(
+        host_free_ms=host_free_ms,
+        host_inclusive_ms=host_inclusive_ms,
+        probe_ms=probe_ms,
     )
 
     rationale: list[str] = []
@@ -261,6 +362,7 @@ def compute_verdict(
                 actions,
                 calibration,
                 device,
+                overlay,
             )
         return Verdict(
             VERDICT_NEEDS_DATA,
@@ -270,6 +372,7 @@ def compute_verdict(
             actions,
             calibration,
             device,
+            overlay,
         )
 
     rationale.append(
@@ -302,6 +405,7 @@ def compute_verdict(
             actions,
             calibration,
             device,
+            overlay,
         )
 
     if probe_ms > stop_ms:
@@ -323,6 +427,7 @@ def compute_verdict(
             actions,
             calibration,
             device,
+            overlay,
         )
 
     if probe_ms > recoverable_ms:
@@ -341,6 +446,7 @@ def compute_verdict(
             actions,
             calibration,
             device,
+            overlay,
         )
 
     rationale.append(
@@ -381,12 +487,63 @@ def compute_verdict(
                 actions,
                 calibration,
                 device,
+                overlay,
             )
         actions += [
             "size the R3 rewrite against the probe floor and the barrier budget",
             "keep the change behind megakernel_batch_decode=True and re-run "
             "tools/correctness_wmma_vs_scalar.py (PASS/CASCADE/FAIL)",
         ]
+
+    # Experiment C decides whether there is anything to win at all: a persistent
+    # kernel removes per-step host cost and nothing else, so it can only beat the
+    # host-free graph time, and only if its own device work is at most that.
+    if overlay.host_free_ms_per_step is not None:
+        rationale.append(
+            f"host-free graph replay: {overlay.host_free_ms_per_step:.3f} ms/step "
+            f"(batches {device.host_free_batches or 'n/a'})"
+        )
+        if overlay.measured_host_ms_per_step is not None:
+            rationale.append(
+                f"measured per-step host overlay: "
+                f"{overlay.measured_host_ms_per_step:.3f} ms "
+                f"(host-inclusive {overlay.host_inclusive_ms_per_step:.3f} ms)"
+            )
+        if overlay.megakernel_could_win:
+            actions.append(
+                "a host-free persistent kernel has room only if its device work "
+                f"stays at or below {overlay.remaining_device_ms_per_step:.3f} "
+                "ms/step, which is the probe's job to prove"
+            )
+            return Verdict(
+                VERDICT_HOST_BOUND_OPPORTUNITY,
+                f"Host-bound opportunity: the device floor "
+                f"({probe_ms:.3f} ms/step) is below the host-free graph time "
+                f"({overlay.host_free_ms_per_step:.3f} ms/step), so a kernel with "
+                "no per-step host round trip can win on device work.",
+                rationale,
+                actions,
+                calibration,
+                device,
+                overlay,
+            )
+        actions.append(
+            f"the host-free graph already runs at {overlay.host_free_ms_per_step:.3f} "
+            f"ms/step against a {probe_ms:.3f} ms/step device floor, so a persistent "
+            "batch>1 kernel has no margin to exploit"
+        )
+        if overlay.host_overlay_material:
+            return Verdict(
+                VERDICT_DEVICE_BOUND_CUDA_GRAPH,
+                f"No device-side win is available: the host-free graph "
+                f"({overlay.host_free_ms_per_step:.3f} ms/step) is at or below the "
+                f"probe floor ({probe_ms:.3f} ms/step).",
+                rationale,
+                actions,
+                calibration,
+                device,
+                overlay,
+            )
 
     return Verdict(
         VERDICT_DEVICE_RECOVERABLE,
@@ -396,6 +553,7 @@ def compute_verdict(
         actions,
         calibration,
         device,
+        overlay,
     )
 
 
@@ -428,6 +586,21 @@ def render_markdown(verdict: Verdict) -> str:
     ]
     for note in calibration.notes:
         lines.append(f"- note: {note}")
+    overlay = verdict.host_overlay
+
+    def _ms(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.3f} ms"
+
+    lines += [
+        "",
+        "## Host overlay (experiment C)",
+        "",
+        f"- host-inclusive graph replay: {_ms(overlay.host_inclusive_ms_per_step)}",
+        f"- host-free graph replay: {_ms(overlay.host_free_ms_per_step)}",
+        f"- measured host overlay: {_ms(overlay.measured_host_ms_per_step)}",
+        f"- host overlay material (>0.5 ms): {overlay.host_overlay_material}",
+        f"- megakernel could win on device work: {overlay.megakernel_could_win}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -485,10 +658,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.markdown_out:
         Path(args.markdown_out).write_text(markdown, encoding="utf-8")
 
-    # Exit code encodes the verdict class so a scripted pipeline can branch.
+    # Exit 0 means "there is something real to chase" (a device-side recovery,
+    # a host-overlay opportunity, or a device already at its floor where the
+    # remaining win is host-side).  Everything else -- including
+    # DEVICE_BOUND_CUDA_GRAPH, where the rewrite has nothing to beat -- is 1.
     return 0 if verdict.verdict in (
         VERDICT_DEVICE_RECOVERABLE,
         VERDICT_DEVICE_AT_FLOOR,
+        VERDICT_HOST_BOUND_OPPORTUNITY,
     ) else 1
 
 

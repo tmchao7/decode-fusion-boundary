@@ -20,7 +20,9 @@ from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel  # noqa: E4
 from tools.verdict import (  # noqa: E402
     VERDICT_DEVICE_AT_FLOOR,
     VERDICT_DEVICE_RECOVERABLE,
+    VERDICT_DEVICE_BOUND_CUDA_GRAPH,
     VERDICT_DEVICE_UNREACHABLE,
+    VERDICT_HOST_BOUND_OPPORTUNITY,
     VERDICT_NEEDS_CALIBRATION,
     VERDICT_NEEDS_DATA,
     compute_verdict,
@@ -30,8 +32,13 @@ from tools.verdict import (  # noqa: E402
 FLOOR_MS = 0.967  # 1.503 GB / 1555 GB/s
 
 
-def _lower_bound(ms_per_step: float, batches=(1, 8, 32)) -> dict:
-    return {
+def _lower_bound(
+    ms_per_step: float,
+    batches=(1, 8, 32),
+    host_free: float | None = None,
+    host_inclusive: float | None = None,
+) -> dict:
+    report = {
         "lower_bound_probe": {
             "rows": [
                 {
@@ -43,6 +50,18 @@ def _lower_bound(ms_per_step: float, batches=(1, 8, 32)) -> dict:
             ]
         }
     }
+    if host_free is not None:
+        report["host_free_graph"] = [
+            {
+                "batch_size": batch,
+                "ms_per_step_host_inclusive": (
+                    host_inclusive if host_inclusive is not None else host_free
+                ),
+                "ms_per_step_host_free": host_free,
+            }
+            for batch in batches
+        ]
+    return report
 
 
 def _roofline(bandwidth_gbps: float | None, barrier_ms: float = 0.548) -> dict:
@@ -128,6 +147,71 @@ class VerdictBranchTests(unittest.TestCase):
         self.assertTrue(
             any("host overhead" in action for action in verdict.actions)
         )
+
+
+class HostOverlayTests(unittest.TestCase):
+    """Experiment C: the measured opponent a persistent kernel must beat."""
+
+    def test_host_overlay_is_measured_from_the_two_replays(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1, host_free=0.9, host_inclusive=3.4),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        overlay = verdict.host_overlay
+        self.assertAlmostEqual(overlay.host_free_ms_per_step, 0.9, places=3)
+        self.assertAlmostEqual(overlay.measured_host_ms_per_step, 2.5, places=3)
+        self.assertTrue(overlay.host_overlay_material)
+        # probe 1.1 vs host-free 0.9: no margin to exploit.
+        self.assertFalse(overlay.megakernel_could_win)
+
+    def test_device_bound_cuda_graph_when_host_free_hits_the_floor(self) -> None:
+        # probe 1.0 and host-free 0.95: no margin, and cudagraph pays a
+        # material host overlay, so there is nothing left to win.
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.0, host_free=0.95, host_inclusive=3.4),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_BOUND_CUDA_GRAPH)
+        self.assertIn("No device-side win", verdict.headline)
+
+    def test_host_bound_opportunity_when_megakernel_has_margin(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.0, host_free=3.0, host_inclusive=5.5),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_HOST_BOUND_OPPORTUNITY)
+        self.assertTrue(verdict.host_overlay.megakernel_could_win)
+        self.assertIn("Host-bound opportunity", verdict.headline)
+
+    def test_no_host_free_data_leaves_overlay_empty(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=98.5, host_ms=1.0),
+        )
+        self.assertIsNone(verdict.host_overlay.host_free_ms_per_step)
+        self.assertIsNone(verdict.host_overlay.megakernel_could_win)
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_RECOVERABLE)
+
+    def test_host_free_min_across_batches(self) -> None:
+        lower_bound = _lower_bound(1.0, host_free=2.0)
+        lower_bound["host_free_graph"][0]["ms_per_step_host_free"] = 1.4
+        verdict = compute_verdict(roofline=_roofline(1600.0), lower_bound=lower_bound)
+        self.assertAlmostEqual(
+            verdict.host_overlay.host_free_ms_per_step, 1.4, places=3
+        )
+
+    def test_markdown_reports_the_host_overlay(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.0, host_free=3.0, host_inclusive=5.5),
+        )
+        text = render_markdown(verdict)
+        self.assertIn("## Host overlay", text)
+        self.assertIn("measured host overlay", text)
 
 
 class CalibrationTests(unittest.TestCase):

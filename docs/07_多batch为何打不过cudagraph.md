@@ -660,11 +660,15 @@ megakernel 若能追平 device 侧: 0.97 + ~0.3 (barrier) + ~0 = ~1.3 ms/step
 - 服务器上一条命令：`RUN_MODE=account bash SERVER_COMMANDS.txt`（会跑对比 +
   账本 + roofline 表；`crossover_scan.json` 存在时自动并入）。
 - **判定由代码给出，不由人读日志给出**：`tools/verdict.py` 读这三个 JSON，按 §10.4
-  的阈值输出 `DEVICE_RECOVERABLE / DEVICE_AT_FLOOR / DEVICE_UNREACHABLE /
-  DEVICE_BORDERLINE / NEEDS_CALIBRATION / NEEDS_DATA` 六种枚举之一，并附证据与行动；
-  阈值分支由 `tests/test_verdict.py` 的 18 个测试锁定。其中 `DEVICE_AT_FLOOR` 是
-  诚实护栏：probe 快 ≠ 有收益，若现有 kernel 已在下界附近，结论必须落在 host 侧。
-  完整用法见 [docs/09](09_高并发判定任务书.md) §3。
+  的阈值输出八种枚举之一：`DEVICE_RECOVERABLE / HOST_BOUND_OPPORTUNITY /
+  DEVICE_AT_FLOOR / DEVICE_BOUND_CUDA_GRAPH / DEVICE_UNREACHABLE / DEVICE_BORDERLINE /
+  NEEDS_CALIBRATION / NEEDS_DATA`，并附证据与行动；阈值分支由
+  `tests/test_verdict.py` 的 24 个测试锁定。
+- **两个诚实护栏**：`DEVICE_AT_FLOOR`——probe 快 ≠ 有收益，若现有 kernel 已在下界
+  附近，结论必须落在 host 侧；`DEVICE_BOUND_CUDA_GRAPH`——判定还要拿 §10.4 实验 C 的
+  `host_free`（消除 host 后 cudagraph 的每步时间）当对手，只有 `probe × 1.25 <
+  host_free` 才给 `HOST_BOUND_OPPORTUNITY`，否则即使 probe 很低也判没有 device 侧的
+  赢法。完整用法见 [docs/09](09_高并发判定任务书.md) §3。
 
 
 
