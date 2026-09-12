@@ -50,6 +50,31 @@ class MetricsMathTests(unittest.TestCase):
         )
         self.assertIsNone(request.to_dict()["tpot_ms"])
 
+    def test_aggregate_latencies_stay_in_milliseconds(self):
+        """Regression: the aggregate used to divide ms by 1000 and report seconds.
+
+        ``RequestMetrics.to_dict()`` emits milliseconds, so a 1000x understated
+        ``ttft_ms``/``tpot_ms``/``itl_ms``/``e2e_ms`` reached every generated
+        report and plot (which label those columns "ms").
+        """
+
+        request = RequestMetrics(
+            request_id=3,
+            prompt_tokens=4,
+            arrival_time=0.0,
+            token_times=[0.1, 0.2],
+            output_tokens=2,
+            prefill_time=0.05,
+            decode_time=0.1,
+            backend_requested="torch",
+            backend_actual="torch",
+        )
+        summary = aggregate_requests([request], wall_time=1.0)
+        self.assertAlmostEqual(summary["ttft_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["tpot_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["itl_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["e2e_ms"]["p50"], 200.0, places=6)
+
     def test_aggregate_and_comparison(self):
         requests = [
             RequestMetrics(1, 4, 0.0, [0.1, 0.2], 2, 0.05, 0.1, "torch", "torch"),

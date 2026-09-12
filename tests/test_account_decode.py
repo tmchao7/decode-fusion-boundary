@@ -283,7 +283,12 @@ class CrossoverScanTests(unittest.TestCase):
 
 
 class CalibrationWarningTests(unittest.TestCase):
-    """0.77 ms/step for 1.503 GB implies 1952 GB/s, above the A100 spec."""
+    """0.6 ms/step for 1.503 GB implies 2505 GB/s, above the 2039 GB/s spec.
+
+    The 0.77 ms that used to live here only looked impossible against the old
+    1555 GB/s constant (the 40 GB A100 part); against the real 80 GB spec it is
+    a legitimate near-peak measurement and must NOT be flagged.
+    """
 
     def _row(self, gpu_ms: float) -> dict:
         return accounting_from_experiment(
@@ -298,14 +303,26 @@ class CalibrationWarningTests(unittest.TestCase):
         )
 
     def test_below_floor_is_flagged(self) -> None:
-        row = self._row(0.77)
+        row = self._row(0.6)
         assert row is not None
         warnings = find_calibration_warnings(
             [row], RooflineModel(ModelDims(), HardwareSpec())
         )
         self.assertEqual(len(warnings), 1)
-        self.assertIn("1952 GB/s", warnings[0])
+        self.assertIn("2505 GB/s", warnings[0])
         self.assertIn("RUN_MODE=roofline", warnings[0])
+
+    def test_near_peak_measurement_is_not_flagged(self) -> None:
+        """0.77 ms/step is 97% of the A100-80GB HBM peak, not a contradiction."""
+
+        row = self._row(0.77)
+        assert row is not None
+        self.assertEqual(
+            find_calibration_warnings(
+                [row], RooflineModel(ModelDims(), HardwareSpec())
+            ),
+            [],
+        )
 
     def test_above_floor_is_not_flagged(self) -> None:
         row = self._row(1.5)

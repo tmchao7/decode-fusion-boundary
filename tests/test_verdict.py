@@ -30,7 +30,7 @@ from tools.verdict import (  # noqa: E402
     render_markdown,
 )
 
-FLOOR_MS = 0.967  # 1.503 GB / 1555 GB/s
+FLOOR_MS = 0.737  # 1.503 GB (32 seqs, untied) / 2039 GB/s (A100-80GB)
 
 
 def _lower_bound(
@@ -216,16 +216,38 @@ class HostOverlayTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_contradiction_detected_from_documented_074ms(self) -> None:
+    def test_contradiction_detected_when_the_timing_is_impossible(self) -> None:
+        """0.6 ms/step implies 2505 GB/s, which is above the 2039 GB/s spec.
+
+        The contradiction means the recording cannot have covered a whole step.
+        """
+
         verdict = compute_verdict(
             roofline=_roofline(1600.0),
             lower_bound=_lower_bound(1.1),
-            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+            account=_account(gpu_ms=0.6, host_ms=2.2, backend="torch", batch=2),
         )
         self.assertTrue(verdict.calibration.contradiction_present)
         self.assertAlmostEqual(
-            verdict.calibration.implied_bandwidth_gbps, 2031.0, delta=5.0
+            verdict.calibration.implied_bandwidth_gbps, 2505.0, delta=5.0
         )
+
+    def test_documented_074ms_is_not_a_contradiction_on_an_80gb_a100(self) -> None:
+        """The batched cudagraph step sits AT the HBM wall, it does not beat it.
+
+        Regression for the old 1555 GB/s constant (the 40 GB part): against that
+        number 0.74 ms looked impossible and sent the project hunting for a
+        missing nsys capture. Against the real 2039 GB/s spec it is 99.7% of
+        peak with the untied 1.503 GB accounting, and a plausible 79% with
+        Qwen3's true tied traffic.
+        """
+
+        verdict = compute_verdict(
+            roofline=_roofline(2039.0),
+            lower_bound=_lower_bound(1.1),
+            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+        )
+        self.assertFalse(verdict.calibration.contradiction_present)
 
     def test_contradiction_absent_when_device_is_above_floor(self) -> None:
         verdict = compute_verdict(
@@ -240,7 +262,7 @@ class CalibrationTests(unittest.TestCase):
         verdict = compute_verdict(
             roofline=_roofline(1750.0),
             lower_bound=_lower_bound(1.1),
-            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+            account=_account(gpu_ms=0.6, host_ms=2.2, backend="torch", batch=2),
         )
         self.assertTrue(verdict.calibration.resolved)
         self.assertEqual(verdict.calibration.measured_bandwidth_gbps, 1750.0)
@@ -250,10 +272,10 @@ class CalibrationTests(unittest.TestCase):
         verdict = compute_verdict(
             roofline=_roofline(None),
             lower_bound=_lower_bound(1.1),
-            account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
+            account=_account(gpu_ms=0.6, host_ms=2.2, backend="torch", batch=2),
         )
         self.assertEqual(verdict.verdict, VERDICT_NEEDS_CALIBRATION)
-        self.assertTrue(any("2031" in action for action in verdict.actions))
+        self.assertTrue(any("2505" in action for action in verdict.actions))
 
 
 class DeviceRowSelectionTests(unittest.TestCase):

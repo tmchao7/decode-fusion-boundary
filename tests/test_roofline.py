@@ -27,28 +27,59 @@ DOCUMENTED_WALL_MS_PER_TOKEN = {1: 2.944, 2: 1.634, 8: 0.429, 32: 0.111}
 
 
 class ModelDimsTests(unittest.TestCase):
-    def test_weight_footprint_matches_hand_count(self) -> None:
+    def test_streaming_params_are_layers_plus_one_lm_head(self) -> None:
+        """The LM head is streamed once; the embedding copy is not a stream.
+
+        ``total_params`` counts the parameters that cross HBM in one decode
+        step, so it is layer weights + one LM head matrix for a tied model and
+        layer weights + embedding table + LM head for an untied one.
+        """
+
         dims = ModelDims()
         # Hand count: qkv 1024*(2048+2048)=4.19M, o 2048*1024=2.10M,
         # mlp 3*1024*3072=9.44M, 2 norms 2048 -> 15,730,688 per layer
         self.assertEqual(dims.params_per_layer(), 15_730_688)
-        self.assertEqual(dims.total_params(), 751_624_192)
-        self.assertAlmostEqual(dims.total_params() / 1e6, 751.6, places=1)
+        layers = dims.num_layers * dims.params_per_layer()
+        lm_head = dims.params_lm_head()
+        self.assertEqual(lm_head, 151936 * 1024)
+        # Qwen3-0.6B has tie_word_embeddings=True.
+        self.assertEqual(dims.total_params(tied_embedding=True), layers + lm_head)
+        self.assertEqual(
+            dims.total_params(tied_embedding=False),
+            layers + dims.params_embedding() + lm_head,
+        )
 
-    def test_weight_bytes_is_about_1_5_gb(self) -> None:
+    def test_weight_bytes_counts_the_lm_head_exactly_once(self) -> None:
         model = RooflineModel()
+        # Untied: layer weights + embedding table + LM head.
         self.assertAlmostEqual(model.weight_bytes() / 1e9, 1.503, places=3)
-        # The batch-independent core excludes the embedding table.
+        # The batch-independent core is layers + one LM head, which is also the
+        # correct per-step traffic for Qwen3-0.6B (tied embeddings).
         self.assertAlmostEqual(
             model.weight_bytes_excl_embedding() / 1e9, 1.192, places=3
         )
+        self.assertAlmostEqual(model.core_weight_bytes() / 1e9, 1.192, places=3)
         self.assertAlmostEqual(model.embedding_bytes() / 1e9, 0.311, places=3)
+        tied = RooflineModel(tied_embedding=True)
+        self.assertEqual(tied.weight_bytes(), tied.core_weight_bytes())
 
-    def test_tied_embedding_drops_lm_head(self) -> None:
+    def test_tied_embedding_does_not_double_count_the_matrix(self) -> None:
+        """Tying removes the *second* copy of the 311 MB matrix, not the LM head.
+
+        The regression this locks: committing 2d21fd8-era code counted the
+        embedding table and the (tied) LM head as separate 311 MB reads, which
+        inflated the Qwen3 floor by 26% and made a real 0.74 ms/step look faster
+        than HBM.
+        """
+
         tied = RooflineModel(tied_embedding=True)
         untied = RooflineModel()
         delta = untied.weight_bytes() - tied.weight_bytes()
         self.assertEqual(delta, 151936 * 1024 * 2)
+        # Sanity: with the correct numbers 0.74 ms is a plausible 79% of peak.
+        implied_gbps = tied.weight_bytes() / 0.74e-3 / 1e9
+        self.assertGreater(implied_gbps, 1400.0)
+        self.assertLess(implied_gbps, tied.hardware.bandwidth_gbps)
 
     def test_weight_breakdown_sums_to_total(self) -> None:
         model = RooflineModel()
@@ -63,7 +94,8 @@ class ModelDimsTests(unittest.TestCase):
 class HardwareTests(unittest.TestCase):
     def test_default_hardware_is_a100(self) -> None:
         hw = HardwareSpec()
-        self.assertEqual(hw.bandwidth_gbps, 1555.0)
+        # A100-SXM4-80GB HBM2e peak; 1555 GB/s is the 40 GB part.
+        self.assertEqual(hw.bandwidth_gbps, 2039.0)
         self.assertEqual(hw.peak_tflops, 312.0)
 
     def test_compute_efficiency_scales_tflops(self) -> None:
@@ -96,12 +128,12 @@ class RooflineTests(unittest.TestCase):
     def test_weight_streaming_floor_is_batch_independent(self) -> None:
         """The weight term is the same for every batch size."""
 
-        floor = self.model.weight_bytes() / (1555.0 * 1e9) * 1000.0
+        floor = self.model.weight_bytes() / (2039.0 * 1e9) * 1000.0
         for batch in (1, 8, 32):
             self.assertGreaterEqual(self.model.memory_bound_ms(batch, 1), floor)
 
     def test_compute_bound_crossover_is_in_the_hundreds(self) -> None:
-        # 2 * batch * 0.75e9 params vs 1.503 GB / 1555 GB/s at 312 TFLOP/s
+        # 2 * batch * 596e6 params vs 1.192 GB / 2039 GB/s at 312 TFLOP/s
         crossover = self.model.compute_bound_batch(seq_len=224)
         self.assertGreater(crossover, 100.0)
         self.assertLess(crossover, 1000.0)
@@ -242,10 +274,11 @@ class GapTableTests(unittest.TestCase):
         self.assertFalse(row["calibration_needed"])
         self.assertAlmostEqual(row["headroom_ms"], 1.5 - row["lower_bound_ms"], places=9)
         # The ceiling is bounded by the measured 1.5 ms, which is above the
-        # modeled 1.099 ms floor, so it sits between 666 and 910 tok/s.
+        # modeled 0.838 ms floor, so it sits below the 1193 tok/s bound and
+        # above what the wall time achieves (1/2.944 ms = 340 tok/s).
         ceiling = row["ceiling_tok_s_if_host_removed"]
-        self.assertGreater(ceiling, 600.0)
-        self.assertLess(ceiling, 950.0)
+        self.assertGreater(ceiling, 900.0)
+        self.assertLess(ceiling, 1200.0)
 
     def test_markdown_contains_warning_for_calibration(self) -> None:
         model = RooflineModel()
@@ -258,7 +291,7 @@ class GapTableTests(unittest.TestCase):
         )
         text = render_markdown(rows, model)
         self.assertIn("WARNING", text)
-        self.assertIn("1.503 GB", text)
+        self.assertIn("1.503 GB", text)  # untied model passed to gap_table here
 
 
 class CliTests(unittest.TestCase):
@@ -285,7 +318,12 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             payload = json.loads(out.read_text(encoding="utf-8"))
-            self.assertEqual(payload["weight_bytes"], RooflineModel().weight_bytes())
+            # The CLI's default target is Qwen3-0.6B, whose embeddings are tied,
+            # so it reports the tied footprint unless asked otherwise.
+            self.assertEqual(
+                payload["weight_bytes"], RooflineModel(tied_embedding=True).weight_bytes()
+            )
+            self.assertAlmostEqual(payload["weight_bytes"] / 1e9, 1.192, places=3)
             self.assertEqual([row["batch_size"] for row in payload["rows"]], [1, 8])
 
     def test_cli_rejects_malformed_wall_pairs(self) -> None:

@@ -24,6 +24,18 @@ class SamplingParamsTests(unittest.TestCase):
         params = SamplingParams(temperature=0.6)
         self.assertFalse(params.is_greedy)
 
+    def test_negative_temperature_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            SamplingParams(temperature=-0.1)
+
+    def test_non_positive_max_tokens_is_rejected(self):
+        """max_tokens <= 0 would decode forever instead of failing fast."""
+
+        for max_tokens in (0, -1):
+            with self.subTest(max_tokens=max_tokens):
+                with self.assertRaisesRegex(ValueError, "max_tokens"):
+                    SamplingParams(max_tokens=max_tokens)
+
 
 if __name__ == "__main__":
     unittest.main()

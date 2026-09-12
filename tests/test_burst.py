@@ -110,7 +110,53 @@ class ScheduleBurstTests(unittest.TestCase):
             sched.running.append(s)
         seqs, max_steps = sched.schedule_burst(burst_cap=64, max_batch=8)
         self.assertEqual(len(seqs), 2)
-        self.assertEqual(max_steps, 32)
+        # max_steps is the SMALLEST budget, not the largest: the device burst
+        # runs one length for the whole batch and never caps a sequence itself,
+        # so running the largest budget would overrun the shorter sequence's
+        # reserved blocks.
+        self.assertEqual(max_steps, 16)
+
+    def test_every_selected_seq_is_reserved_for_the_whole_burst(self):
+        """No selected sequence may be able to write past its block table.
+
+        This is the regression lock for the burst overrun: the kernel writes up
+        to ``position + max_steps`` for *every* row, and ``ldg_kv_ptr`` has no
+        bound check, so a sequence reserved for fewer than ``max_steps`` tokens
+        would spill into another sequence's physical blocks.
+        """
+
+        sched = make_scheduler(num_blocks=256, block_size=256, max_num_seqs=8)
+        long_seq = make_seq(10, max_tokens=64)
+        short_seq = make_seq(10, max_tokens=3)
+        for s in (long_seq, short_seq):
+            fully_prefill(sched, s)
+            sched.running.append(s)
+        seqs, max_steps = sched.schedule_burst(burst_cap=64, max_batch=8)
+        self.assertEqual(len(seqs), 2)
+        self.assertEqual(max_steps, 3)
+        for seq in seqs:
+            # Blocks reserved must cover position + max_steps for this row.
+            needed_blocks = (len(seq) + max_steps + 255) // 256
+            self.assertGreaterEqual(
+                len(seq.block_table),
+                needed_blocks,
+                f"seq {seq.seq_id} reserved {len(seq.block_table)} blocks but "
+                f"the burst will write through position {len(seq) + max_steps}",
+            )
+
+    def test_short_budget_clamps_the_burst_not_the_reservation(self):
+        """A tiny budget must shorten the burst, never leave a row unserved."""
+
+        sched = make_scheduler(num_blocks=64, block_size=256, max_num_seqs=8)
+        seqs_in = []
+        for max_tokens in (64, 64, 1):
+            s = make_seq(10, max_tokens=max_tokens)
+            fully_prefill(sched, s)
+            sched.running.append(s)
+            seqs_in.append(s)
+        seqs, max_steps = sched.schedule_burst(burst_cap=64, max_batch=8)
+        self.assertEqual(max_steps, 1)
+        self.assertEqual(len(seqs), 3)
 
     def test_respects_max_batch_limit(self):
         sched = make_scheduler(num_blocks=128, block_size=256, max_num_seqs=8)

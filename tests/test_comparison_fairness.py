@@ -130,6 +130,16 @@ class EosSentinelTests(unittest.TestCase):
     def test_empty_batch_falls_back_to_configured_eos(self) -> None:
         self.assertEqual(burst_eos_token(make_config(eos=151643), []), 151643)
 
+    def test_missing_eos_id_becomes_the_never_stop_sentinel(self) -> None:
+        """A tokenizer without an EOS id must not crash the burst path.
+
+        ``LLMEngine`` copies ``tokenizer.eos_token_id`` straight onto the config,
+        which is None for tokenizers that have no EOS.  ``int(None)`` used to
+        raise a TypeError out of ``run_burst`` before its try/except.
+        """
+
+        self.assertEqual(burst_eos_token(make_config(eos=None), [make_seq()]), -1)
+
     def test_run_burst_uses_the_helper(self) -> None:
         """The engine must not re-implement the sentinel decision."""
 
@@ -147,7 +157,10 @@ class CudagraphPaddingDocumentationTests(unittest.TestCase):
             REPO_ROOT / "src" / "nanovllm" / "engine" / "model_runner.py"
         ).read_text(encoding="utf-8")
         self.assertIn("[1, 2, 4, 8] + list(range(16, max_bs + 1, 16))", source)
-        self.assertIn("next(x for x in self.graph_bs if x >= bs)", source)
+        # A batch that falls between buckets must not raise: there is no graph
+        # for bs 9..15, so the lookup falls back to eager instead of StopIteration.
+        self.assertIn("next((x for x in self.graph_bs if x >= bs), None)", source)
+        self.assertIn("if bucket is None:", source)
 
     def test_padding_is_documented_in_the_fairness_doc(self) -> None:
         """docs/05 must state the bucket padding so the table is not read as clean."""

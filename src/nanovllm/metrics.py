@@ -301,6 +301,9 @@ def aggregate_requests(
     requests = list(requests)
     serialized = [request.to_dict() for request in requests]
     completed = [request for request in serialized if request["e2e_ms"] is not None]
+    # The request-level fields are already milliseconds.  Convert to seconds for
+    # the internal accounting (the throughput ratios below want seconds), then
+    # ask summarize() for milliseconds again via scale=1000.0 at the call sites.
     ttft_values = [request["ttft_ms"] / 1000.0 for request in completed if request["ttft_ms"] is not None]
     tpot_values = [request["tpot_ms"] / 1000.0 for request in completed if request["tpot_ms"] is not None]
     itl_values = [
@@ -340,10 +343,13 @@ def aggregate_requests(
         "wall_time_s": wall_time,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
-        "ttft_ms": summarize(ttft_values),
-        "tpot_ms": summarize(tpot_values),
-        "itl_ms": summarize(itl_values),
-        "e2e_ms": summarize(e2e_values),
+        # Request-level latency is stored in milliseconds; summarize() is asked
+        # for milliseconds, so it needs scale=1000.0 because the values above
+        # were converted to seconds for the throughput ratios.
+        "ttft_ms": summarize(ttft_values, scale=1000.0),
+        "tpot_ms": summarize(tpot_values, scale=1000.0),
+        "itl_ms": summarize(itl_values, scale=1000.0),
+        "e2e_ms": summarize(e2e_values, scale=1000.0),
         "prefill_time_ms": summarize(prefill_values, scale=1000.0),
         "decode_time_ms": summarize(decode_values, scale=1000.0),
         "cuda_prefill_time_ms": summarize(cuda_prefill_values, scale=1000.0),

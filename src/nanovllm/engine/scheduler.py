@@ -85,33 +85,54 @@ class Scheduler:
     ) -> tuple[list[Sequence], int]:
         """Select running sequences for a fixed-table no-sync megakernel burst.
 
-        Pre-allocates each sequence's decode blocks for up to
-        ``min(max_tokens - num_completion_tokens, burst_cap)`` new tokens so the
-        block table stays fixed for the whole burst. Returns ``(seqs,
-        max_steps)`` where ``max_steps`` is the largest per-seq token budget.
+        Pre-allocates each sequence's decode blocks for ``max_steps`` new tokens
+        so the block table stays fixed for the whole burst.  Returns ``(seqs,
+        max_steps)``.
 
-        Only sequences whose burst blocks can be allocated are included; if none
-        qualify the caller should fall back to the normal step-wise schedule.
-        Selected sequences stay in ``self.running`` (no rotation); finished
-        sequences are removed by :meth:`postprocess_burst`.
+        ``max_steps`` is the **smallest** budget of the selected sequences, not
+        the largest.  The device burst has no per-sequence cap: it deactivates a
+        sequence only on EOS, and runs the *same* ``max_steps`` for every row of
+        the batch.  Reserving only a sequence's own smaller budget while running
+        the batch maximum would therefore make that sequence write K/V past the
+        blocks it owns -- ``ldg_kv_ptr`` never bounds-checks, the padded
+        block-table entries are another sequence's physical blocks, so the
+        overrun silently corrupts a neighbour's KV (and then its attention).
+        Clamping to the minimum keeps the reservation and the run length equal
+        for every selected sequence, so no row can overrun.
+
+        The cost is that one short sequence limits the whole burst; it finishes
+        after this burst and the remainder is re-selected next step, so there is
+        no starvation, only more (shorter) bursts.
+
+        Only sequences whose blocks can be allocated for ``max_steps`` are
+        included; if none qualify the caller should fall back to the normal
+        step-wise schedule.  Selected sequences stay in ``self.running`` (no
+        rotation); finished sequences are removed by :meth:`postprocess_burst`.
         """
-        seqs: list[Sequence] = []
-        max_steps = 0
+        candidates: list[tuple[Sequence, int]] = []
         for seq in self.running:
-            if len(seqs) >= max_batch:
+            if len(candidates) >= max_batch:
                 break
             budget = min(
                 seq.max_tokens - seq.num_completion_tokens, burst_cap
             )
             if budget <= 0:
                 continue
-            if not self.block_manager.can_allocate_burst(seq, budget):
+            candidates.append((seq, budget))
+        if not candidates:
+            return [], 0
+
+        # Every selected sequence must be able to run the full burst length.
+        max_steps = min(budget for _, budget in candidates)
+        seqs: list[Sequence] = []
+        for seq, _ in candidates:
+            if not self.block_manager.can_allocate_burst(seq, max_steps):
                 continue
-            self.block_manager.allocate_burst(seq, budget)
+            self.block_manager.allocate_burst(seq, max_steps)
             seq.is_prefill = False
             seqs.append(seq)
-            if budget > max_steps:
-                max_steps = budget
+        if not seqs:
+            return [], 0
         return seqs, max_steps
 
     def postprocess_burst(

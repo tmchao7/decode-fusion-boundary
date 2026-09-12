@@ -283,7 +283,14 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            # Buckets are [1,2,4,8] + range(16, max_bs+1, 16), so a batch size
+            # between buckets (9..15, 17..31, ...) has no captured graph. Fall
+            # back to eager instead of letting `next(...)` raise StopIteration
+            # in the middle of a generation loop.
+            bucket = next((x for x in self.graph_bs if x >= bs), None)
+            if bucket is None:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs[bucket]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions

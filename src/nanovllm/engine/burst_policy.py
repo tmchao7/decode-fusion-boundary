@@ -53,8 +53,14 @@ def burst_batch_eligibility(config: Any, seqs: Sequence[Any]) -> tuple[bool, str
 
 
 def burst_eos_token(config: Any, seqs: Sequence[Any]) -> int:
-    """Device-side EOS argument for a burst: ``-1`` when the batch ignores EOS."""
+    """Device-side EOS argument for a burst: ``-1`` when the batch ignores EOS.
+
+    A tokenizer without an EOS id leaves ``config.eos`` as ``None``; that must
+    map to the ``-1`` "never deactivate" sentinel rather than reaching ``int()``
+    and raising a TypeError out of the burst path.
+    """
 
     if seqs and all(getattr(seq, "ignore_eos", False) for seq in seqs):
         return -1
-    return int(getattr(config, "eos", -1))
+    eos = getattr(config, "eos", -1)
+    return -1 if eos is None else int(eos)

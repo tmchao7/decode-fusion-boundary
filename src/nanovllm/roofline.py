@@ -75,24 +75,46 @@ class ModelDims:
         return self.vocab_size * self.hidden_size
 
     def params_lm_head(self, tied_embedding: bool = False) -> int:
-        """LM head parameters; ``tied_embedding`` folds it into the embedding."""
+        """LM head parameters.
 
-        return 0 if tied_embedding else self.vocab_size * self.hidden_size
+        The LM head is streamed in full on every decode step whether or not it is
+        tied to the embedding table (a tied model simply reuses that matrix), so
+        this is independent of ``tied_embedding``.  What differs is the
+        *embedding table*: see :meth:`total_params`.
+        """
+
+        return self.vocab_size * self.hidden_size
 
     def total_params(self, tied_embedding: bool = False) -> int:
+        """Parameters that must stream from HBM in one decode step.
+
+        The LM head matrix is always read in full (one row per vocabulary
+        entry).  The embedding table is read in full **only** when it is a
+        separate tensor; when the embeddings are tied the step reads just one
+        row per token, so the table itself is not part of the streaming traffic.
+        """
+
         return (
             self.num_layers * self.params_per_layer()
-            + self.params_embedding()
-            + self.params_lm_head(tied_embedding)
+            + (0 if tied_embedding else self.params_embedding())
+            + self.params_lm_head()
         )
 
 
 @dataclass(frozen=True)
 class HardwareSpec:
-    """Peak (or measured) device limits.  Defaults are A100-SXM4-80GB spec."""
+    """Peak (or measured) device limits.  Defaults are A100-SXM4-80GB spec.
+
+    ``bandwidth_gbps`` is the HBM2e peak of the **80 GB** SXM4 part (2039 GB/s).
+    The 1555 GB/s figure that used to live here is the 40 GB HBM2 part, so it
+    understated this device by ~24% and turned a real measurement into a
+    "physically impossible" alarm.  ``tools/bench_roofline_a100.py`` derives the
+    same value from the device clocks and bus width; prefer that measured value
+    when the probe has run (pass ``--bandwidth-gbps``).
+    """
 
     name: str = "A100-SXM4-80GB"
-    bandwidth_gbps: float = 1555.0
+    bandwidth_gbps: float = 2039.0
     peak_tflops: float = 312.0
     compute_efficiency: float = 1.0
 
@@ -181,21 +203,36 @@ class RooflineModel:
         """Bytes that every query token must stream from HBM in one step.
 
         This is the load_tokens term of the decode roofline: every weight is
-        touched by every query token.  It includes the LM head (which is the
-        single largest matrix) and the embedding table, because at the batch
-        sizes where embedding rows stop being negligible the step is already
-        compute-bound.  Use :meth:`weight_bytes_excl_embedding` for the term
-        that is independent of batch and sequence length.
+        touched by every query token.  It is the layer weights plus **one** read
+        of the LM head matrix.  The embedding table is counted only when it is a
+        separate tensor from the LM head -- an embedding *lookup* reads ``batch``
+        rows, never the whole table, so a tied model must not be charged for it
+        twice.
+
+        For Qwen3-0.6B (``tie_word_embeddings: true``) this is 1.192 GB, not the
+        1.503 GB that the old "embedding table + LM head" count produced; that
+        26% inflation is what made a real 0.74 ms/step look faster than HBM.
+        Use :meth:`weight_bytes_excl_embedding` for the batch-independent core.
         """
 
         return self.dims.total_params(self.tied_embedding) * self.bytes_per_param
 
-    def weight_bytes_excl_embedding(self) -> int:
-        """Weight bytes ignoring the embedding table (batch-independent core)."""
+    def core_weight_bytes(self) -> int:
+        """Layer weights plus one LM head read: the batch-independent core.
 
-        return self.dims.total_params(self.tied_embedding) * self.bytes_per_param - (
-            self.dims.vocab_size * self.dims.hidden_size * self.bytes_per_param
-        )
+        This is the traffic that exists regardless of how the embedding table is
+        stored, so it is the honest lower bound for one decode step.
+        """
+
+        return (
+            self.dims.num_layers * self.dims.params_per_layer()
+            + self.dims.params_lm_head()
+        ) * self.bytes_per_param
+
+    def weight_bytes_excl_embedding(self) -> int:
+        """Alias of :meth:`core_weight_bytes` (batch-independent core)."""
+
+        return self.core_weight_bytes()
 
     def embedding_bytes(self) -> int:
         return self.dims.vocab_size * self.dims.hidden_size * self.bytes_per_param
@@ -569,7 +606,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seq-len", type=int, default=224)
     parser.add_argument("--bandwidth-gbps", type=float, default=None)
     parser.add_argument("--peak-tflops", type=float, default=None)
-    parser.add_argument("--tied-embedding", action="store_true")
+    parser.add_argument(
+        "--tied-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "the LM head is the embedding table (default: true, which is "
+            "Qwen3-0.6B's tie_word_embeddings=true; the step then streams the "
+            "layers plus one LM head read = 1.192 GB). Use --no-tied-embedding "
+            "for a checkpoint with a separate embedding table and LM head."
+        ),
+    )
     parser.add_argument("--attn-blocks", type=int, default=8)
     parser.add_argument(
         "--kv-read-amp",
