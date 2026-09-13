@@ -1,40 +1,39 @@
 # Megakernel-vLLM
 
-A research implementation that extends nano-vLLM with a Qwen3-0.6B Megakernel
-decode backend and reproducible A100/V100 evaluation tooling.
+nano-vLLM extended with a Megakernel decode backend for Qwen3-0.6B on A100.
+The runtime is a **hybrid dispatch**: batch=1 uses a fused cooperative
+Megakernel (device-side EOS, no per-step host launch); batch≥2 falls back to
+standard CUDA Graph (full SM + tensor cores, no padding). This split is the
+measured conclusion, not a placeholder — see `docs/07` §10.
 
-## Current Scope
+## Architecture
 
-The repository currently contains three execution paths:
+```
+batch == 1  →  Megakernel persistent/paged kernel  (1.31x faster than cudagraph)
+batch >= 2  →  torch-cudagraph fallback             (megakernel is 15–135x the device floor)
+```
 
-- `torch-eager`: standard nano-vLLM PyTorch execution;
-- `torch-cudagraph`: standard nano-vLLM CUDA Graph execution;
-- `megakernel`: experimental Qwen3-0.6B BF16 greedy decode on an A100-class
-  GPU, with paged KV support and an initial batch limit of 32 sequences;
-  correctness and performance remain pending server validation.
+Three backends are available: `torch-eager` (reference), `torch-cudagraph`
+(production), and `megakernel` (experimental, batch=1 only by default).
+Unsupported requests fall back automatically and are marked in benchmark
+output.
 
-Megakernel requests that are unsupported or run on V100 fall back to the
-standard backend and are marked as non-comparable in benchmark reports.
+## Why This Split (measured on A100)
 
-## Where Megakernel Wins (measured, and where it does not)
+| fact | value | source |
+|---|---:|---|
+| attainable HBM bandwidth | 1728 GB/s (85% spec) | `bench_roofline_a100.py` |
+| weight floor (tied_embedding=True) | 1.192 GB → 0.77 ms/step | `roofline.py` |
+| device lower bound (probe + LM head) | 1.543 ms/step | `bench_burst_lower_bound.py` + verdict |
+| cudagraph host-free replay | 0.020 ms/step | `bench_burst_lower_bound.py` |
+| host overlay per step | 0.014 ms (not recoverable) | same |
+| megakernel batch=1 vs cudagraph | **1.31x E2E win** | `benchmarks.compare` |
+| megakernel batch=10 vs cudagraph | 48x the device floor | `account_decode.py` |
 
-The megakernel removes per-step host/launch overhead by fusing the whole
-Transformer decode into one cooperative kernel with device-side EOS. On A100
-with Qwen3-0.6B it beats `torch-cudagraph` at **batch=1** (1.04-1.31x E2E), but
-loses badly at **batch>1** (b8: 6.50 vs 0.43 ms/token), so the default dispatch
-is hybrid: batch=1 megakernel, batch>1 cudagraph.
-
-The analytical reason is in `src/nanovllm/roofline.py`: a decode step must
-stream **1.503 GB** of bf16 weights, which at ~1555 GB/s is a **0.97 ms/step**
-HBM floor shared by *any* implementation, and the step only turns
-compute-bound around batch≈243. `tools/account_decode.py` shows the cudagraph
-step is 2.94/3.43/3.55 ms at batch 1/8/32 while its pure GPU time is only
-0.74/0.77/0.77 ms -- i.e. **~2.5 ms of every step is host overhead that batch
-size merely amortizes.** Whether a batch>1 megakernel can win therefore depends
-entirely on getting its device side back near the 0.97 ms floor, which is what
-`RUN_MODE=roofline` measures *before* any kernel rewrite. See
-[docs/06](docs/07_架构结论_megakernel为何打不过cudagraph.md) §10 for the falsifiable
-decision rule.
+The device floor (1.543 ms) is **above** the 1.5 ms recoverable threshold, and
+cudagraph's host-free replay (0.020 ms) is far below it — so there is no
+device-side or host-side headroom for a batch>1 megakernel to win. The verdict
+is `DEVICE_BORDERLINE`; see `docs/07` §10.4 and `docs/06` §7.
 
 ## Repository Layout
 
@@ -96,7 +95,7 @@ Run the short correctness gate before long experiments:
 CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
 python -m tools.correctness_smoke /PATH/TO/Qwen3-0.6B \
   --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
-  --max-tokens 8 --require-megakernel \
+  --max-tokens 8 --require-megakernel --allow-cascade \
   --json results/a100-correctness.json
 ```
 
@@ -159,9 +158,11 @@ python -m compileall src/nanovllm benchmarks tools
 `tools/account_decode.py` splits each measured decode step into wall time, GPU
 time and host residual (and reads both the `benchmarks.compare` and
 `bench_burst_batch` JSON schemas). `tools/verdict.py` turns the probe outputs
-into a reproducible binary verdict — `DEVICE_RECOVERABLE`, `DEVICE_AT_FLOOR`,
-`DEVICE_UNREACHABLE`, `DEVICE_BORDERLINE`, `NEEDS_CALIBRATION` or
-`NEEDS_DATA` — with the thresholds locked by `tests/test_verdict.py`.
+into a reproducible verdict — `DEVICE_BORDERLINE`, `DEVICE_AT_FLOOR`,
+`DEVICE_UNREACHABLE`, `DEVICE_RECOVERABLE`, `NEEDS_CALIBRATION` or
+`NEEDS_DATA` — with thresholds locked by `tests/test_verdict.py`. The verdict
+includes an LM head stream correction (the probe skips `lm_head`, so the full
+device floor = probe + 0.180 ms at 1728 GB/s).
 
 ```bash
 python -m nanovllm.roofline --batch-sizes 1,8,32 --seq-len 160 --check-kernel
