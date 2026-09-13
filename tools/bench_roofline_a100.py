@@ -207,8 +207,13 @@ def bench_host_step(  # pragma: no cover - GPU only
             kernel_end = torch.cuda.Event(enable_timing=True)
             wall_start.record()
             kernel_start.record()
+            # Local chain variable: do not reassign the outer ``activation``
+            # (Python would then treat it as a local and raise
+            # UnboundLocalError on the first read).  Each call starts fresh
+            # from the original activation so the measured cost is stable.
+            x = activation
             for _ in range(4):  # mimic a short chain of dependent kernels
-                activation = (activation @ weight).contiguous()
+                x = (x @ weight).contiguous()
             kernel_end.record()
             wall_end.record()
             torch.cuda.synchronize()
@@ -359,7 +364,10 @@ def bench_barrier(  # pragma: no cover - GPU only
 
         module = load_inline(
             name="ldg_barrier_probe",
-            cpp_sources="double run_barrier_probe(int, int, int);",
+            # Must match the `extern "C"` definition in _BARRIER_SOURCE: a
+            # plain C++ declaration would mangle to _Z17run_barrier_probeiii
+            # and fail to link against the C-linkage definition.
+            cpp_sources='extern "C" double run_barrier_probe(int, int, int);',
             cuda_sources=_BARRIER_SOURCE,
             functions=["run_barrier_probe"],
             extra_cuda_cflags=["-O3", "-arch=sm_80"],

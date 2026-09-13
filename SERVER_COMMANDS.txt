@@ -54,7 +54,7 @@ export NANOVLLM_PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://mirrors.huawe
 select_gpu() {
   local candidates="/tmp/nanovllm_gpu_candidates.$$"
   local candidate free_mb
-  trap 'rm -f "$candidates"' RETURN
+  trap 'rm -f "${candidates:-}"' RETURN
   for candidate in $PREFERRED_GPUS; do
     free_mb="$(nvidia-smi --id="$candidate" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')"
     if [ -n "$free_mb" ]; then

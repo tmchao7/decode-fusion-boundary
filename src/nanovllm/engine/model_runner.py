@@ -422,6 +422,12 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # max_bs is always a capturable bucket so a non-bucket batch (e.g. 10)
+        # has a graph to replay; without this, batches in (8, 16) hit
+        # StopIteration on the ``next(x ... if x >= bs)`` lookup when
+        # max_num_seqs == batch_size (benchmarks/compare sets exactly that).
+        if max_bs > self.graph_bs[-1]:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 

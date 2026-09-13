@@ -162,10 +162,15 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
 // Returns the per-step time in ms on success, a negative code on failure.
 // Returning a double (rather than a double* out-param) keeps the C++ shim
 // trivially bindable: torch's load_inline has no converter for `double*`.
-extern "C" double run_lower_bound_probe(
-    const void *weights, unsigned long long bytes_per_layer,
+// The device pointer is passed as an unsigned long long (the value of
+// torch.Tensor.data_ptr()) rather than const void* because pybind11's
+// auto-binding for const void* under load_inline expects a capsule, not an
+// int.  An integer argument binds cleanly and we cast back to a pointer here.
+double run_lower_bound_probe(
+    unsigned long long weights_ptr, unsigned long long bytes_per_layer,
     unsigned long long buffer_bytes, int nlayers, int barriers_per_layer,
     int grid_blocks, int block_size, int iterations) {
+  const void *weights = (const void *)weights_ptr;
   if (weights == nullptr || nlayers <= 0 || grid_blocks <= 0 ||
       buffer_bytes == 0 || iterations <= 0)
     return -1.0;
@@ -292,8 +297,11 @@ def bench_lower_bound(  # pragma: no cover - GPU only
 
         module = load_inline(
             name="ldg_lower_bound_probe",
+            # First arg is a device pointer passed as unsigned long long
+            # (torch.Tensor.data_ptr()); const void* would make pybind11 expect
+            # a capsule under load_inline.  See _PROBE_SOURCE for the cast.
             cpp_sources=(
-                "double run_lower_bound_probe(const void*, unsigned long long, "
+                "double run_lower_bound_probe(unsigned long long, unsigned long long, "
                 "unsigned long long, int, int, int, int, int);"
             ),
             cuda_sources=_PROBE_SOURCE,
