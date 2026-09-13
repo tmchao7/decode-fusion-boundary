@@ -15,6 +15,16 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # Observability for the mixed-length burst overrun tripwire in
+        # schedule_burst() (consumed by tools/correctness_burst_mixed.py).
+        # Counters are bounded; the last-burst fields describe the most recent
+        # schedule_burst() call.
+        self.bursts_observed = 0
+        self.burst_max_steps_violations = 0
+        self.burst_reservation_violations = 0
+        self.last_burst_max_steps = 0
+        self.last_burst_budgets: list[int] = []
+        self.last_burst_reserved_tokens: list[int] = []
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -125,12 +135,36 @@ class Scheduler:
         # Every selected sequence must be able to run the full burst length.
         max_steps = min(budget for _, budget in candidates)
         seqs: list[Sequence] = []
-        for seq, _ in candidates:
+        selected_budgets: list[int] = []
+        for seq, budget in candidates:
             if not self.block_manager.can_allocate_burst(seq, max_steps):
                 continue
             self.block_manager.allocate_burst(seq, max_steps)
             seq.is_prefill = False
             seqs.append(seq)
+            selected_budgets.append(budget)
+
+        # Regression tripwire for the mixed-length overrun documented above.
+        # The device burst runs ``max_steps`` for every row, so max_steps must
+        # be the minimum budget and every selected sequence must be reserved
+        # for that whole length; otherwise a shorter row writes past its blocks.
+        # This is the same contract as ``tests/test_burst.py``, but checked on
+        # real GPU runs from tools/correctness_burst_mixed.py -- a token-level
+        # comparison cannot distinguish that corruption from the documented
+        # bf16 ulp cascade, so the guard needs this oracle-free signal.
+        # Cost is one pass over <= max_batch sequences per *burst* (not per
+        # token), and the counters are bounded.
+        self.bursts_observed += 1
+        self.last_burst_max_steps = max_steps
+        self.last_burst_budgets = selected_budgets
+        self.last_burst_reserved_tokens = [
+            len(seq.block_table) * self.block_size - len(seq) for seq in seqs
+        ]
+        if max_steps != min((budget for _, budget in candidates), default=0):
+            self.burst_max_steps_violations += 1
+        if any(reserved < max_steps for reserved in self.last_burst_reserved_tokens):
+            self.burst_reservation_violations += 1
+
         if not seqs:
             return [], 0
         return seqs, max_steps

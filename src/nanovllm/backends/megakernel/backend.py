@@ -121,15 +121,24 @@ class MegakernelBackend:
         # Reject here so the batch falls back to torch-cudagraph with a clear
         # reason instead of the launch aborting and the caller reading the
         # previous step's tokens.
-        batch_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
-        if len(seqs) > batch_limit:
-            return Compatibility(
-                False,
-                f"Megakernel batch decode supports at most {batch_limit} "
-                "sequences (grid partitioned per sequence with "
-                "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
-                "larger batches",
-            )
+        #
+        # Query the limit only when the batch could exceed it.  The limit is
+        # >= 1 for any launchable grid, so batch=1 always fits and the check is
+        # vacuous there; meanwhile wmma_batch_limit() issues CUDA driver calls
+        # (cudaGetDeviceProperties + cudaOccupancyMaxActiveBlocksPerMultiprocessor)
+        # and compatibility() runs on every decode step.  Batch=1 is the path
+        # that wins by removing per-step host work, so an unconditional query
+        # would tax exactly the path this project optimized.
+        if len(seqs) > 1:
+            batch_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
+            if len(seqs) > batch_limit:
+                return Compatibility(
+                    False,
+                    f"Megakernel batch decode supports at most {batch_limit} "
+                    "sequences (grid partitioned per sequence with "
+                    "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
+                    "larger batches",
+                )
         if _get_attr(config, "tensor_parallel_size", 1) != 1:
             return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
 

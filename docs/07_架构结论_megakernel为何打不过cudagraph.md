@@ -284,9 +284,9 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | **batch-aware 审计**（batch 是否直映 CTA/warp、tile/KV/mapping） | 部分完成 | 已确认每 GEMM 仅 4-12/80 block 干活（§9.7） |
 | 四象限对照（eager / CG / mega / mega+CG） | 待跑 | 区分 launch 消除 vs kernel 内效率（§9.8） |
 | **roofline 模型 + host/device 账本**（`roofline.py` / `tools/account_decode.py`） | ✅ 已落地（本地 26+6 单测） | 每步权重 1.192 GB（`tied_embedding=True`）、下界 0.585 ms（规格）/ 0.69 ms（实测）；已量化 host 残差 2.2-2.8 ms（§10） |
-| **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | **实测 1.363 ms（per-layer）+ 0.180 ms（lm_head 修正）= 1.543 ms > 1.5 ms → BORDERLINE（§10.4）** |
-| **实验 B：可达带宽标定**（1.192 GB `__ldg` 流式读） | ✅ A100 已跑（`tools/bench_roofline_a100.py`） | 1728 GB/s（84.7% 规格），解决"0.74 ms ⇒ 1.61 TB/s 超规格"的矛盾（§10.4） |
-| **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | host-free replay 0.020 ms/step；host overlay 0.014 ms（§9.8 象限 D） |
+| **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | **实测 1.364 ms（per-layer）+ 0.181 ms（lm_head 修正）= 1.545 ms > 1.5 ms → BORDERLINE（§10.4）** |
+| **实验 B：可达带宽标定**（1.192 GB `__ldg` 流式读） | ✅ A100 已跑（`tools/bench_roofline_a100.py`） | 1724 GB/s（84.5% 规格），解决"0.74 ms ⇒ 1.61 TB/s 超规格"的矛盾（§10.4） |
+| **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | host-free replay 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.011–0.014 ms（§9.8 象限 D） |
 | **二值判定工具**（`tools/verdict.py` + `tests/test_verdict.py`） | ✅ 已落地（26 个单测覆盖全部分支） | 六种 verdict 枚举；probe/带宽/账号任一缺失即 `NEEDS_DATA`，不猜结论；含 LM head 修正 |
 
 ## 7. 结论（更新为可执行判语）
@@ -656,20 +656,22 @@ megakernel 若能追平 device 侧: 0.77 + ~0.66 (barrier) + ~0.18 (lm_head) + ~
 |---|---|---|---|
 | **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** | **1.364 ms（per-layer）+ 0.181 ms（lm_head 修正）= 1.545 ms → BORDERLINE（实测）** |
 | **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来判定 10.2 里"0.74 ms 是否超过本机能力" | **1724 GB/s（84.5% 规格）→ 0.74 ms 隐含 1611 GB/s，可达，不是漏采** |
-| **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **0.020 ms/step；host overlay 0.014 ms（不可回收）** |
+| **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **host-free 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.011–0.014 ms（不可回收）** |
 
 **verdict**：**实测** `DEVICE_BORDERLINE`（完整下界 1.545 ms 刚过 1.5 ms；已用
 合并后的 `tools/verdict.py` 重跑 `RUN_MODE=roofline` 确认，见 [06](06_实际运行数据.md)
-§7）。但三个实测事实让 R3 不值得做：(1) host overlay 0.014 ms 不可回收；(2) cudagraph host-free
-replay 仅 0.020 ms，megakernel 没有 device 侧空间可赢；(3) 实测 megakernel-burst
-b>1 是完整下界的 **1.45–134.7x**（b1 2.241 ms、b32 207.885 ms）。**结论：固化
-"batch>1 回退 cudagraph"，不再投入 R3。**
+§7）。`full_device_floor_ms` 以 verdict JSON 为准（用 §7 表里舍入后的 1.364 复算得
+1.544，0.001 的差来自未舍入的 `ms_per_step_mean`）。但三个实测事实让 R3 不值得做：
+(1) host overlay 0.011 ms（b32）不可回收；(2) cudagraph host-free replay 0.029 ms
+（b32，verdict 选取的行），megakernel 没有 device 侧空间可赢；(3) 实测
+megakernel-burst b>1 是完整下界的 **14.7–134.7x**（b2 22.704 ms、b32 207.885 ms）。
+**结论：固化"batch>1 回退 cudagraph"，不再投入 R3。**
 
 **10.2 的表里那个"内部矛盾"是常量错，不是漏采**：0.74 ms/step 流 1.192 GB 需要
 1611 GB/s。旧文档说这超过 "A100 HBM2e 的 1.555 TB/s 规格"——但 1555 GB/s 是
 **40GB** 版 A100 的规格；本机是 **80GB（2039 GB/s）**。实验 B 标定可达带宽
-1728 GB/s，1611 GB/s 比它还低 7%，**完全可达**，所以不需要"nsys 漏采"假设。
-cudagraph 真实 device 侧 ≥ 0.690 ms（1.192 GB / 1728 GB/s），实测 0.74 ms =
+1724 GB/s，1611 GB/s 比它还低 7%，**完全可达**，所以不需要"nsys 漏采"假设。
+cudagraph 真实 device 侧 ≥ 0.692 ms（1.192 GB / 1724 GB/s），实测 0.74 ms =
 1.07x 墙。**"cudagraph 已贴带宽墙"现在是已证事实**。无论 device 侧是 0.74 还是
 1.5 ms，"可赚的是 host 开销"这个结论都不变（host 残差都在 1.5-2.8 ms 量级）。
 

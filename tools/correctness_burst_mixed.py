@@ -4,18 +4,33 @@ The ``schedule_burst`` fix (``max_steps = min(budget)``; every selected
 sequence reserved for the whole burst, ``scheduler.py``) prevents a short
 sequence in a mixed-length batch from writing K/V past its reserved blocks
 into a neighbour's slot on the device-side burst loop. The reservation
-invariant is unit-tested in ``tests/test_burst.py``; this tool is the
-on-GPU end-to-end check that no corruption surfaces in the generated tokens.
+invariant is unit-tested in ``tests/test_burst.py``.
 
-It runs ``torch-eager`` (reference) and ``megakernel-burst`` on the same
-batch whose per-sequence ``max_tokens`` alternate between ``--short-tokens``
-and ``--long-tokens``, all with ``ignore_eos=True`` so the burst path is
-taken and every sequence produces exactly its ``max_tokens``. The reference
-prompt length is chosen near ``kvcache_block_size`` (256) so that a
-``max_steps = max(budget)`` regression would make the short row write across
-a block boundary into the padded block-table entry (physical block 0 after
-the §8 padding fix), corrupting whichever sequence owns it. The comparison
-is classified PASS / CASCADE / FAIL exactly like ``tools/correctness_smoke``.
+This tool has two arms, because a token-level comparison alone **cannot** see
+the regression:
+
+1. **Scheduler tripwire (the real detector).** The run reads the scheduler's
+   ``burst_max_steps_violations`` / ``burst_reservation_violations`` counters
+   and fails if any burst ran longer than the minimum selected budget or
+   reserved fewer tokens than it ran. This is deterministic and independent of
+   numerical tolerance.
+2. **Token comparison (secondary smoke).** ``torch-eager`` (reference) and
+   ``megakernel-burst`` on the same batch whose per-sequence ``max_tokens``
+   alternate between ``--short-tokens`` and ``--long-tokens``, all with
+   ``ignore_eos=True`` so the burst path is taken. The comparison is classified
+   PASS / CASCADE / FAIL exactly like ``tools/correctness_smoke``.
+
+   Why arm 2 is not the detector: an overrun corrupts a *neighbour's* KV, which
+   shows up as that sequence diverging at a decode token >= 1 -- i.e. exactly
+   the documented ~1-ulp bf16 cascade that ``--allow-cascade`` tolerates.
+   ``length_check`` cannot see it either, because ``postprocess_burst``
+   truncates the short row back to its cap. So ``--allow-cascade`` is safe here
+   *only because* arm 1 carries the detection.
+
+The reference prompt length is chosen near ``kvcache_block_size`` (256) so that
+a ``max_steps = max(budget)`` regression would make the short row write across
+a block boundary into the padded block-table entry (physical block 0 after the
+§8 padding fix), corrupting whichever sequence owns it.
 """
 
 from __future__ import annotations
@@ -42,6 +57,21 @@ def caps_for_batch(batch_size: int, short_tokens: int, long_tokens: int) -> list
     return [short_tokens if slot % 2 == 0 else long_tokens for slot in range(batch_size)]
 
 
+def burst_guard_violations(guard: dict | None) -> int:
+    """Total scheduler burst-contract violations recorded by the tripwire.
+
+    ``max_steps`` must equal the minimum selected budget (otherwise a shorter
+    sequence runs past the blocks it reserved) and every selected sequence must
+    be reserved for the full burst length.  Either violation is a hard failure;
+    the tool must not fall back to the token comparison for this decision.
+    """
+
+    guard = guard or {}
+    return int(guard.get("max_steps_violations") or 0) + int(
+        guard.get("reservation_violations") or 0
+    )
+
+
 def run_backend(model: str, name: str, prompts: list[list[int]], caps: list[int]) -> dict:
     import torch
     from nanovllm import LLM, SamplingParams
@@ -60,6 +90,27 @@ def run_backend(model: str, name: str, prompts: list[list[int]], caps: list[int]
         result = llm.generate_with_metrics(prompts, params, use_tqdm=False)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        # Oracle-free half of this guard: the scheduler's own tripwire.  The
+        # device burst runs one max_steps for the whole batch, so max_steps must
+        # be the minimum per-sequence budget and every selected sequence must be
+        # reserved for that length.  A token comparison against torch-eager
+        # cannot see an overrun (it looks exactly like the documented bf16 ulp
+        # cascade), so this is the signal that actually catches a regression.
+        scheduler = getattr(llm, "scheduler", None)
+        result["burst_guard"] = {
+            "bursts_observed": int(getattr(scheduler, "bursts_observed", 0) or 0),
+            "max_steps_violations": int(
+                getattr(scheduler, "burst_max_steps_violations", 0) or 0
+            ),
+            "reservation_violations": int(
+                getattr(scheduler, "burst_reservation_violations", 0) or 0
+            ),
+            "last_max_steps": int(getattr(scheduler, "last_burst_max_steps", 0) or 0),
+            "last_budgets": list(getattr(scheduler, "last_burst_budgets", []) or []),
+            "last_reserved_tokens": list(
+                getattr(scheduler, "last_burst_reserved_tokens", []) or []
+            ),
+        }
         return result
     finally:
         llm.exit()
@@ -80,6 +131,7 @@ def _worker(connection, model: str, name: str, prompts, caps):
                 "result": {
                     "outputs": [item["token_ids"] for item in result["outputs"]],
                     "metrics": result["metrics"],
+                    "burst_guard": result.get("burst_guard"),
                 },
             }
         )
@@ -202,6 +254,24 @@ def main() -> None:
                 raise SystemExit(
                     f"Megakernel-burst was requested but did not execute for {case_id}"
                 )
+            burst_guard = result.get("burst_guard") or {}
+            checks[backend]["burst_guard"] = burst_guard
+            if backend == "megakernel-burst" and used_megakernel:
+                observed = int(burst_guard.get("bursts_observed") or 0)
+                violations = burst_guard_violations(burst_guard)
+                if observed <= 0:
+                    raise SystemExit(
+                        f"megakernel-burst ran but the scheduler observed no burst "
+                        f"for {case_id}; the mixed-length path was not exercised"
+                    )
+                if violations:
+                    raise SystemExit(
+                        f"mixed burst OVERRUN for {case_id}: the scheduler's "
+                        f"schedule_burst contract was violated "
+                        f"(max_steps must equal the minimum budget and every "
+                        f"selected sequence must be reserved for it); "
+                        f"burst_guard={burst_guard}"
+                    )
             if status == "FAIL":
                 raise SystemExit(
                     f"mixed burst correctness FAILED for {backend}/{case_id}: "
