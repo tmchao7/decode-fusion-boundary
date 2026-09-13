@@ -476,7 +476,7 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
             "probe_ms_per_step": probe["ms_per_step_mean"],
             "barrier_budget_ms": probe["barriers_per_layer"]
             * dims.num_layers
-            * 1.63e-3,
+            * 1.96e-3,  # measured 1.96 us/barrier on A100 with __launch_bounds__(512,1)
         }
     if "graph" in sections:
         report["host_free_graph"] = bench_host_free_graph(

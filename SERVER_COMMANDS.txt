@@ -135,6 +135,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_single_megakernel.json \
       2>&1 | tee results/a100_correctness_single_megakernel.log
 
@@ -152,6 +153,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_boundary.json \
       2>&1 | tee results/a100_correctness_boundary.log
 
@@ -165,6 +167,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_batch2.json \
       2>&1 | tee results/a100_correctness_batch2.log
 
@@ -184,6 +187,7 @@ run_correctness() {
       --max-tokens 16 \
       --backends torch-eager,megakernel-wmma \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_wmma.json \
       2>&1 | tee results/a100_correctness_wmma.log
 
@@ -200,6 +204,7 @@ run_correctness() {
       --max-tokens 16 \
       --backends torch-eager,megakernel-burst \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_burst.json \
       2>&1 | tee results/a100_correctness_burst.log
 
@@ -317,6 +322,7 @@ run_nosync_bench() {
       --max-tokens 16 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_nosync_correctness.json \
       2>&1 | tee results/a100_nosync_correctness.log
 

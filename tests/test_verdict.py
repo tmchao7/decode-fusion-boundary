@@ -99,13 +99,18 @@ class VerdictBranchTests(unittest.TestCase):
         self.assertIn("has not run", verdict.headline)
 
     def test_probe_without_bandwidth_is_needs_calibration(self) -> None:
-        """A recoverable-looking floor is still untrustworthy uncalibrated."""
+        """A recoverable-looking floor is still untrustworthy uncalibrated.
+
+        With tied_embedding=True (Qwen3-0.6B) the LM head correction uses the
+        spec bandwidth when no measured bandwidth is available, so the full
+        floor = probe + lm_head_at_spec = 1.2 + 0.200 = 1.400 ms.
+        """
 
         verdict = compute_verdict(
             roofline=_roofline(None), lower_bound=_lower_bound(1.2)
         )
         self.assertEqual(verdict.verdict, VERDICT_NEEDS_CALIBRATION)
-        self.assertIn("1.200", verdict.headline)
+        self.assertIn("1.400", verdict.headline)
 
     def test_probe_above_stop_threshold_is_unreachable(self) -> None:
         verdict = compute_verdict(
@@ -134,6 +139,35 @@ class VerdictBranchTests(unittest.TestCase):
         self.assertEqual(verdict.verdict, VERDICT_DEVICE_RECOVERABLE)
         self.assertAlmostEqual(verdict.device.probe_ms_per_step, 1.1, places=3)
         self.assertAlmostEqual(verdict.device.measured_ms_per_step, 98.5, places=3)
+
+    def test_lm_head_correction_promotes_recoverable_to_borderline(self) -> None:
+        """The probe streams per-layer weights only; the verdict adds the LM
+        head read analytically.  A probe of 1.4 ms looks recoverable, but the
+        LM head correction (~0.19 ms at 1600 GB/s) pushes the full floor to
+        ~1.59 ms -> borderline.
+        """
+
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.4),
+        )
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_BORDERLINE)
+        self.assertAlmostEqual(verdict.device.probe_ms_per_step, 1.4, places=3)
+        self.assertIsNotNone(verdict.device.lm_head_stream_ms)
+        self.assertIsNotNone(verdict.device.full_device_floor_ms)
+        self.assertGreater(
+            verdict.device.full_device_floor_ms, verdict.device.probe_ms_per_step
+        )
+        self.assertGreater(verdict.device.full_device_floor_ms, 1.5)
+
+    def test_lm_head_correction_fields_are_in_the_json(self) -> None:
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0),
+            lower_bound=_lower_bound(1.1),
+        )
+        d = verdict.to_dict()["device"]
+        self.assertIn("lm_head_stream_ms", d)
+        self.assertIn("full_device_floor_ms", d)
 
     def test_recoverable_probe_but_device_at_floor_reports_host_only(self) -> None:
         """Honesty guard: no device-side promise when the gap is already closed."""
@@ -217,6 +251,9 @@ class HostOverlayTests(unittest.TestCase):
 
 class CalibrationTests(unittest.TestCase):
     def test_contradiction_detected_from_documented_074ms(self) -> None:
+        # With tied_embedding=True (Qwen3-0.6B), the weight bytes are 1.192 GB
+        # (not 1.503 GB), so 0.74 ms implies 1.192/0.74*1000 ~= 1611 GB/s,
+        # still above the 1555 GB/s spec.
         verdict = compute_verdict(
             roofline=_roofline(1600.0),
             lower_bound=_lower_bound(1.1),
@@ -224,7 +261,7 @@ class CalibrationTests(unittest.TestCase):
         )
         self.assertTrue(verdict.calibration.contradiction_present)
         self.assertAlmostEqual(
-            verdict.calibration.implied_bandwidth_gbps, 2031.0, delta=5.0
+            verdict.calibration.implied_bandwidth_gbps, 1611.0, delta=5.0
         )
 
     def test_contradiction_absent_when_device_is_above_floor(self) -> None:
@@ -237,13 +274,17 @@ class CalibrationTests(unittest.TestCase):
         self.assertIsNone(verdict.calibration.implied_bandwidth_gbps)
 
     def test_measured_bandwidth_resolves_calibration(self) -> None:
+        # The implied rate (1611 GB/s) is above the spec (1555) but below the
+        # measured 1750 GB/s, so the rate IS reachable and the contradiction
+        # is resolved as "covers the whole step".  Use a lower measured bw
+        # (1500 < 1611) to exercise the "NOT reachable" branch.
         verdict = compute_verdict(
-            roofline=_roofline(1750.0),
+            roofline=_roofline(1500.0),
             lower_bound=_lower_bound(1.1),
             account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
         )
         self.assertTrue(verdict.calibration.resolved)
-        self.assertEqual(verdict.calibration.measured_bandwidth_gbps, 1750.0)
+        self.assertEqual(verdict.calibration.measured_bandwidth_gbps, 1500.0)
         self.assertTrue(any("NOT reachable" in note for note in verdict.calibration.notes))
 
     def test_needs_calibration_mentions_the_implied_rate(self) -> None:
@@ -253,7 +294,7 @@ class CalibrationTests(unittest.TestCase):
             account=_account(gpu_ms=0.74, host_ms=2.2, backend="torch", batch=2),
         )
         self.assertEqual(verdict.verdict, VERDICT_NEEDS_CALIBRATION)
-        self.assertTrue(any("2031" in action for action in verdict.actions))
+        self.assertTrue(any("1611" in action for action in verdict.actions))
 
 
 class DeviceRowSelectionTests(unittest.TestCase):

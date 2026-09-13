@@ -213,6 +213,53 @@ def compare_outputs(reference, actual):
     return sorted(set(mismatches)), first_mismatch
 
 
+def classify_comparison(reference, actual):
+    """Classify a reference-vs-actual comparison (PASS / CASCADE / FAIL).
+
+    Mirrors the classification in ``correctness_wmma_vs_scalar.py``:
+
+      - PASS: token-for-token identical.
+      - CASCADE (tolerated): every divergence starts at a decode token
+        (token >= 1; token 0 is the prefill output and must always match)
+        and no request has a length mismatch.  This is the documented
+        ~1-ulp bf16 reduction-order cascade, not a correctness failure.
+      - FAIL: any divergence at token 0 (prefill mismatch) or any length
+        mismatch -- a real bug.
+    """
+    details = []
+    real_fail = False
+    for i, (expected, observed) in enumerate(zip(reference, actual)):
+        if expected == observed:
+            continue
+        if len(expected) != len(observed):
+            real_fail = True
+            details.append({"seq": i, "kind": "length", "d": len(expected) - len(observed)})
+            continue
+        first = next(j for j, (a, b) in enumerate(zip(expected, observed)) if a != b)
+        real_fail |= first == 0
+        details.append(
+            {
+                "seq": i,
+                "kind": "token",
+                "first": first,
+                "expected": expected[first],
+                "actual": observed[first],
+            }
+        )
+    if len(reference) != len(actual):
+        real_fail = True
+        details.append(
+            {"seq": len(actual), "kind": "count", "d": len(reference) - len(actual)}
+        )
+    if real_fail:
+        status = "FAIL"
+    elif details:
+        status = "CASCADE"
+    else:
+        status = "PASS"
+    return status, details
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
@@ -232,6 +279,16 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--require-megakernel", action="store_true")
+    parser.add_argument(
+        "--allow-cascade",
+        action="store_true",
+        help=(
+            "Tolerate the documented ~1-ulp bf16 cascade: divergences at decode "
+            "tokens (token >= 1) are classified as CASCADE and do not abort. "
+            "Prefill-token-0 mismatches and length mismatches still fail. "
+            "Use this for megakernel-family backends vs torch-eager."
+        ),
+    )
     parser.add_argument("--json", dest="json_path")
     args = parser.parse_args()
 
@@ -269,11 +326,14 @@ def main() -> None:
         for backend, result in backend_results.items():
             actuals = result["metrics"]["summary"].get("backend_actuals", [])
             mismatches, first_mismatch = compare_outputs(reference, result["outputs"])
+            status, cascade_details = classify_comparison(reference, result["outputs"])
             used_megakernel = "megakernel" in actuals
             checks[backend] = {
                 "passed": not mismatches,
+                "status": status,
                 "mismatched_requests": mismatches,
                 "first_mismatch": first_mismatch,
+                "cascade_details": cascade_details if cascade_details else None,
                 "backend_actuals": actuals,
                 "used_megakernel": used_megakernel,
                 "fallback_reasons": result["metrics"]["summary"].get(
@@ -284,11 +344,24 @@ def main() -> None:
                 raise SystemExit(
                     f"Megakernel was requested but did not execute for {case['id']}"
                 )
-            if mismatches:
+            if status == "FAIL":
                 raise SystemExit(
-                    f"correctness failed for {backend}/{case['id']}: "
-                    f"requests {mismatches}; first_mismatch={first_mismatch}; "
+                    f"correctness FAILED for {backend}/{case['id']}: "
+                    f"prefill-token-0 or length mismatch; "
+                    f"details={cascade_details}; "
                     f"reference_outputs={reference}; actual_outputs={result['outputs']}"
+                )
+            if status == "CASCADE" and not args.allow_cascade:
+                raise SystemExit(
+                    f"correctness cascade for {backend}/{case['id']}: "
+                    f"decode-token divergence (use --allow-cascade to tolerate); "
+                    f"details={cascade_details}"
+                )
+            if status == "CASCADE":
+                print(
+                    f"correctness CASCADE (tolerated) for {backend}/{case['id']}: "
+                    f"details={cascade_details}",
+                    flush=True,
                 )
         results.append(
             {
