@@ -283,9 +283,9 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | 四象限对照（eager / CG / mega / mega+CG） | 待跑 | 区分 launch 消除 vs kernel 内效率（§9.8） |
 | **roofline 模型 + host/device 账本**（`roofline.py` / `tools/account_decode.py`） | ✅ 已落地（本地 26+6 单测） | 每步权重 1.192 GB（`tied_embedding=True`）、下界 0.77 ms；已量化 host 残差 2.2-2.8 ms（§10） |
 | **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | **实测 1.363 ms（per-layer）+ 0.180 ms（lm_head 修正）= 1.543 ms > 1.5 ms → BORDERLINE（§10.4）** |
-| **实验 B：可达带宽标定**（1.192 GB `__ldg` 流式读） | ✅ A100 已跑（`tools/bench_roofline_a100.py`） | 1728 GB/s（84.7% 规格），解决"0.74 ms ⇒ 2.03 TB/s 超规格"的矛盾（§10.4） |
+| **实验 B：可达带宽标定**（1.192 GB `__ldg` 流式读） | ✅ A100 已跑（`tools/bench_roofline_a100.py`） | 1728 GB/s（84.7% 规格），解决"0.74 ms ⇒ 1.61 TB/s 超规格"的矛盾（§10.4） |
 | **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | host-free replay 0.020 ms/step；host overlay 0.014 ms（§9.8 象限 D） |
-| **二值判定工具**（`tools/verdict.py` + `tests/test_verdict.py`） | ✅ 已落地（24 个单测覆盖全部分支） | 六种 verdict 枚举；probe/带宽/账号任一缺失即 `NEEDS_DATA`，不猜结论；含 LM head 修正 |
+| **二值判定工具**（`tools/verdict.py` + `tests/test_verdict.py`） | ✅ 已落地（26 个单测覆盖全部分支） | 六种 verdict 枚举；probe/带宽/账号任一缺失即 `NEEDS_DATA`，不猜结论；含 LM head 修正 |
 
 ## 7. 结论（更新为可执行判语）
 
@@ -322,7 +322,7 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 - **不要**把 barrier 原始成本当成 ~7-8ms 主开销——实测 pure barrier 仅 0.55ms，
   真正成本是它强制的层间串行潜伏期 + SM 空转。
 - **不要**说"高并发下 device 侧还有几倍余量"——除非 §10.4 实验 B/C 推翻了
-  "cudagraph 已贴带宽墙"这个强假设。0.74 ms 对应 2.03 TB/s 已超过 A100 规格，
+  "cudagraph 已贴带宽墙"这个强假设。0.74 ms 对应 1.61 TB/s 已超过 A100 规格，
   这个矛盾必须先解决，否则数字读法会出错。
 - **不要**在 batch≥8 上承诺 speedup——并行 batch 上限 ≈10，架构上没有吞吐优势。
 - **不要**在 §10.4 实验 A 出结果之前动 `kernel.cu` 的 batch 路径（probe 若 >3 ms/step，
@@ -645,7 +645,7 @@ megakernel 若能追平 device 侧: 0.77 + ~0.66 (barrier) + ~0.18 (lm_head) + ~
 | 实验 | 怎么测 | 判据 | 实测结果 |
 |---|---|---|---|
 | **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** | **1.363 ms（per-layer）+ 0.180 ms（lm_head 修正）= 1.543 ms → BORDERLINE** |
-| **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来解释 10.2 里"0.74 ms 意味着 2.03 TB/s（超过 A100 规格）"这个矛盾 | **1728 GB/s（84.7% 规格）→ 0.74 ms 确认是 nsys 漏采** |
+| **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来解释 10.2 里"0.74 ms 意味着 1.61 TB/s（超过 A100 规格）"这个矛盾 | **1728 GB/s（84.7% 规格）→ 0.74 ms 确认是 nsys 漏采** |
 | **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **0.020 ms/step；host overlay 0.014 ms（不可回收）** |
 
 **verdict**：`DEVICE_BORDERLINE`（完整下界 1.543 ms 刚过 1.5 ms）。但三个实测
@@ -734,7 +734,7 @@ P1 项）。
   的阈值输出八种枚举之一：`DEVICE_BORDERLINE / HOST_BOUND_OPPORTUNITY /
   DEVICE_AT_FLOOR / DEVICE_BOUND_CUDA_GRAPH / DEVICE_UNREACHABLE / DEVICE_RECOVERABLE /
   NEEDS_CALIBRATION / NEEDS_DATA`，并附证据与行动；阈值分支由
-  `tests/test_verdict.py` 的 24 个测试锁定。verdict 含 LM head 修正
+  `tests/test_verdict.py` 的 26 个测试锁定。verdict 含 LM head 修正
   （`full_device_floor_ms = probe + lm_head_stream_ms`）。
 - **两个诚实护栏**：`DEVICE_AT_FLOOR`——probe 快 ≠ 有收益，若现有 kernel 已在下界
   附近，结论必须落在 host 侧；`DEVICE_BOUND_CUDA_GRAPH`——判定还要拿 §10.4 实验 C 的

@@ -79,3 +79,13 @@ class ClassifyComparisonTests(unittest.TestCase):
         status, details = classify_comparison([[1, 2], [3, 4]], [[1, 2]])
         self.assertEqual(status, "FAIL")
         self.assertTrue(any(d["kind"] == "count" for d in details))
+
+    def test_empty_outputs_are_pass(self):
+        status, details = classify_comparison([], [])
+        self.assertEqual(status, "PASS")
+        self.assertEqual(details, [])
+
+    def test_single_token_prefill_only_mismatch_is_fail(self):
+        """With only one token (prefill), any mismatch is FAIL (token 0)."""
+        status, _ = classify_comparison([[1]], [[99]])
+        self.assertEqual(status, "FAIL")

@@ -349,6 +349,15 @@ class ReportTests(unittest.TestCase):
         self.assertIn("## Actions", text)
         self.assertIn("device lower bound probe", text)
 
+    def test_markdown_reports_lm_head_correction(self) -> None:
+        """The LM head correction must appear in the markdown evidence."""
+        verdict = compute_verdict(
+            roofline=_roofline(1600.0), lower_bound=_lower_bound(1.4)
+        )
+        text = render_markdown(verdict)
+        self.assertIn("LM head", text)
+        self.assertIn("full device floor", text)
+
     def test_json_round_trips_all_fields(self) -> None:
         verdict = compute_verdict(
             roofline=_roofline(1600.0),
