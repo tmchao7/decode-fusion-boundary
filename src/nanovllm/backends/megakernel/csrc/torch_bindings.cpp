@@ -31,14 +31,17 @@ extern "C" int ldg_wmma_max_supported_batch(int requested_blocks);
 
 /// Reject a batch the batch kernel cannot launch.
 ///
-/// Without this the C++ launch helper prints to stderr and returns, the void
-/// binding reports success, and the Python caller reads the *previous* step's
-/// tokens out of ``output_tokens`` as if they were fresh output.
-static void check_wmma_batch_supported(int64_t batch_size) {
+/// Both the scalar and WMMA batch kernels partition the resident cooperative
+/// grid across sequences (blocks_per_seq = grid_blocks / batch_size) and need
+/// at least LDG_ATTN_BLOCKS blocks per sequence.  Without this check the C++
+/// launch helper prints to stderr and returns, the void binding reports
+/// success, and the Python caller reads the *previous* step's tokens out of
+/// ``output_tokens`` as if they were fresh output.
+static void check_batch_supported(int64_t batch_size) {
   const int max_batch = ldg_wmma_max_supported_batch(0);
   if (max_batch > 0 && batch_size > max_batch) {
     TORCH_CHECK(false,
-                "megakernel WMMA batch decode supports at most ", max_batch,
+                "megakernel batch decode supports at most ", max_batch,
                 " sequences (got ", batch_size,
                 "); the cooperative grid is partitioned per sequence and needs "
                 "at least LDG_ATTN_BLOCKS=8 blocks per sequence. Use "
@@ -298,6 +301,12 @@ void decode_paged_batch(
     }
   }
 
+  check_batch_supported(input_token_ids.numel());
+  // Defence-in-depth: sentinel the output so that if the launch aborts after
+  // this point (e.g. a caller bypassed the check via a different path), the
+  // Python caller reads -1 instead of the previous step's tokens.
+  output_tokens.fill_(-1);
+
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   launch_ldg_decode_paged_batch(
       input_token_ids.data_ptr(), positions.data_ptr(), block_tables.data_ptr(),
@@ -330,7 +339,7 @@ void decode_paged_batch_wmma(
     double attn_scale) {
   TORCH_CHECK(input_token_ids.numel() > 0 && input_token_ids.numel() <= 32,
               "decode_paged_batch_wmma supports 1-32");
-  check_wmma_batch_supported(input_token_ids.numel());
+  check_batch_supported(input_token_ids.numel());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   launch_ldg_decode_batch_wmma(
       input_token_ids.data_ptr(), positions.data_ptr(),
@@ -495,7 +504,7 @@ torch::Tensor generate_nosync_paged_batch(
                   block_tables.size(0) == input_token_ids.numel(),
               "block_tables must be a contiguous int32 2D CUDA tensor");
   TORCH_CHECK(max_steps > 0, "max_steps must be positive");
-  check_wmma_batch_supported(input_token_ids.numel());
+  check_batch_supported(input_token_ids.numel());
 
   int batch_size = static_cast<int>(input_token_ids.numel());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();

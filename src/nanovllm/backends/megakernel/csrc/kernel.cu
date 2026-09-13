@@ -2356,10 +2356,10 @@ static bool ldg_batch_is_launchable(int batch_size, int grid_blocks) {
   if (reason == nullptr) {
     return true;
   }
-  fprintf(stderr, "Megakernel WMMA batch: %s\n", reason);
+  fprintf(stderr, "Megakernel batch: %s\n", reason);
   // This helper returns void, so stderr alone would leave the caller reading the
   // previous step's tokens as fresh output.  The observable rejection is done
-  // before the launch by the torch binding (check_wmma_batch_supported) and by
+  // before the launch by the torch binding (check_batch_supported) and by
   // MegakernelBackend.compatibility(); this backstop only covers a caller that
   // bypassed both, and it deliberately does not fake a CUDA error.
   (void)cudaGetLastError();
@@ -2455,16 +2455,14 @@ extern "C" void launch_ldg_decode_paged_batch(
   int grid_blocks = ldg_resident_grid_blocks(
       ldg_decode_kernel_batch, LDG_NUM_BLOCKS);
   // Partition the cooperative grid into per-sequence groups. Each sequence
-  // needs at least LDG_ATTN_BLOCKS blocks for its attention; we must also use
-  // a multiple of batch_size so every sequence gets an equal group.
-  int blocks_per_seq = grid_blocks / batch_size;
-  if (blocks_per_seq < LDG_ATTN_BLOCKS) {
-    fprintf(stderr,
-            "Megakernel parallel batch needs >= %d blocks per sequence "
-            "(occupancy allows %d total for %d seqs)\n",
-            LDG_ATTN_BLOCKS, grid_blocks, batch_size);
+  // needs at least LDG_ATTN_BLOCKS blocks for its attention; the shared
+  // backstop rejects (and logs) an unsupported batch.  The binding-level
+  // TORCH_CHECK is the primary guard; this backstop covers callers that
+  // bypassed it.
+  if (!ldg_batch_is_launchable(batch_size, grid_blocks)) {
     return;
   }
+  int blocks_per_seq = grid_blocks / batch_size;
   grid_blocks = blocks_per_seq * batch_size;
 
   void *kernel_args[] = {

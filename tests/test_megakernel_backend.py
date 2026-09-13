@@ -269,7 +269,12 @@ class WmmaBatchLimitTests(unittest.TestCase):
             )
         self.assertTrue(decision.supported, decision.reason)
 
-    def test_scalar_kernel_is_not_subject_to_the_wmma_limit(self):
+    def test_scalar_kernel_is_also_subject_to_the_batch_limit(self):
+        """P0-1: the scalar batch kernel shares the same grid-partitioning
+        constraint as WMMA (blocks_per_seq >= LDG_ATTN_BLOCKS), so both paths
+        must enforce the occupancy limit.  Without this, batch 11-32 with
+        ``megakernel_batch_kernel="scalar"`` silently returns the previous
+        step's tokens when the launch aborts."""
         config = self.make_config(megakernel_batch_kernel="scalar")
         with mock.patch(
             "nanovllm.backends.megakernel.backend.wmma_batch_limit",
@@ -278,8 +283,8 @@ class WmmaBatchLimitTests(unittest.TestCase):
             decision = MegakernelBackend.compatibility(
                 config, self._seqs(11), is_prefill=False
             )
-        # 11 <= max_num_seqs=32, and the scalar kernel keeps the wider limit.
-        self.assertTrue(decision.supported, decision.reason)
+        self.assertFalse(decision.supported)
+        self.assertIn("at most 10 sequences", decision.reason)
 
 if __name__ == "__main__":
     unittest.main()

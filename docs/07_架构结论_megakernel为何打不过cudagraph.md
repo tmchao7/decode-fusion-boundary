@@ -654,13 +654,13 @@ megakernel 若能追平 device 侧: 0.77 + ~0.66 (barrier) + ~0.18 (lm_head) + ~
 
 | 实验 | 怎么测 | 判据 | 实测结果 |
 |---|---|---|---|
-| **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** | **1.363 ms（per-layer）+ 0.180 ms（lm_head 修正）= 1.543 ms → BORDERLINE** |
-| **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来判定 10.2 里"0.74 ms 是否超过本机能力" | **1728 GB/s（84.7% 规格）→ 0.74 ms 隐含 1611 GB/s，可达，不是漏采** |
+| **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** | **1.364 ms（per-layer）+ 0.181 ms（lm_head 修正）= 1.545 ms → BORDERLINE（实测）** |
+| **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来判定 10.2 里"0.74 ms 是否超过本机能力" | **1724 GB/s（84.5% 规格）→ 0.74 ms 隐含 1611 GB/s，可达，不是漏采** |
 | **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **0.020 ms/step；host overlay 0.014 ms（不可回收）** |
 
-**verdict**：**预期** `DEVICE_BORDERLINE`（完整下界 1.543 ms 刚过 1.5 ms；判定
-工具待用修正后的 `tools/verdict.py` 重跑，见 [06](06_实际运行数据.md) §7）。但三个
-实测事实让 R3 不值得做：(1) host overlay 0.014 ms 不可回收；(2) cudagraph host-free
+**verdict**：**实测** `DEVICE_BORDERLINE`（完整下界 1.545 ms 刚过 1.5 ms；已用
+合并后的 `tools/verdict.py` 重跑 `RUN_MODE=roofline` 确认，见 [06](06_实际运行数据.md)
+§7）。但三个实测事实让 R3 不值得做：(1) host overlay 0.014 ms 不可回收；(2) cudagraph host-free
 replay 仅 0.020 ms，megakernel 没有 device 侧空间可赢；(3) 实测 megakernel-burst
 b>1 是完整下界的 **1.45–134.7x**（b1 2.241 ms、b32 207.885 ms）。**结论：固化
 "batch>1 回退 cudagraph"，不再投入 R3。**

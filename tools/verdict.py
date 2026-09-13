@@ -218,27 +218,44 @@ def _measured_device_row(
 def _host_free_evidence(
     lower_bound: dict | None,
 ) -> tuple[float | None, float | None, list[int]]:
-    """Return (host_free_ms_per_step, host_inclusive_ms_per_step, batches)."""
+    """Return (host_free_ms_per_step, host_inclusive_ms_per_step, batches).
+
+    Both values are taken from the **same row** (same batch size) so the
+    overlay (inclusive - free) is meaningful.  The previous implementation
+    took ``min(free)`` and ``min(inclusive)`` separately, which could pair
+    values from different batches — e.g. b1's tiny ``free`` with b8's large
+    ``inclusive`` — and mask the true host overlay, flipping
+    ``DEVICE_BOUND_CUDA_GRAPH`` into ``DEVICE_RECOVERABLE``.
+
+    The largest batch is selected because the verdict is about the batch>1
+    question; batch=1's overlay is irrelevant for that decision.
+    """
 
     if not lower_bound:
         return None, None, []
     rows = lower_bound.get("host_free_graph") or []
-    free, inclusive, batches = [], [], []
+    best_row: dict | None = None
+    best_batch = -1
+    batches: list[int] = []
     for row in rows:
-        value = row.get("ms_per_step_host_free")
-        if isinstance(value, (int, float)) and value > 0:
-            free.append(float(value))
-            batches.append(int(row.get("batch_size") or 0))
-            host_inclusive = row.get("ms_per_step_host_inclusive")
-            if isinstance(host_inclusive, (int, float)) and host_inclusive > 0:
-                inclusive.append(float(host_inclusive))
-    if not free:
+        free = row.get("ms_per_step_host_free")
+        if not (isinstance(free, (int, float)) and free > 0):
+            continue
+        batch = int(row.get("batch_size") or 0)
+        batches.append(batch)
+        if batch > best_batch:
+            best_batch = batch
+            best_row = row
+    if best_row is None:
         return None, None, []
-    return (
-        min(free),
-        min(inclusive) if inclusive else None,
-        batches,
+    free_ms = float(best_row["ms_per_step_host_free"])
+    inclusive_raw = best_row.get("ms_per_step_host_inclusive")
+    inclusive_ms = (
+        float(inclusive_raw)
+        if isinstance(inclusive_raw, (int, float)) and inclusive_raw > 0
+        else None
     )
+    return free_ms, inclusive_ms, batches
 
 
 def _build_host_overlay(

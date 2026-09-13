@@ -231,13 +231,54 @@ class HostOverlayTests(unittest.TestCase):
         self.assertIsNone(verdict.host_overlay.megakernel_could_win)
         self.assertEqual(verdict.verdict, VERDICT_DEVICE_RECOVERABLE)
 
-    def test_host_free_min_across_batches(self) -> None:
-        lower_bound = _lower_bound(1.0, host_free=2.0)
+    def test_host_free_uses_the_largest_batch_row(self) -> None:
+        """The overlay must be computed within a single row (same batch), not
+        by mixing values from different batches.  The largest batch is
+        selected because the verdict is about the batch>1 question."""
+        lower_bound = _lower_bound(1.0, host_free=2.0, host_inclusive=3.0)
+        # Batch 1 has a smaller free, but we should select batch 32.
         lower_bound["host_free_graph"][0]["ms_per_step_host_free"] = 1.4
+        lower_bound["host_free_graph"][0]["ms_per_step_host_inclusive"] = 1.5
         verdict = compute_verdict(roofline=_roofline(1600.0), lower_bound=lower_bound)
         self.assertAlmostEqual(
-            verdict.host_overlay.host_free_ms_per_step, 1.4, places=3
+            verdict.host_overlay.host_free_ms_per_step, 2.0, places=3
         )
+        self.assertAlmostEqual(
+            verdict.host_overlay.host_inclusive_ms_per_step, 3.0, places=3
+        )
+
+    def test_overlay_does_not_mix_free_and_inclusive_from_different_batches(self) -> None:
+        """Regression for P0-3: _host_free_evidence used to take min(free) and
+        min(inclusive) from different rows, which could pair b1's tiny free
+        with b8's large inclusive and mask the true overlay, flipping
+        DEVICE_BOUND_CUDA_GRAPH into DEVICE_RECOVERABLE.
+
+        With the fix, both values come from batch=32 (the largest):
+        free=0.03, inclusive=3.03 -> overlay=3.0 (material) -> DEVICE_BOUND_CUDA_GRAPH.
+        The old buggy code would mix free=0.01 (b8) with inclusive=0.12 (b1)
+        -> overlay=0.11 (not material) -> DEVICE_RECOVERABLE.
+        """
+        lower_bound = _lower_bound(1.0)
+        lower_bound["host_free_graph"] = [
+            {"batch_size": 1, "ms_per_step_host_free": 0.02,
+             "ms_per_step_host_inclusive": 0.12},
+            {"batch_size": 8, "ms_per_step_host_free": 0.01,
+             "ms_per_step_host_inclusive": 2.51},
+            {"batch_size": 32, "ms_per_step_host_free": 0.03,
+             "ms_per_step_host_inclusive": 3.03},
+        ]
+        verdict = compute_verdict(roofline=_roofline(1600.0), lower_bound=lower_bound)
+        self.assertAlmostEqual(
+            verdict.host_overlay.host_free_ms_per_step, 0.03, places=3
+        )
+        self.assertAlmostEqual(
+            verdict.host_overlay.host_inclusive_ms_per_step, 3.03, places=3
+        )
+        self.assertAlmostEqual(
+            verdict.host_overlay.measured_host_ms_per_step, 3.0, places=2
+        )
+        self.assertTrue(verdict.host_overlay.host_overlay_material)
+        self.assertEqual(verdict.verdict, VERDICT_DEVICE_BOUND_CUDA_GRAPH)
 
     def test_markdown_reports_the_host_overlay(self) -> None:
         verdict = compute_verdict(

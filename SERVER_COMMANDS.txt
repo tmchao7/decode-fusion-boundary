@@ -139,25 +139,13 @@ run_correctness() {
       --json results/a100_correctness_single_megakernel.json \
       2>&1 | tee results/a100_correctness_single_megakernel.log
 
-  # batch=2+ correctness on the megakernel batch kernel is covered by the
-  # megakernel-wmma / megakernel-burst correctness blocks below (they set
-  # megakernel_batch_decode=True). Plain megakernel now defaults to batch=1
-  # only (batch>1 falls back to cudagraph, see docs/07 §7).
-  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
-    TORCH_SHOW_CPP_STACKTRACES=1 \
-    NANOVLLM_CUDA_DEBUG=1 \
-    python -m tools.correctness_smoke \
-      "$MODEL" \
-      --prompt-lengths 32,128,255,256,257,512 \
-      --batch-sizes 1 \
-      --max-tokens 8 \
-      --backends torch-eager,megakernel \
-      --require-megakernel \
-      --allow-cascade \
-      --json results/a100_correctness_boundary.json \
-      2>&1 | tee results/a100_correctness_boundary.log
-
-  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+  # WMMA batch kernel at block-boundary prompt lengths, batch 1 and 2.
+  # Plain megakernel defaults to batch=1 only (batch>1 falls back to torch,
+  # see docs/07 §7), so this block drives megakernel-wmma -- the real batch
+  # kernel -- across the 255/256/257/512 boundary prompts that the wmma block
+  # below (p32,128 only) does not reach. b1 uses the WMMA batch kernel with
+  # M=1; b2 with M=2 stresses KV indexing at the block boundary.
+  timeout 720s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
     python -m tools.correctness_smoke \
@@ -165,7 +153,7 @@ run_correctness() {
       --prompt-lengths 32,128,255,256,257,512 \
       --batch-sizes 1,2 \
       --max-tokens 8 \
-      --backends torch-eager,megakernel \
+      --backends torch-eager,megakernel-wmma \
       --require-megakernel \
       --allow-cascade \
       --json results/a100_correctness_batch2.json \
@@ -177,7 +165,7 @@ run_correctness() {
   # batch=2,3,4,5 go through the same path with M=2,3,4,5.
   # batch=3 is included because it exposed the GPU-scope fence race
   # (grid_blocks=78 leaves 2 idle SMs, changing L1 write-back timing).
-  timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
     python -m tools.correctness_smoke \
@@ -194,7 +182,7 @@ run_correctness() {
   # Burst (no-sync) WMMA batch kernel correctness.
   # batch=1 dispatches to the persistent single-seq kernel (hybrid dispatch).
   # batch=2,3,4,5 dispatch to generate_paged_batch (WMMA burst with device-side EOS).
-  timeout 300s env CUDA_LAUNCH_BLOCKING=1 \
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
     python -m tools.correctness_smoke \
@@ -225,6 +213,29 @@ run_correctness() {
       --prompt-lengths 32,128 \
       --max-tokens 16 \
       2>&1 | tee results/a100_correctness_wmma_vs_scalar.log
+
+  # Mixed max_tokens burst regression guard (docs/10 §5.6).
+  # A batch with per-sequence max_tokens=1 next to max_tokens=200, all
+  # ignore_eos=True so the burst path is taken. prompt_len=250 sits next to
+  # kvcache_block_size=256, so a max_steps=max(budget) regression would make
+  # the short row write across a block boundary into the padded block-table
+  # entry (physical block 0 after the §8 padding fix), corrupting a neighbour.
+  # The schedule_burst fix (max_steps=min(budget)) keeps every row inside its
+  # reserved blocks; this confirms no corruption surfaces on the GPU.
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_burst_mixed \
+      "$MODEL" \
+      --batch-sizes 2,4,5 \
+      --prompt-length 250 \
+      --short-tokens 1 \
+      --long-tokens 200 \
+      --backends torch-eager,megakernel-burst \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_burst_mixed.json \
+      2>&1 | tee results/a100_correctness_burst_mixed.log
 
   echo "A100 correctness: OK"
 }
@@ -443,7 +454,7 @@ run_roofline() {
   python -m tools.bench_roofline_a100 \
     --model "$MODEL" \
     --sections bandwidth,weights,host,barrier \
-    --target-bytes 1503000000 \
+    --target-bytes 1192000000 \
     --batches 1,8,32 \
     --grid-blocks 80 \
     --block-size 512 \

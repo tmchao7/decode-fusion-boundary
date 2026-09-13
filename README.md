@@ -22,19 +22,19 @@ output.
 
 | fact | value | source |
 |---|---:|---|
-| attainable HBM bandwidth | 1728 GB/s (84.7% of the A100-80GB 2039 GB/s spec) | `bench_roofline_a100.py` |
-| weight floor (tied_embedding=True) | 1.192 GB → 0.585 ms/step spec, 0.690 ms measured | `roofline.py` |
-| device lower bound (probe + LM head) | 1.543 ms/step (derived; verdict not yet regenerated) | `bench_burst_lower_bound.py` + `verdict.py` |
+| attainable HBM bandwidth | 1724 GB/s (84.5% of the A100-80GB 2039 GB/s spec) | `bench_roofline_a100.py` |
+| weight floor (tied_embedding=True) | 1.192 GB → 0.585 ms/step spec, 0.692 ms measured | `roofline.py` |
+| device lower bound (probe + LM head) | 1.545 ms/step (measured) | `bench_burst_lower_bound.py` + `verdict.py` |
 | cudagraph host-free replay | 0.020 ms/step | `bench_burst_lower_bound.py` |
 | host overlay per step | 0.014 ms (not recoverable) | same |
 | megakernel batch=1 vs cudagraph | **1.31x E2E win** | `benchmarks.compare` |
 | megakernel batch=10 vs cudagraph | 48.5x the device floor | `account_decode.py` |
+| binary verdict | **`DEVICE_BORDERLINE`** (measured) | `tools/verdict` → `results/a100_verdict.json` |
 
-The device floor (1.543 ms) is **above** the 1.5 ms recoverable threshold, and
+The device floor (1.545 ms) is **above** the 1.5 ms recoverable threshold, and
 cudagraph's host-free replay (0.020 ms) is far below it — so there is no
-device-side or host-side headroom for a batch>1 megakernel to win. The expected
-verdict is `DEVICE_BORDERLINE`, but `results/a100_verdict.json` is still the
-pre-correction `DEVICE_RECOVERABLE`: it must be regenerated with
+device-side or host-side headroom for a batch>1 megakernel to win. The verdict
+is `DEVICE_BORDERLINE`, regenerated from `results/a100_verdict.json` by
 `RUN_MODE=roofline` on the server. See `docs/07` §10.4 and `docs/06` §7.
 
 ## Repository Layout

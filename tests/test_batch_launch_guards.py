@@ -154,9 +154,10 @@ class RealLimitTests(unittest.TestCase):
         # The docs and the compatibility message both quote this number.
         self.assertLess(real_limit, 32)
 
-    def test_backstop_guards_both_batch_launch_sites(self) -> None:
+    def test_backstop_guards_all_batch_launch_sites(self) -> None:
         kernel = read(KERNEL_CU)
-        self.assertEqual(kernel.count("ldg_batch_is_launchable(batch_size"), 2)
+        # scalar decode + WMMA decode + WMMA burst = 3 call sites.
+        self.assertEqual(kernel.count("ldg_batch_is_launchable(batch_size"), 3)
         # And the backstop itself must not claim a silent failure is fine.
         helper = re.search(
             r"static bool ldg_batch_is_launchable\(.*?\n\}", kernel, re.DOTALL
@@ -170,11 +171,12 @@ class RealLimitTests(unittest.TestCase):
 class ObservableRejectionTests(unittest.TestCase):
     def test_binding_rejects_before_launching(self) -> None:
         bindings = read(BINDINGS)
-        # Both WMMA batch entry points call the check.
-        self.assertEqual(bindings.count("check_wmma_batch_supported("), 3)  # def + 2 calls
+        # All three batch entry points call the check (def + 3 calls = 4).
+        self.assertEqual(bindings.count("check_batch_supported("), 4)
         # Locate the *definitions* (void / torch::Tensor prefix), not the
         # forward declarations near the top of the file.
         definitions = {
+            "decode_paged_batch": "void decode_paged_batch(",
             "decode_paged_batch_wmma": "void decode_paged_batch_wmma(",
             "generate_nosync_paged_batch": "torch::Tensor generate_nosync_paged_batch(",
         }
@@ -193,10 +195,26 @@ class ObservableRejectionTests(unittest.TestCase):
             self.assertTrue(following, f"could not delimit {function}")
             body = bindings[start : min(following)]
             self.assertIn(
-                "check_wmma_batch_supported",
+                "check_batch_supported",
                 body,
                 f"{function} does not reject an unsupported batch",
             )
+
+    def test_scalar_binding_sentinels_output_before_launch(self) -> None:
+        """The scalar binding must fill output with -1 so a launch that aborts
+        after bypassing the TORCH_CHECK cannot be read as stale tokens."""
+        bindings = read(BINDINGS)
+        start = bindings.index("void decode_paged_batch(")
+        following = [
+            index
+            for index in (
+                bindings.find("\nvoid ", start + 1),
+                bindings.find("\ntorch::Tensor ", start + 1),
+            )
+            if index > start
+        ]
+        body = bindings[start : min(following)]
+        self.assertIn("fill_(-1)", body)
 
     def test_binding_exposes_the_limit_to_python(self) -> None:
         bindings = read(BINDINGS)
@@ -208,11 +226,14 @@ class ObservableRejectionTests(unittest.TestCase):
         self.assertIn("def wmma_batch_limit(", backend)
         self.assertIn("wmma_batch_limit(max_batch_size)", backend)
         self.assertIn("wmma_max_supported_batch()", backend)
+        # The guard must not be gated on megakernel_batch_kernel == "wmma";
+        # both scalar and WMMA paths share the same grid-partitioning limit.
+        self.assertNotIn('== "wmma":', backend)
         # The rejection must be a Compatibility(False, ...) so the hybrid
         # dispatch falls back rather than raising mid-decode.
-        start = backend.index('== "wmma":')
-        block = backend[start : start + 900]
-        self.assertIn("wmma_limit", block)
+        start = backend.index("batch_limit = min(")
+        block = backend[start : start + 600]
+        self.assertIn("batch_limit", block)
         self.assertIn("return Compatibility(", block)
 
     def test_backend_limit_falls_back_when_cuda_is_unavailable(self) -> None:

@@ -42,6 +42,10 @@ def wmma_batch_limit(default: int = MAX_BATCH_SIZE) -> int:
     and ``LDG_ATTN_BLOCKS=8`` that is batch <= 10.  Querying the kernel keeps
     this guard in sync with the real occupancy instead of hard-coding 10.
 
+    The scalar batch kernel shares the same grid-partitioning constraint, so
+    this limit is used as a conservative bound for both paths (WMMA is more
+    register-heavy, so its occupancy is at most the scalar kernel's).
+
     Returns ``default`` when the extension or CUDA is unavailable, which keeps
     the compatibility check usable on the CPU-only test path; the binding still
     rejects an unsupported batch with a clear error at execution time.
@@ -109,21 +113,23 @@ class MegakernelBackend:
                 False,
                 f"Megakernel v1 supports batch sizes from 1 to {max_batch_size}",
             )
-        # The WMMA batch kernel partitions its cooperative grid per sequence and
-        # needs LDG_ATTN_BLOCKS blocks each, so it supports far fewer sequences
-        # than MAX_BATCH_SIZE.  Reject here so the batch falls back to
-        # torch-cudagraph with a clear reason instead of the launch aborting and
-        # the caller reading the previous step's tokens.
-        if _get_attr(config, "megakernel_batch_kernel", "scalar") == "wmma":
-            wmma_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
-            if len(seqs) > wmma_limit:
-                return Compatibility(
-                    False,
-                    "Megakernel WMMA batch decode supports at most "
-                    f"{wmma_limit} sequences (grid partitioned per sequence with "
-                    "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
-                    "larger batches",
-                )
+        # Both the scalar and WMMA batch kernels partition the cooperative
+        # grid per sequence and need LDG_ATTN_BLOCKS blocks each, so they
+        # support far fewer sequences than MAX_BATCH_SIZE.  The WMMA limit is
+        # a conservative bound for the scalar kernel too (WMMA is more
+        # register-heavy, so its occupancy is at most the scalar kernel's).
+        # Reject here so the batch falls back to torch-cudagraph with a clear
+        # reason instead of the launch aborting and the caller reading the
+        # previous step's tokens.
+        batch_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
+        if len(seqs) > batch_limit:
+            return Compatibility(
+                False,
+                f"Megakernel batch decode supports at most {batch_limit} "
+                "sequences (grid partitioned per sequence with "
+                "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
+                "larger batches",
+            )
         if _get_attr(config, "tensor_parallel_size", 1) != 1:
             return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
 
