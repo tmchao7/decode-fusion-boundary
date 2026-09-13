@@ -466,7 +466,7 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
             args.iterations, args.warmup, args.runs,
         )
         probe = report["lower_bound_probe"]["rows"][0]
-        model = RooflineModel(dims, HardwareSpec())
+        model = RooflineModel(dims, HardwareSpec(), tied_embedding=args.tied_embedding)
         report["roofline_reference"] = {
             "weight_bytes": model.weight_bytes(),
             "spec_bandwidth_gbps": model.hardware.effective_bandwidth_gbps(),
@@ -591,6 +591,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replays", type=int, default=50)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--tied-embedding",
+        action="store_true",
+        default=True,
+        help="whether the model ties LM head to the embedding (Qwen3-0.6B: True)",
+    )
+    parser.add_argument(
+        "--no-tied-embedding",
+        dest="tied_embedding",
+        action="store_false",
+        help="override: model does NOT tie LM head to embedding",
+    )
     parser.add_argument("--json", dest="json_path")
     args = parser.parse_args(argv)
 

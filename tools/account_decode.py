@@ -423,6 +423,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bandwidth-gbps", type=float, default=None)
     parser.add_argument("--seq-len", type=int, default=224)
     parser.add_argument(
+        "--tied-embedding",
+        action="store_true",
+        default=True,
+        help="whether the model ties LM head to the embedding (Qwen3-0.6B: True)",
+    )
+    parser.add_argument(
+        "--no-tied-embedding",
+        dest="tied_embedding",
+        action="store_false",
+        help="override: model does NOT tie LM head to embedding",
+    )
+    parser.add_argument(
         "--floor-ms-per-step",
         type=float,
         default=None,
@@ -440,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         bandwidth_gbps=args.bandwidth_gbps or HardwareSpec().bandwidth_gbps,
         peak_tflops=HardwareSpec().peak_tflops,
     )
-    model = RooflineModel(ModelDims(), hw)
+    model = RooflineModel(ModelDims(), hw, tied_embedding=args.tied_embedding)
 
     experiments = load_experiments(args.json_paths)
     # For device-less scans use the batch-independent *weight* floor.  The KV

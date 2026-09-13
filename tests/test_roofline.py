@@ -285,7 +285,12 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             payload = json.loads(out.read_text(encoding="utf-8"))
-            self.assertEqual(payload["weight_bytes"], RooflineModel().weight_bytes())
+            # CLI defaults to tied_embedding=True (Qwen3-0.6B), so the weight
+            # bytes should match the tied model, not the untied default.
+            self.assertEqual(
+                payload["weight_bytes"],
+                RooflineModel(tied_embedding=True).weight_bytes(),
+            )
             self.assertEqual([row["batch_size"] for row in payload["rows"]], [1, 8])
 
     def test_cli_rejects_malformed_wall_pairs(self) -> None:

@@ -569,7 +569,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seq-len", type=int, default=224)
     parser.add_argument("--bandwidth-gbps", type=float, default=None)
     parser.add_argument("--peak-tflops", type=float, default=None)
-    parser.add_argument("--tied-embedding", action="store_true")
+    parser.add_argument(
+        "--tied-embedding",
+        action="store_true",
+        default=True,
+        help="whether the model ties LM head to the embedding (Qwen3-0.6B: True)",
+    )
+    parser.add_argument(
+        "--no-tied-embedding",
+        dest="tied_embedding",
+        action="store_false",
+        help="override: model does NOT tie LM head to embedding",
+    )
     parser.add_argument("--attn-blocks", type=int, default=8)
     parser.add_argument(
         "--kv-read-amp",
