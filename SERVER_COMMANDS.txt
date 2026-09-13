@@ -54,7 +54,7 @@ export NANOVLLM_PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://mirrors.huawe
 select_gpu() {
   local candidates="/tmp/nanovllm_gpu_candidates.$$"
   local candidate free_mb
-  trap 'rm -f "$candidates"' RETURN
+  trap 'rm -f "${candidates:-}"' RETURN
   for candidate in $PREFERRED_GPUS; do
     free_mb="$(nvidia-smi --id="$candidate" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')"
     if [ -n "$free_mb" ]; then
@@ -135,6 +135,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_single_megakernel.json \
       2>&1 | tee results/a100_correctness_single_megakernel.log
 
@@ -152,6 +153,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_boundary.json \
       2>&1 | tee results/a100_correctness_boundary.log
 
@@ -165,6 +167,7 @@ run_correctness() {
       --max-tokens 8 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_batch2.json \
       2>&1 | tee results/a100_correctness_batch2.log
 
@@ -184,6 +187,7 @@ run_correctness() {
       --max-tokens 16 \
       --backends torch-eager,megakernel-wmma \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_wmma.json \
       2>&1 | tee results/a100_correctness_wmma.log
 
@@ -200,6 +204,7 @@ run_correctness() {
       --max-tokens 16 \
       --backends torch-eager,megakernel-burst \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_correctness_burst.json \
       2>&1 | tee results/a100_correctness_burst.log
 
@@ -317,6 +322,7 @@ run_nosync_bench() {
       --max-tokens 16 \
       --backends torch-eager,megakernel \
       --require-megakernel \
+      --allow-cascade \
       --json results/a100_nosync_correctness.json \
       2>&1 | tee results/a100_nosync_correctness.log
 
@@ -377,7 +383,7 @@ run_account() {
     2>&1 | tee results/a100_account_compare.log
 
   # 2. Split every row into per-step wall / GPU / host residual and compare
-  #    against the 1.503 GB weight-streaming roofline.
+  #    against the 1.192 GB tied weight-streaming roofline (0.585 ms @2039 GB/s).
   #    seq-len 160 == prompt_len 32 + max_tokens 128 for this run.
   python -m tools.account_decode \
     results/a100_account.json \

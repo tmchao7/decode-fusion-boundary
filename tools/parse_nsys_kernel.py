@@ -13,7 +13,8 @@ unavailable and says which tables it did find.
 
 ``--decode-steps`` plus ``--roofline`` turns the kernel total into an implied
 bandwidth, which is how docs/07 §10 checks whether the measured per-step kernel
-time is even physically possible for the 1.503 GB/step weight traffic::
+time is even physically possible for the 1.192 GB/step weight traffic
+(tied_embedding=True for Qwen3-0.6B)::
 
     python -m tools.parse_nsys_kernel results/nsys_b8_cg.sqlite \
         --decode-steps 49 --memory --roofline
@@ -129,7 +130,7 @@ def roofline_context(
     if weight_bytes is None or spec_bandwidth_gbps is None:
         from nanovllm.roofline import HardwareSpec, ModelDims, RooflineModel
 
-        model = RooflineModel(ModelDims(), HardwareSpec())
+        model = RooflineModel(ModelDims(), HardwareSpec(), tied_embedding=True)
         weight_bytes = model.weight_bytes()
         spec_bandwidth_gbps = model.hardware.effective_bandwidth_gbps()
     if kernel_ms_per_step <= 0:

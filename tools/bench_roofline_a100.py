@@ -4,7 +4,7 @@
 batch" question reduces to two numbers:
 
 * the machine's *attainable* HBM bandwidth, which sets the weight-streaming
-  floor (1.503 GB/step for Qwen3-0.6B bf16), and
+  floor (1.192 GB/step for Qwen3-0.6B bf16, tied_embedding=True), and
 * the per-step *host* cost, which is what a persistent kernel can remove.
 
 This tool measures both, plus the grid-wide barrier cost that the megakernel
@@ -207,8 +207,13 @@ def bench_host_step(  # pragma: no cover - GPU only
             kernel_end = torch.cuda.Event(enable_timing=True)
             wall_start.record()
             kernel_start.record()
+            # Local chain variable: do not reassign the outer ``activation``
+            # (Python would then treat it as a local and raise
+            # UnboundLocalError on the first read).  Each call starts fresh
+            # from the original activation so the measured cost is stable.
+            x = activation
             for _ in range(4):  # mimic a short chain of dependent kernels
-                activation = (activation @ weight).contiguous()
+                x = (x @ weight).contiguous()
             kernel_end.record()
             wall_end.record()
             torch.cuda.synchronize()
@@ -359,7 +364,10 @@ def bench_barrier(  # pragma: no cover - GPU only
 
         module = load_inline(
             name="ldg_barrier_probe",
-            cpp_sources="double run_barrier_probe(int, int, int);",
+            # Must match the `extern "C"` definition in _BARRIER_SOURCE: a
+            # plain C++ declaration would mangle to _Z17run_barrier_probeiii
+            # and fail to link against the C-linkage definition.
+            cpp_sources='extern "C" double run_barrier_probe(int, int, int);',
             cuda_sources=_BARRIER_SOURCE,
             functions=["run_barrier_probe"],
             extra_cuda_cflags=["-O3", "-arch=sm_80"],
@@ -423,7 +431,7 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
         report["weights"] = bench_weight_stream(args.model, args.runs, args.warmup)
         weight_bytes = report["weights"].get("weight_bytes")
         if weight_bytes:
-            model = RooflineModel(dims, HardwareSpec())
+            model = RooflineModel(dims, HardwareSpec(), tied_embedding=True)
             report["weights"]["weight_roofline_bytes"] = model.weight_bytes()
             report["weights"]["weight_bytes_ratio_vs_model"] = (
                 weight_bytes / model.weight_bytes()
@@ -450,7 +458,9 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
 
     if "bandwidth" in sections and report.get("bandwidth", {}).get("best_gbps"):
         measured = report["bandwidth"]["best_gbps"]
-        model = RooflineModel(dims, HardwareSpec(bandwidth_gbps=measured))
+        model = RooflineModel(
+            dims, HardwareSpec(bandwidth_gbps=measured), tied_embedding=True
+        )
         report["roofline_with_measured_bandwidth"] = {
             "bandwidth_gbps": measured,
             "weight_bytes": model.weight_bytes(),
@@ -474,7 +484,12 @@ def main(argv: list[str] | None = None) -> int:
         default="bandwidth,weights,host,barrier",
         help="comma list of bandwidth,weights,host,barrier",
     )
-    parser.add_argument("--target-bytes", type=float, default=1.503e9)
+    parser.add_argument(
+        "--target-bytes",
+        type=float,
+        default=1.192e9,
+        help="weight bytes to stream in the bandwidth probe (tied_embedding=True)",
+    )
     parser.add_argument("--batches", type=parse_batches, default=[1, 8, 32])
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)

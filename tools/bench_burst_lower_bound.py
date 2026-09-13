@@ -162,10 +162,15 @@ __global__ void __launch_bounds__(512, 1) lower_bound_probe(
 // Returns the per-step time in ms on success, a negative code on failure.
 // Returning a double (rather than a double* out-param) keeps the C++ shim
 // trivially bindable: torch's load_inline has no converter for `double*`.
-extern "C" double run_lower_bound_probe(
-    const void *weights, unsigned long long bytes_per_layer,
+// The device pointer is passed as an unsigned long long (the value of
+// torch.Tensor.data_ptr()) rather than const void* because pybind11's
+// auto-binding for const void* under load_inline expects a capsule, not an
+// int.  An integer argument binds cleanly and we cast back to a pointer here.
+double run_lower_bound_probe(
+    unsigned long long weights_ptr, unsigned long long bytes_per_layer,
     unsigned long long buffer_bytes, int nlayers, int barriers_per_layer,
     int grid_blocks, int block_size, int iterations) {
+  const void *weights = (const void *)weights_ptr;
   if (weights == nullptr || nlayers <= 0 || grid_blocks <= 0 ||
       buffer_bytes == 0 || iterations <= 0)
     return -1.0;
@@ -292,8 +297,11 @@ def bench_lower_bound(  # pragma: no cover - GPU only
 
         module = load_inline(
             name="ldg_lower_bound_probe",
+            # First arg is a device pointer passed as unsigned long long
+            # (torch.Tensor.data_ptr()); const void* would make pybind11 expect
+            # a capsule under load_inline.  See _PROBE_SOURCE for the cast.
             cpp_sources=(
-                "double run_lower_bound_probe(const void*, unsigned long long, "
+                "double run_lower_bound_probe(unsigned long long, unsigned long long, "
                 "unsigned long long, int, int, int, int, int);"
             ),
             cuda_sources=_PROBE_SOURCE,
@@ -458,7 +466,7 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
             args.iterations, args.warmup, args.runs,
         )
         probe = report["lower_bound_probe"]["rows"][0]
-        model = RooflineModel(dims, HardwareSpec())
+        model = RooflineModel(dims, HardwareSpec(), tied_embedding=args.tied_embedding)
         report["roofline_reference"] = {
             "weight_bytes": model.weight_bytes(),
             "spec_bandwidth_gbps": model.hardware.effective_bandwidth_gbps(),
@@ -468,7 +476,7 @@ def build_report(args) -> dict:  # pragma: no cover - GPU only
             "probe_ms_per_step": probe["ms_per_step_mean"],
             "barrier_budget_ms": probe["barriers_per_layer"]
             * dims.num_layers
-            * 1.63e-3,
+            * 1.96e-3,  # measured 1.96 us/barrier on A100 with __launch_bounds__(512,1)
         }
     if "graph" in sections:
         report["host_free_graph"] = bench_host_free_graph(
@@ -583,6 +591,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replays", type=int, default=50)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--tied-embedding",
+        action="store_true",
+        default=True,
+        help="whether the model ties LM head to the embedding (Qwen3-0.6B: True)",
+    )
+    parser.add_argument(
+        "--no-tied-embedding",
+        dest="tied_embedding",
+        action="store_false",
+        help="override: model does NOT tie LM head to embedding",
+    )
     parser.add_argument("--json", dest="json_path")
     args = parser.parse_args(argv)
 

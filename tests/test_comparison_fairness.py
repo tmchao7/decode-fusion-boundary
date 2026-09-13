@@ -162,6 +162,34 @@ class CudagraphPaddingDocumentationTests(unittest.TestCase):
         self.assertIn("next((x for x in self.graph_bs if x >= bs), None)", source)
         self.assertIn("if bucket is None:", source)
 
+    def test_max_bs_is_always_a_bucket_so_no_gap_exists(self) -> None:
+        """Batches in (8, 16) must find a bucket when max_num_seqs == batch.
+
+        ``benchmarks/compare`` sets ``max_num_seqs = batch_size``.  Without
+        ``max_bs`` appended as a bucket, ``range(16, max_bs + 1, 16)`` is empty
+        for max_bs < 16, so the largest bucket is 8 and a batch of 10 hits
+        ``StopIteration`` on the ``next(...)`` lookup.  The fix appends
+        ``max_bs`` itself; this test pins it.
+        """
+
+        source = (
+            REPO_ROOT / "src" / "nanovllm" / "engine" / "model_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "if max_bs > self.graph_bs[-1]:", source,
+        )
+        self.assertIn("self.graph_bs.append(max_bs)", source)
+        # Sanity: for every max_bs in 1..64, the constructed bucket list has a
+        # bucket >= max_bs (so the next() lookup never raises StopIteration).
+        for max_bs in range(1, 65):
+            graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+            if max_bs > graph_bs[-1]:
+                graph_bs.append(max_bs)
+            self.assertTrue(
+                any(x >= max_bs for x in graph_bs),
+                f"no bucket >= max_bs={max_bs}",
+            )
+
     def test_padding_is_documented_in_the_fairness_doc(self) -> None:
         """docs/05 must state the bucket padding so the table is not read as clean."""
 

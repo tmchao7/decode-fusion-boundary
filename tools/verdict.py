@@ -1,8 +1,9 @@
 """Compute the high-batch Megakernel verdict from the A100 probe outputs.
 
-docs/09 defines three experiments with hard thresholds.  This tool applies
-them mechanically so the verdict is reproducible rather than hand-derived from
-a log, and so the thresholds can be unit tested on synthetic evidence.
+docs/07 section 10.4 defines three experiments with hard thresholds.  This tool
+applies them mechanically so the verdict is reproducible rather than
+hand-derived from a log, and so the thresholds can be unit tested on synthetic
+evidence.
 
 Inputs (all written by ``RUN_MODE=roofline`` / ``RUN_MODE=account``)::
 
@@ -10,7 +11,7 @@ Inputs (all written by ``RUN_MODE=roofline`` / ``RUN_MODE=account``)::
     results/a100_lower_bound.json      # device lower bound probe + host-free graph
     results/a100_account_breakdown.json  # per-step host/device ledger
 
-The decision hierarchy follows docs/09:
+The decision hierarchy follows docs/07 section 10.4:
 
 1. **Bandwidth calibration first.**  If the measured per-step device time is
    below the weight floor, the timing cannot cover a whole step (or the device
@@ -85,6 +86,11 @@ class Calibration:
 class DeviceEvidence:
     probe_ms_per_step: float | None = None
     probe_batch_sizes: list[int] = field(default_factory=list)
+    # The probe streams per-layer weights only (no embed / lm_head).  The LM
+    # head is a full-matrix read every decode step and must be part of the
+    # floor, so the verdict adds its bandwidth-equivalent time analytically.
+    lm_head_stream_ms: float | None = None
+    full_device_floor_ms: float | None = None
     measured_ms_per_step: float | None = None
     measured_backend: str | None = None
     measured_batch: int | None = None
@@ -277,7 +283,10 @@ def compute_verdict(
     recoverable_ms: float = RECOVERABLE_MS,
     stop_ms: float = STOP_MS,
 ) -> Verdict:
-    model = model or RooflineModel(ModelDims(), HardwareSpec())
+    # Qwen3-0.6B has tie_word_embeddings=True (the LM head weight IS the
+    # embedding weight), so the roofline must use tied_embedding=True to
+    # avoid double-counting the 0.311 GB embedding/lm-head matrix.
+    model = model or RooflineModel(ModelDims(), HardwareSpec(), tied_embedding=True)
     spec_bw = model.hardware.effective_bandwidth_gbps()
     weight_gb = model.weight_bytes() / 1e9
     spec_floor_ms = model.weight_bytes() / (spec_bw * 1e9) * 1000.0
@@ -287,6 +296,25 @@ def compute_verdict(
     measured_row, implied_bw = _measured_device_row(account, model)
     host_free_ms, host_inclusive_ms, host_free_batches = _host_free_evidence(
         lower_bound
+    )
+
+    # The lower-bound probe streams per-layer weights only (it skips
+    # embed_tokens and lm_head in _weight_layout).  The LM head is a full
+    # matrix read every decode step and must be part of the device floor.
+    # Add its bandwidth-equivalent time analytically using the measured (or
+    # spec) bandwidth.  With tied_embedding=True the embedding_bytes() IS
+    # the lm_head weight.
+    lm_head_bytes = model.embedding_bytes()
+    bw_for_correction = measured_bw if measured_bw else spec_bw
+    lm_head_stream_ms = (
+        lm_head_bytes / (bw_for_correction * 1e9) * 1000.0
+        if lm_head_bytes and bw_for_correction
+        else None
+    )
+    full_device_floor_ms = (
+        probe_ms + lm_head_stream_ms
+        if probe_ms is not None and lm_head_stream_ms is not None
+        else probe_ms
     )
 
     calibration = Calibration(
@@ -321,6 +349,8 @@ def compute_verdict(
     device = DeviceEvidence(
         probe_ms_per_step=probe_ms,
         probe_batch_sizes=probe_batches,
+        lm_head_stream_ms=lm_head_stream_ms,
+        full_device_floor_ms=full_device_floor_ms,
         measured_ms_per_step=(
             float(measured_row["ms_per_step_gpu"]) if measured_row else None
         ),
@@ -343,7 +373,7 @@ def compute_verdict(
     overlay = _build_host_overlay(
         host_free_ms=host_free_ms,
         host_inclusive_ms=host_inclusive_ms,
-        probe_ms=probe_ms,
+        probe_ms=full_device_floor_ms,
     )
 
     rationale: list[str] = []
@@ -381,9 +411,18 @@ def compute_verdict(
         f"(no arithmetic, 28 layers of weight streaming + 12 barriers/layer; "
         f"batches {probe_batches or 'n/a'})"
     )
+    if lm_head_stream_ms is not None:
+        rationale.append(
+            f"LM head stream correction: {lm_head_stream_ms:.3f} ms/step "
+            f"(the probe skips lm_head; {lm_head_bytes / 1e9:.3f} GB at "
+            f"{bw_for_correction:.0f} GB/s)"
+        )
+        rationale.append(
+            f"full device floor (probe + lm_head): {full_device_floor_ms:.3f} ms/step"
+        )
     rationale.append(
         f"roofline weight floor: {weight_gb:.3f} GB/step at {spec_bw:.0f} GB/s = "
-        f"{spec_floor_ms:.3f} ms"
+        f"{spec_floor_ms:.3f} ms (tied_embedding={model.tied_embedding})"
     )
     if device.barrier_ms_per_step is not None:
         rationale.append(
@@ -400,7 +439,7 @@ def compute_verdict(
         )
         return Verdict(
             VERDICT_NEEDS_CALIBRATION,
-            f"Device side is {probe_ms:.3f} ms/step, but the bandwidth "
+            f"Device side is {full_device_floor_ms:.3f} ms/step, but the bandwidth "
             "contradiction is unresolved, so no headroom claim is trustworthy yet.",
             rationale,
             actions,
@@ -409,9 +448,14 @@ def compute_verdict(
             overlay,
         )
 
-    if probe_ms > stop_ms:
+    # Use the FULL device floor (probe + lm_head correction) for the threshold
+    # comparison: the probe only streams per-layer weights, but the LM head is
+    # a full-matrix read every decode step and must be part of the floor.
+    floor_ms = full_device_floor_ms if full_device_floor_ms is not None else probe_ms
+
+    if floor_ms > stop_ms:
         rationale.append(
-            f"probe {probe_ms:.3f} ms/step > stop threshold {stop_ms:.3f} ms/step: "
+            f"full device floor {floor_ms:.3f} ms/step > stop threshold {stop_ms:.3f} ms/step: "
             "a fused kernel cannot even stream the weights faster than this, so "
             "the batch>1 device side is not recoverable"
         )
@@ -423,7 +467,7 @@ def compute_verdict(
         return Verdict(
             VERDICT_DEVICE_UNREACHABLE,
             f"High-batch device-side crossover is NOT achievable: the no-arithmetic "
-            f"device floor is already {probe_ms:.3f} ms/step.",
+            f"device floor is already {floor_ms:.3f} ms/step.",
             rationale,
             actions,
             calibration,
@@ -431,9 +475,9 @@ def compute_verdict(
             overlay,
         )
 
-    if probe_ms > recoverable_ms:
+    if floor_ms > recoverable_ms:
         rationale.append(
-            f"probe {probe_ms:.3f} ms/step sits between the recoverable "
+            f"full device floor {floor_ms:.3f} ms/step sits between the recoverable "
             f"({recoverable_ms:.1f} ms) and stop ({stop_ms:.1f} ms) thresholds"
         )
         actions.append(
@@ -441,8 +485,8 @@ def compute_verdict(
             "(e.g. also fixing attention/LM head)"
         )
         return Verdict(
-            VERDICT_DEVICE_UNREACHABLE if probe_ms > stop_ms else VERDICT_DEVICE_BORDERLINE,
-            f"High-batch device side is borderline: {probe_ms:.3f} ms/step.",
+            VERDICT_DEVICE_UNREACHABLE if floor_ms > stop_ms else VERDICT_DEVICE_BORDERLINE,
+            f"High-batch device side is borderline: {floor_ms:.3f} ms/step.",
             rationale,
             actions,
             calibration,
@@ -451,7 +495,7 @@ def compute_verdict(
         )
 
     rationale.append(
-        f"probe {probe_ms:.3f} ms/step <= recoverable threshold "
+        f"full device floor {floor_ms:.3f} ms/step <= recoverable threshold "
         f"{recoverable_ms:.1f} ms/step: a fused kernel could plausibly reach the "
         "HBM wall at batch>1"
     )
@@ -464,11 +508,11 @@ def compute_verdict(
             "run RUN_MODE=account and pass --account to size the device-side gap"
         )
     else:
-        gap = device.measured_ms_per_step / probe_ms if probe_ms > 0 else float("inf")
+        gap = device.measured_ms_per_step / floor_ms if floor_ms > 0 else float("inf")
         rationale.append(
             f"measured batch>1 device time {device.measured_ms_per_step:.3f} ms/step "
             f"({device.measured_backend}, batch={device.measured_batch}) = "
-            f"{gap:.1f}x the probe floor"
+            f"{gap:.1f}x the full device floor"
         )
         if gap <= DEVICE_AT_FLOOR_RATIO:
             if device.measured_host_residual_ms is not None:
@@ -646,7 +690,11 @@ def main(argv: list[str] | None = None) -> int:
     hardware = HardwareSpec()
     if args.bandwidth_gbps:
         hardware = HardwareSpec(bandwidth_gbps=args.bandwidth_gbps)
-    model = RooflineModel(ModelDims(), hardware)
+    # Qwen3-0.6B has tie_word_embeddings=True.  compute_verdict() defaults to a
+    # tied model, but passing an explicit model overrides that default, so the
+    # CLI must build it tied too -- otherwise the evidence line reports the
+    # untied 1.503 GB / 0.967 ms footprint.
+    model = RooflineModel(ModelDims(), hardware, tied_embedding=True)
     verdict = compute_verdict(
         roofline=roofline, lower_bound=lower_bound, account=account, model=model
     )

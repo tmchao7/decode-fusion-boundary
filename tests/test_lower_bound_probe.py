@@ -101,10 +101,11 @@ class ProbeCoverageTests(unittest.TestCase):
 
 class ProbeConstantsTests(unittest.TestCase):
     def test_barriers_per_layer_matches_model(self) -> None:
-        # kernel.cu performs ~12 grid syncs per layer; docs/07 section 3.4
-        # prices 28 layers x 12 barriers at 0.547 ms/token.
+        # kernel.cu performs ~12 grid syncs per layer; the measured per-barrier
+        # cost on A100 with __launch_bounds__(512,1) is 1.96 us, so 28 layers
+        # x 12 barriers = 0.659 ms/token (roofline probe barrier section).
         self.assertEqual(BARRIERS_PER_LAYER, 12)
-        self.assertAlmostEqual(BARRIERS_PER_LAYER * 28 * 1.63e-3, 0.548, places=2)
+        self.assertAlmostEqual(BARRIERS_PER_LAYER * 28 * 1.96e-3, 0.659, places=2)
 
 
 if __name__ == "__main__":

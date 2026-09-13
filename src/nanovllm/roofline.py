@@ -10,12 +10,13 @@ answer is bounded by two hardware limits:
 
 This matters because the arithmetic intensity of a decode step is so low that
 the memory term dominates for a wide range of realistic batch sizes.  For
-Qwen3-0.6B in bf16 the weight footprint is ~1.5 GB, which at a measured
-A100 bandwidth of ~1.5-1.6 TB/s is ~1 ms per step -- and the observed
-cudagraph decode kernel time is ~0.75 ms per step.  In other words the
-existing batched/cuBLAS path is already at the weight-streaming wall, so a
-megakernel cannot win on the device side: both are bounded by the same HBM
-bandwidth, and the only recoverable cost is the per-step host overhead.
+Qwen3-0.6B in bf16 the tied weight footprint is ~1.19 GB, which at the
+A100-80GB spec bandwidth (2039 GB/s) is 0.585 ms per step, or 0.690 ms at the
+measured attainable 1728 GB/s -- and the observed cudagraph decode kernel time
+is ~0.74 ms per step.  In other words the existing batched/cuBLAS path is
+already at the weight-streaming wall, so a megakernel cannot win on the device
+side: both are bounded by the same HBM bandwidth, and the only recoverable cost
+is the per-step host overhead.
 
 Everything here is pure Python (no torch, no CUDA) so it can be unit tested on
 a laptop.  The model dimensions are checked against ``kernel.cu`` at import
