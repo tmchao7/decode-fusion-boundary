@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Megakernel-vLLM server workflow.
+#
+# Run it from the checkout (paths default to the script's own directory):
+#   bash SERVER_COMMANDS.txt
+#
+# Then run one phase from this single file:
+#   bash SERVER_COMMANDS.txt                         # correctness (default)
+#   RUN_MODE=model bash SERVER_COMMANDS.txt          # download/check Qwen3-0.6B
+#   RUN_MODE=verify bash SERVER_COMMANDS.txt         # environment + extension check
+#   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean Megakernel rebuild
+#   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # controlled A/B benchmark
+#   RUN_MODE=nosync bash SERVER_COMMANDS.txt         # no-sync / burst vs cudagraph
+#   RUN_MODE=account bash SERVER_COMMANDS.txt        # host/device split of decode steps
+#   RUN_MODE=roofline bash SERVER_COMMANDS.txt       # device lower-bound probe + bandwidth
+#   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
+#   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
+#   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
+#
+# Overridable: REPO, NANOVLLM_MODEL_PATH (or MODEL), PREFERRED_GPUS,
+# NANOVLLM_PYPI_INDEX_URL, HF_ENDPOINT, HF_HOME.
+#
+# The file is intentionally the only checked-in server command file. Update this
+# file in future changes instead of creating another *_COMMANDS.txt file.
+
+RUN_MODE="${RUN_MODE:-correctness}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$SCRIPT_DIR}"
+MODEL="${MODEL:-${NANOVLLM_MODEL_PATH:-$HOME/models/Qwen3-0.6B}}"
+# Space-separated physical GPU ids; select_gpu() picks the one with the most free
+# memory. Point it at the GPUs you are allowed to use on a shared box.
+PREFERRED_GPUS="${PREFERRED_GPUS:-0}"
+
+cd "$REPO"
+
+# The venv is created by setup_server.sh. Point the package index at a mirror
+# only if the machine cannot reach PyPI directly.
+source .venv/bin/activate
+export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
+export NANOVLLM_CUDA_ARCH="${NANOVLLM_CUDA_ARCH:-sm_80}"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$REPO/.torch_extensions}"
+export NANOVLLM_CUDA_DEBUG="${NANOVLLM_CUDA_DEBUG:-0}"
+# Use exact CUDA math for correctness. Set to 1 only for a later performance
+# experiment after token-level correctness has passed.
+export NANOVLLM_CUDA_FAST_MATH="${NANOVLLM_CUDA_FAST_MATH:-0}"
+export TORCH_DISABLE_ADDR2LINE="${TORCH_DISABLE_ADDR2LINE:-1}"
+export UV_SYSTEM_CERTS="${UV_SYSTEM_CERTS:-true}"
+export UV_PYTHON_DOWNLOADS=0
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
+export NANOVLLM_PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://pypi.org/simple/}"
+# Tensor-parallel rendezvous uses an automatically selected local port. Set
+# NANOVLLM_DIST_PORT only when an externally controlled fixed port is required.
+
+select_gpu() {
+  local candidates="/tmp/nanovllm_gpu_candidates.$$"
+  local candidate free_mb
+  trap 'rm -f "${candidates:-}"' RETURN
+  for candidate in $PREFERRED_GPUS; do
+    free_mb="$(nvidia-smi --id="$candidate" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')"
+    if [ -n "$free_mb" ]; then
+      printf '%s %s\n' "$free_mb" "$candidate" >> "$candidates"
+    fi
+  done
+  if [ ! -s "$candidates" ]; then
+    echo "ERROR: none of preferred GPUs ($PREFERRED_GPUS) is visible." >&2
+    exit 1
+  fi
+  GPU_SELECTION="$(sort -nr "$candidates" | awk 'NR == 1 {print $2}')"
+  export CUDA_VISIBLE_DEVICES="$GPU_SELECTION"
+  echo "Selected physical GPU: $GPU_SELECTION (logical GPU 0 inside this process)"
+  nvidia-smi --id="$GPU_SELECTION"
+}
+
+require_model() {
+  if [ ! -f "$MODEL/config.json" ]; then
+    echo "ERROR: model config not found at $MODEL/config.json" >&2
+    echo "Run: RUN_MODE=model bash SERVER_COMMANDS.txt" >&2
+    exit 1
+  fi
+}
+
+verify_environment() {
+  require_model
+  NANOVLLM_MODEL_PATH="$MODEL" \
+    python -m tools.verify_server_env --require-megakernel
+}
+
+verify_extension_import() {
+  python - <<'PY'
+from nanovllm.backends.megakernel.build import get_extension
+get_extension()
+print("Megakernel extension import: OK")
+PY
+}
+
+build_extension() {
+  mkdir -p results
+  # Never reuse an extension compiled before the current kernel source change.
+  rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
+  python -m nanovllm.backends.megakernel.build \
+    2>&1 | tee results/a100_build.log
+  echo "Megakernel build: OK"
+}
+
+run_correctness() {
+  mkdir -p results
+  verify_environment
+  build_extension
+  verify_extension_import
+
+  PYTHONPATH=src python -m unittest discover -s tests -v
+
+  # Keep CUDA backends in separate Python processes. A failed CUDA kernel
+  # poisons the process context; otherwise a prior CUDA-Graph/eager run can
+  # make the first Megakernel API call report a stale illegal-access error.
+  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 8,32 \
+      --batch-sizes 1 \
+      --max-tokens 8 \
+      --backends torch-eager,torch-cudagraph \
+      --json results/a100_correctness_single_baseline.json \
+      2>&1 | tee results/a100_correctness_single_baseline.log
+
+  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 8,32 \
+      --batch-sizes 1 \
+      --max-tokens 8 \
+      --backends torch-eager,megakernel \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_single_megakernel.json \
+      2>&1 | tee results/a100_correctness_single_megakernel.log
+
+  # WMMA batch kernel at block-boundary prompt lengths, batch 1 and 2.
+  # Plain megakernel defaults to batch=1 only (batch>1 falls back to torch,
+  # see docs/07 §7), so this block drives megakernel-wmma -- the real batch
+  # kernel -- across the 255/256/257/512 boundary prompts that the wmma block
+  # below (p32,128 only) does not reach. b1 uses the WMMA batch kernel with
+  # M=1; b2 with M=2 stresses KV indexing at the block boundary.
+  timeout 720s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32,128,255,256,257,512 \
+      --batch-sizes 1,2 \
+      --max-tokens 8 \
+      --backends torch-eager,megakernel-wmma \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_batch2.json \
+      2>&1 | tee results/a100_correctness_batch2.log
+
+  # WMMA batch kernel correctness (per-step, no burst).
+  # Tests ldg_decode_kernel_batch_wmma with the new batched WMMA MLP path.
+  # batch=1 goes through step_batch → decode_paged_batch_wmma (WMMA with M=1).
+  # batch=2,3,4,5 go through the same path with M=2,3,4,5.
+  # batch=3 is included because it exposed the GPU-scope fence race
+  # (grid_blocks=78 leaves 2 idle SMs, changing L1 write-back timing).
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32,128 \
+      --batch-sizes 1,2,3,4,5 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel-wmma \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_wmma.json \
+      2>&1 | tee results/a100_correctness_wmma.log
+
+  # Burst (no-sync) WMMA batch kernel correctness.
+  # batch=1 dispatches to the persistent single-seq kernel (hybrid dispatch).
+  # batch=2,3,4,5 dispatch to generate_paged_batch (WMMA burst with device-side EOS).
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32,128 \
+      --batch-sizes 1,2,3,4,5 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel-burst \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_burst.json \
+      2>&1 | tee results/a100_correctness_burst.log
+
+  # WMMA vs scalar megakernel, cascade-aware gate.
+  # The batched megakernel and WMMA tensor-core paths are not bit-identical: a
+  # ~1-ulp bf16 reduction-order difference at some layer cascades into a token
+  # flip at greedy decode (see CONTRIBUTING.md). The scalar megakernel also
+  # diverges from torch-eager by ~1-ulp, so the meaningful gate is WMMA vs
+  # scalar, with the cascade classified separately: PASS (identical),
+  # CASCADE (divergence only at a decode token >= 1, expected ulp cascade),
+  # FAIL (divergence at prefill token 0 or a length mismatch = real bug).
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_wmma_vs_scalar \
+      "$MODEL" \
+      --batch-sizes 1,2,3,4,5 \
+      --prompt-lengths 32,128 \
+      --max-tokens 16 \
+      2>&1 | tee results/a100_correctness_wmma_vs_scalar.log
+
+  # Mixed max_tokens burst regression guard (docs/10 §5.6).
+  # A batch with per-sequence max_tokens=2 next to max_tokens=200, all
+  # ignore_eos=True so the burst path is taken.  --short-tokens must be >= 2:
+  # prefill already emits the first completion token, so max_tokens=1 is
+  # FINISHED during prefill and never enters a burst -- the batch would then be
+  # all-long, min(budget) == max(budget), and the tripwire would pass without
+  # exercising the mixed path.  With short=2 the short row joins the first burst
+  # with a 1-token budget next to the long row's burst_cap=64, and prompt_len=250
+  # puts len(seq)=252 inside a single 256-token block, so a max_steps=max(budget)
+  # regression writes into the padded block-table entry (physical block 0 after
+  # the §8 padding fix), corrupting a neighbour.  The schedule_burst fix
+  # (max_steps=min(budget)) keeps every row inside its reserved blocks; the tool
+  # fails unless it observes a genuinely mixed-budget burst and zero contract
+  # violations (see tools/correctness_burst_mixed.py).
+  timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_burst_mixed \
+      "$MODEL" \
+      --batch-sizes 2,4,5 \
+      --prompt-length 250 \
+      --short-tokens 2 \
+      --long-tokens 200 \
+      --backends torch-eager,megakernel-burst \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_correctness_burst_mixed.json \
+      2>&1 | tee results/a100_correctness_burst_mixed.log
+
+  echo "A100 correctness: OK"
+}
+
+run_model_download() {
+  mkdir -p "$(dirname "$MODEL")"
+  export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+  export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+
+  if ! command -v hf >/dev/null 2>&1; then
+    uv pip install --python "$REPO/.venv/bin/python" \
+      --index-url "$NANOVLLM_PYPI_INDEX_URL" \
+      'huggingface-hub>=0.30'
+  fi
+
+  if [ -f "$MODEL/config.json" ]; then
+    echo "Model directory already exists; validating it without overwriting: $MODEL"
+  else
+    mkdir -p "$MODEL"
+    HF_ENDPOINT="$HF_ENDPOINT" hf download Qwen/Qwen3-0.6B \
+      --local-dir "$MODEL" \
+      --max-workers 8
+  fi
+
+  MODEL="$MODEL" python - <<'PY'
+import json
+import os
+
+model = os.environ["MODEL"]
+with open(os.path.join(model, "config.json"), encoding="utf-8") as handle:
+    config = json.load(handle)
+expected = {
+    "model_type": "qwen3",
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "vocab_size": 151936,
+}
+for key, expected_value in expected.items():
+    actual = config.get(key)
+    print(f"{key}: {actual}")
+    if actual != expected_value:
+        raise SystemExit(
+            f"ERROR: {key}={actual!r}; expected {expected_value!r}. "
+            "This is not Qwen3-0.6B."
+        )
+print("Qwen3-0.6B config: OK")
+PY
+}
+
+run_benchmark() {
+  mkdir -p results
+  verify_environment
+  verify_extension_import
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-eager,torch-cudagraph,megakernel,megakernel-wmma,megakernel-burst \
+    --prompt-lengths 32,128,512,1024 \
+    --batch-sizes 1,8,32 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 10 \
+    --json results/a100_performance.json \
+    --markdown results/a100_performance.md \
+    2>&1 | tee results/a100_performance.log
+  python -m tools.plot_metrics \
+    results/a100_performance.json \
+    --output-dir results/a100_plots
+}
+
+run_nosync_bench() {
+  mkdir -p results
+  require_model
+  select_gpu
+  build_extension
+  verify_extension_import
+
+  PYTHONPATH=src python -m unittest discover -s tests -v \
+    2>&1 | tee results/a100_nosync_unittest.log
+
+  # Correctness: batch=1 (persistent kernel via hybrid dispatch).
+  # Verifies device-side EOS on the single-seq kernel. batch>1 correctness is
+  # covered by the megakernel-wmma / megakernel-burst blocks above.
+  timeout 180s env CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_SHOW_CPP_STACKTRACES=1 \
+    NANOVLLM_CUDA_DEBUG=1 \
+    python -m tools.correctness_smoke \
+      "$MODEL" \
+      --prompt-lengths 32 \
+      --batch-sizes 1 \
+      --max-tokens 16 \
+      --backends torch-eager,megakernel \
+      --require-megakernel \
+      --allow-cascade \
+      --json results/a100_nosync_correctness.json \
+      2>&1 | tee results/a100_nosync_correctness.log
+
+  # End-to-end ms/token: megakernel sync vs no-sync vs burst vs cudagraph.
+  # Each path runs in a fresh process so KV pools do not starve each other.
+  # batch=1 burst now dispatches to the persistent kernel (hybrid dispatch).
+  python -m tools.bench_nosync \
+    --prompt-length 32 \
+    --tokens 200 \
+    --seed 0 \
+    2>&1 | tee results/a100_nosync_bench.log
+
+  # Controlled A/B: burst vs cudagraph at batch=1/2/4/5, prompt_len=32.
+  # batch 1-5 is the correct range (80 blocks / 16 blocks_per_seq = 5 max).
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-cudagraph,megakernel-burst \
+    --prompt-lengths 32 \
+    --batch-sizes 1,2,4,5 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 5 \
+    --json results/a100_nosync_compare.json \
+    --markdown results/a100_nosync_compare.md \
+    2>&1 | tee results/a100_nosync_compare.log
+
+  # Multi-batch burst vs cudagraph with ignore_eos=False (burst path triggers).
+  # Uses synthetic prompts; batch=1/2/4/5 (max correct for 80-block grid).
+  python -m tools.bench_burst_batch \
+    --prompt-length 32 \
+    --max-tokens 128 \
+    2>&1 | tee results/a100_burst_batch_bench.log
+}
+
+run_account() {
+  mkdir -p results
+  require_model
+  select_gpu
+  verify_extension_import
+
+  # 1. Device/host split from both ends of the batch range.
+  #    megakernel-wmma/megakernel-burst are bounded by the 80-block grid
+  #    (batch <= 10); batch 16/32 only exist for the cudagraph baseline.
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-cudagraph,megakernel-burst \
+    --prompt-lengths 32 \
+    --batch-sizes 1,2,4,8,10,16,32 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 5 \
+    --json results/a100_account.json \
+    --markdown results/a100_account.md \
+    2>&1 | tee results/a100_account_compare.log
+
+  # 2. Split every row into per-step wall / GPU / host residual and compare
+  #    against the 1.192 GB tied weight-streaming roofline (0.585 ms @2039 GB/s).
+  #    seq-len 160 == prompt_len 32 + max_tokens 128 for this run.
+  python -m tools.account_decode \
+    results/a100_account.json \
+    --seq-len 160 \
+    --json results/a100_account_breakdown.json \
+    2>&1 | tee results/a100_account_breakdown.md
+
+  # 2b. The same accounting over an already-existing wall-time-only artifact
+  #     (tools/bench_burst_batch.py writes this schema). Rows are anchored to
+  #     the batch-independent weight floor instead of a measured GPU time.
+  #     Skipped when the scan has not been produced on this machine yet.
+  if [ -f results/crossover_scan.json ]; then
+    python -m tools.account_decode \
+      results/a100_account.json \
+      results/crossover_scan.json \
+      --seq-len 160 \
+      --json results/a100_account_breakdown_with_crossover.json \
+      2>&1 | tee results/a100_account_breakdown_with_crossover.md
+  else
+    echo "SKIP 2b: results/crossover_scan.json not found; run" \
+         "'python -m tools.bench_burst_batch --json results/crossover_scan.json'" \
+         "to include the existing crossover data." >&2
+  fi
+
+  # 3. Standalone roofline table for the doc (no GPU state needed).
+  python -m nanovllm.roofline \
+    --batch-sizes 1,2,4,8,10,16,32 \
+    --seq-len 160 \
+    --check-kernel \
+    --json results/a100_roofline_model.json
+
+  # 4. Compute the binary verdict from whatever probe data exists.  Missing
+  #    inputs are reported as NEEDS_DATA instead of guessing, so this can run
+  #    before or after RUN_MODE=roofline.  Exit code is 0 for a
+  #    recoverable/at-floor verdict and 1 otherwise; the JSON is the contract.
+  set +e
+  python -m tools.verdict \
+    --results-dir results \
+    --json results/a100_verdict.json \
+    --markdown results/a100_verdict.md \
+    2>&1 | tee results/a100_verdict.log
+  echo "verdict exit code: ${PIPESTATUS[0]} (see results/a100_verdict.md)"
+  set -e
+
+  # Decision rule (docs/07 section 10): if the fastest backend's step time is
+  # dominated by host residual, the recoverable cost is host-side for BOTH
+  # backends, and the megakernel question is not a device-side race.
+}
+
+run_roofline() {
+  mkdir -p results
+  require_model
+  select_gpu
+
+  # Experiments B (attainable bandwidth) and C (host-free graph replay).
+  # Standalone inline extensions -- no megakernel build required.
+  python -m tools.bench_roofline_a100 \
+    --model "$MODEL" \
+    --sections bandwidth,weights,host,barrier \
+    --target-bytes 1192000000 \
+    --batches 1,8,32 \
+    --grid-blocks 80 \
+    --block-size 512 \
+    --barrier-iterations 336 \
+    --json results/a100_roofline_probe.json \
+    2>&1 | tee results/a100_roofline_probe.log
+
+  # Experiment A: the device-side lower bound. Streams every transformer
+  # weight once per layer with the production barrier count and NO arithmetic.
+  # DECISION RULE (docs/07 section 10.4): <= 1.5 ms/step means the high-batch
+  # device side is recoverable and R3 is worth attempting; > 3 ms/step means
+  # the high-batch crossover is NOT achievable and the rewrite should stop.
+  python -m tools.bench_burst_lower_bound \
+    --model "$MODEL" \
+    --sections probe,graph \
+    --batches 1,8,32 \
+    --grid-blocks 80 \
+    --block-size 512 \
+    --iterations 4 \
+    --replays 50 \
+    --json results/a100_lower_bound.json \
+    2>&1 | tee results/a100_lower_bound.log
+
+  # Compute the binary verdict now that both probe inputs exist.  Missing
+  # inputs report NEEDS_DATA rather than guessing.
+  set +e
+  python -m tools.verdict \
+    --results-dir results \
+    --json results/a100_verdict.json \
+    --markdown results/a100_verdict.md \
+    2>&1 | tee results/a100_verdict.log
+  echo "verdict exit code: ${PIPESTATUS[0]}"
+  set -e
+
+  echo "Send back results/a100_verdict.json plus a100_roofline_probe.log," \
+       "a100_lower_bound.log and (after RUN_MODE=account) a100_account_breakdown.md."
+}
+
+run_profile() {
+  mkdir -p results
+  verify_environment
+  verify_extension_import
+  # nsys is safe (trace-only, no kernel replay).
+  nsys profile --trace=cuda,nvtx --sample=none \
+    --output=results/a100_megakernel_nsys \
+    python -m benchmarks.compare \
+      "$MODEL" --suite performance --backends megakernel \
+      --prompt-lengths 32 --batch-sizes 1 --max-tokens 32 \
+      --warmup 1 --runs 1
+  # WARNING: ncu (Nsight Compute) cannot safely profile cooperative kernels.
+  # Its kernel-replay mechanism conflicts with cudaLaunchCooperativeKernel and
+  # causes a GPU driver hang (nvidia-smi blocks, needs TDR to recover). The
+  # megakernel decode path uses cooperative launch, so ncu --set full on it
+  # will hang the GPU. Use nsys + tools/parse_nsys_kernel.py for kernel-time
+  # breakdown instead. The ncu block below is kept for non-cooperative kernels
+  # (eager/cudagraph) only; do NOT point it at megakernel backends.
+  # ncu --set full --target-processes all \
+  #   --export results/a100_megakernel_ncu \
+  #   python -m benchmarks.compare \
+  #     "$MODEL" --suite performance --backends megakernel \
+  #     --prompt-lengths 32 --batch-sizes 1 --max-tokens 32 \
+  #     --warmup 1 --runs 1
+}
+
+run_sanitize() {
+  mkdir -p results
+  verify_environment
+  export NANOVLLM_CUDA_SANITIZE=1
+  build_extension
+  local sanitizer_log=results/a100_compute_sanitizer.log
+  set +e
+  PYTHONPATH=src \
+    timeout 900s \
+    compute-sanitizer --tool memcheck \
+      --error-exitcode=1 \
+      --target-processes all \
+      --show-backtrace yes \
+      --print-limit 500 \
+      env CUDA_LAUNCH_BLOCKING=1 \
+        TORCH_SHOW_CPP_STACKTRACES=0 \
+        NANOVLLM_CUDA_DEBUG=1 \
+        python -m tools.correctness_smoke \
+          "$MODEL" \
+          --prompt-lengths 8 \
+          --batch-sizes 1 \
+          --max-tokens 2 \
+          --backends torch-eager,megakernel \
+          --require-megakernel \
+          --json results/a100_compute_sanitizer.json \
+          2>&1 | tee "$sanitizer_log"
+  local sanitizer_status=${PIPESTATUS[0]}
+  set -e
+
+  echo
+  echo "===== FIRST COMPUTE-SANITIZER REPORT ====="
+  if ! grep -n -m 1 -B 5 -A 40 -E \
+      'Invalid __global__|Invalid __shared__|Invalid __local__|Address .* out of bounds|misaligned|Race|illegal memory|unspecified launch' \
+      "$sanitizer_log"; then
+    echo "No detailed sanitizer report marker found; inspect $sanitizer_log"
+  fi
+  echo "===== END FIRST COMPUTE-SANITIZER REPORT ====="
+  return "$sanitizer_status"
+}
+
+case "$RUN_MODE" in
+  model)
+    run_model_download
+    ;;
+  verify)
+    select_gpu
+    verify_environment
+    verify_extension_import
+    ;;
+  build)
+    select_gpu
+    require_model
+    nvidia-smi --id="$GPU_SELECTION"
+    build_extension
+    ;;
+  correctness)
+    select_gpu
+    run_correctness
+    ;;
+  benchmark)
+    select_gpu
+    run_benchmark
+    ;;
+  nosync)
+    run_nosync_bench
+    ;;
+  account)
+    run_account
+    ;;
+  roofline)
+    run_roofline
+    ;;
+  profile)
+    select_gpu
+    run_profile
+    ;;
+  sanitize)
+    select_gpu
+    run_sanitize
+    ;;
+  all)
+    select_gpu
+    verify_environment
+    run_correctness
+    run_benchmark
+    ;;
+  *)
+    echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
+    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, or all." >&2
+    exit 2
+    ;;
+esac

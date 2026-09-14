@@ -1,0 +1,61 @@
+{
+  "performance": {
+    "prompt_lengths": [32, 128, 512, 1024],
+    "batch_mixes": [
+      {
+        "id": "mixed_batch_8",
+        "category": "mixed_length_batch",
+        "prompt_lengths": [32, 128, 512, 1024, 64, 256, 768, 192]
+      },
+      {
+        "id": "mixed_batch_32",
+        "category": "mixed_length_batch",
+        "prompt_lengths": [32, 64, 128, 256, 512, 768, 1024, 192]
+      }
+    ]
+  },
+  "correctness": [
+    {
+      "id": "short_qa",
+      "category": "qa",
+      "prompt": "Explain what a KV cache stores during autoregressive transformer inference.",
+      "max_tokens": 32
+    },
+    {
+      "id": "math_reasoning",
+      "category": "math",
+      "prompt": "A model serves 4 requests per second and each request generates 128 tokens. What is the generated-token throughput per second? Show the calculation.",
+      "max_tokens": 48
+    },
+    {
+      "id": "code_generation",
+      "category": "code",
+      "prompt": "Write a Python function that returns the first n Fibonacci numbers and include a short explanation of its time complexity.",
+      "max_tokens": 96
+    },
+    {
+      "id": "code_debugging",
+      "category": "code",
+      "prompt": "Find the bug in this Python code and provide a corrected version: def average(xs): return sum(xs) / len(xs) if xs else 0.0",
+      "max_tokens": 96
+    },
+    {
+      "id": "document_summary",
+      "category": "summary",
+      "prompt": "Summarize the following engineering note in five bullet points: A decode kernel processes one token at a time, repeatedly reads model weights and KV cache, and pays launch overhead for every layer. Kernel fusion can reduce launches, but correctness must be checked against a reference implementation before measuring throughput.",
+      "max_tokens": 96
+    },
+    {
+      "id": "long_context_qa",
+      "category": "long_context",
+      "prompt": "Read the following context and answer the question. Context: In a paged KV cache, a logical token position maps to a physical block through a block table. The block offset is the position modulo block size. A fused decode kernel can use this mapping to read keys and values directly without materializing a contiguous cache. Question: why does direct paged access matter for memory traffic?",
+      "max_tokens": 96
+    },
+    {
+      "id": "multi_turn_chat",
+      "category": "chat",
+      "prompt": "User: I am optimizing LLM inference on an A100. Assistant: Start by separating prefill and decode measurements. User: What should I record next? Assistant:",
+      "max_tokens": 96
+    }
+  ]
+}

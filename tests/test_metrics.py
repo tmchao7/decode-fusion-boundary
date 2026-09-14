@@ -1,0 +1,174 @@
+import json
+import unittest
+from types import SimpleNamespace
+
+from nanovllm.metrics import (
+    CudaEventTimer,
+    MetricsCollector,
+    RequestMetrics,
+    aggregate_requests,
+    compare_metric_summaries,
+    percentile,
+)
+
+
+class MetricsMathTests(unittest.TestCase):
+    def test_percentiles_are_deterministic_and_empty_is_none(self):
+        self.assertIsNone(percentile([], 0.95))
+        self.assertEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.5), 2.5)
+        self.assertAlmostEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.95), 3.85)
+
+    def test_request_metrics_derives_tpot_and_itl(self):
+        request = RequestMetrics(
+            request_id=7,
+            prompt_tokens=4,
+            arrival_time=10.0,
+            token_times=[11.0, 11.5, 12.25],
+            output_tokens=3,
+            prefill_time=0.25,
+            decode_time=1.25,
+            backend_requested="megakernel",
+            backend_actual="torch+megakernel",
+        )
+        sample = request.to_dict()
+        self.assertEqual(sample["ttft_ms"], 1000.0)
+        self.assertEqual(sample["itl_ms"], [500.0, 750.0])
+        self.assertEqual(sample["e2e_ms"], 2250.0)
+        self.assertEqual(sample["tpot_ms"], 625.0)
+
+    def test_single_token_tpot_is_none_not_nan(self):
+        request = RequestMetrics(
+            request_id=1,
+            prompt_tokens=1,
+            arrival_time=0.0,
+            token_times=[0.25],
+            output_tokens=1,
+            prefill_time=0.1,
+            decode_time=0.0,
+            backend_requested="torch",
+            backend_actual="torch",
+        )
+        self.assertIsNone(request.to_dict()["tpot_ms"])
+
+    def test_aggregate_latencies_stay_in_milliseconds(self):
+        """Regression: the aggregate used to divide ms by 1000 and report seconds.
+
+        ``RequestMetrics.to_dict()`` emits milliseconds, so a 1000x understated
+        ``ttft_ms``/``tpot_ms``/``itl_ms``/``e2e_ms`` reached every generated
+        report and plot (which label those columns "ms").
+        """
+
+        request = RequestMetrics(
+            request_id=3,
+            prompt_tokens=4,
+            arrival_time=0.0,
+            token_times=[0.1, 0.2],
+            output_tokens=2,
+            prefill_time=0.05,
+            decode_time=0.1,
+            backend_requested="torch",
+            backend_actual="torch",
+        )
+        summary = aggregate_requests([request], wall_time=1.0)
+        self.assertAlmostEqual(summary["ttft_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["tpot_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["itl_ms"]["p50"], 100.0, places=6)
+        self.assertAlmostEqual(summary["e2e_ms"]["p50"], 200.0, places=6)
+
+    def test_aggregate_and_comparison(self):
+        requests = [
+            RequestMetrics(1, 4, 0.0, [0.1, 0.2], 2, 0.05, 0.1, "torch", "torch"),
+            RequestMetrics(2, 4, 0.0, [0.2, 0.4], 2, 0.05, 0.2, "torch", "torch"),
+        ]
+        summary = aggregate_requests(requests)
+        self.assertEqual(summary["request_count"], 2)
+        self.assertEqual(summary["output_tokens"], 4)
+        self.assertIsNotNone(summary["ttft_ms"]["p95"])
+
+        comparison = compare_metric_summaries(
+            {
+                "prefill_tok_s": 200.0,
+                "output_tok_s": 100.0,
+                "peak_memory_allocated_bytes": 200.0,
+                "e2e_ms": {"p50": 20.0},
+            },
+            {
+                "prefill_tok_s": 250.0,
+                "output_tok_s": 125.0,
+                "peak_memory_allocated_bytes": 150.0,
+                "e2e_ms": {"p50": 15.0},
+            },
+        )
+        self.assertEqual(comparison["output_tok_s"]["speedup"], 1.25)
+        self.assertEqual(comparison["prefill_tok_s"]["improvement_pct"], 25.0)
+        self.assertEqual(comparison["peak_memory_allocated_bytes"]["improvement_pct"], 25.0)
+        self.assertEqual(comparison["e2e_ms_p50"]["improvement_pct"], 25.0)
+
+    def test_metrics_are_json_serializable(self):
+        request = RequestMetrics(1, 2, 0.0, [1.0], 1, 0.1, 0.2, "torch", "torch")
+        json.dumps(request.to_dict())
+
+    def test_cuda_event_timer_is_safe_without_cuda(self):
+        timer = CudaEventTimer()
+        self.assertIsNone(timer.elapsed_seconds())
+
+    def test_collector_tracks_cuda_phase_time(self):
+        class FakeTimer:
+            def elapsed_seconds(self):
+                return 0.05
+
+        collector = MetricsCollector("torch")
+        collector.add_request(4, 8, 0.0)
+        seq = SimpleNamespace(seq_id=4)
+        collector.record_step([seq], True, 0.1, "torch", None, cuda_timer=FakeTimer())
+        report = collector.report(wall_time=0.1)
+        self.assertEqual(report["summary"]["cuda_prefill_time_ms_total"], 50.0)
+        self.assertEqual(report["requests"][0]["cuda_prefill_time_ms"], 50.0)
+
+    def test_collector_tracks_phase_tokens_and_backend_fallback(self):
+        collector = MetricsCollector("megakernel")
+        collector.add_request(3, 8, 0.0)
+        seq = SimpleNamespace(seq_id=3)
+        collector.record_step([seq], True, 0.2, "torch", "decode-only")
+        collector.record_token(3, 0.3)
+        collector.record_step([seq], False, 0.1, "megakernel", None)
+        collector.record_token(3, 0.4)
+        report = collector.report(wall_time=0.4)
+        self.assertEqual(report["summary"]["backend_actuals"], ["megakernel", "torch"])
+        self.assertEqual(report["summary"]["fallback_count"], 1)
+        self.assertEqual(report["requests"][0]["output_tokens"], 2)
+
+
+class MetricsMergeTests(unittest.TestCase):
+    def test_merge_reports_preserves_requests_and_adds_wall_time(self):
+        from nanovllm.metrics import merge_metric_reports
+
+        first = MetricsCollector("torch")
+        first.add_request(1, 4, 0.0)
+        first.record_token(1, 0.2)
+        second = MetricsCollector("torch")
+        second.add_request(2, 8, 0.0)
+        second.record_token(2, 0.3)
+        merged = merge_metric_reports(
+            [first.report(wall_time=0.2), second.report(wall_time=0.3)]
+        )
+        self.assertEqual(merged["summary"]["request_count"], 2)
+        self.assertEqual(merged["summary"]["output_tokens"], 2)
+        self.assertEqual(merged["summary"]["wall_time_s"], 0.5)
+        self.assertEqual(len(merged["requests"]), 2)
+
+class BatchThroughputTests(unittest.TestCase):
+    def test_summary_throughput_uses_step_time_once_for_a_batch(self):
+        collector = MetricsCollector("torch")
+        collector.add_request(1, 10, 0.0)
+        collector.add_request(2, 20, 0.0)
+        seqs = [SimpleNamespace(seq_id=1), SimpleNamespace(seq_id=2)]
+        collector.record_step(seqs, True, 0.5, "torch", None)
+        collector.record_token(1, 0.6)
+        collector.record_token(2, 0.6)
+        summary = collector.report(wall_time=0.6)["summary"]
+        self.assertEqual(summary["prefill_tok_s"], 60.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

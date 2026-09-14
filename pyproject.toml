@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "megakernel-vllm"
+version = "0.2.0"
+readme = "README.md"
+description = "Qwen Megakernel research extension for nano-vLLM"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    "flash-attn",
+    "xxhash",
+]
+
+[project.urls]
+Homepage="https://github.com/tmchao7/MegaKernel-vLLM"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nanovllm*"]
+
+[tool.setuptools.package-data]
+nanovllm = ["backends/megakernel/csrc/*.cu", "backends/megakernel/csrc/*.cpp"]
