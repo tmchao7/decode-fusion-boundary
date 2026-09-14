@@ -1,52 +1,99 @@
-# Python
+# ---- Python ----
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg
 *.egg-info/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
 .venv/
 venv/
 env/
+ENV/
+.python-version
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.nox/
 .coverage
+.coverage.*
 htmlcov/
 
-# Packaging and build outputs
-build/
-dist/
-*.egg
+# ---- Native / CUDA build artifacts ----
 *.so
 *.o
+*.a
+*.obj
+*.dll
+*.dylib
 *.cubin
 *.fatbin
+*.ptx
 .ninja_deps
 .ninja_log
+.torch_extensions/
 
-# Local models and downloaded checkpoints
+# ---- Local models and checkpoints (never commit weights) ----
+models/
+huggingface/
+checkpoints/
 *.safetensors
 *.bin
 *.pt
 *.pth
 *.ckpt
-models/
-huggingface/
-.ref/
+*.gguf
+*.onnx
 
-# CUDA extension build cache
-.torch_extensions/
-
-# GPU benchmarks and profiling
+# ---- Benchmark / profiler output (regenerated, machine-specific) ----
 results/
+logs/
+*.log
+*.jsonl
 *.nsys-rep
 *.ncu-rep
 *.qdrep
 *.sqlite
+*.sqlite3
+*.perf
+*.folded
+profile_*.txt
+ncu_report*
 
-# Local environments, secrets, and tooling
+# ---- Local tooling / agent state ----
+.opencode/
+.claude/
+.cursor/
+.aider*
+.codex/
+
+# ---- Secrets and local environment ----
 .env
 .env.*
-.DS_Store
+!.env.example
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# ---- Editors ----
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+*.orig
+*.rej
+
+# ---- OS ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini

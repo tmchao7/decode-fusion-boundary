@@ -1,7 +1,7 @@
 """Compare WMMA batch kernel vs scalar megakernel token-by-token.
 
 The scalar megakernel itself diverges from torch-eager due to ~1-ulp
-bf16 reduction-order differences (documented in AGENTS.md).  The correct
+bf16 reduction-order differences (see CONTRIBUTING.md).  The correct
 gate for the WMMA conversion is therefore: WMMA must match the scalar
 megakernel, not torch-eager.
 
@@ -92,7 +92,7 @@ def classify(scalar: list[list[int]], wmma: list[list[int]]) -> tuple[str, list[
 
     The batched megakernel and WMMA tensor-core paths are not bit-identical:
     a ~1-ulp bf16 reduction-order difference at some layer cascades into a
-    token flip at greedy decode (documented in AGENTS.md).  A strict token-
+    token flip at greedy decode (see CONTRIBUTING.md).  A strict token-
     equality gate can therefore never pass at every batch/length, so this
     separates that *expected cascade* from a *real bug*:
 

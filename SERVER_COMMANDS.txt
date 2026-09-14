@@ -3,15 +3,14 @@ set -euo pipefail
 
 # Megakernel-vLLM server workflow.
 #
-# On the server, update first:
-#   cd /home/t50063365/workspace/repos/MegaKernel-vLLM
-#   git pull --ff-only
+# Run it from the checkout (paths default to the script's own directory):
+#   bash SERVER_COMMANDS.txt
 #
 # Then run one phase from this single file:
 #   bash SERVER_COMMANDS.txt                         # correctness (default)
 #   RUN_MODE=model bash SERVER_COMMANDS.txt          # download/check Qwen3-0.6B
 #   RUN_MODE=verify bash SERVER_COMMANDS.txt         # environment + extension check
-#   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean A100 Megakernel rebuild
+#   RUN_MODE=build bash SERVER_COMMANDS.txt          # clean Megakernel rebuild
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # controlled A/B benchmark
 #   RUN_MODE=nosync bash SERVER_COMMANDS.txt         # no-sync / burst vs cudagraph
 #   RUN_MODE=account bash SERVER_COMMANDS.txt        # host/device split of decode steps
@@ -20,18 +19,24 @@ set -euo pipefail
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
+# Overridable: REPO, NANOVLLM_MODEL_PATH (or MODEL), PREFERRED_GPUS,
+# NANOVLLM_PYPI_INDEX_URL, HF_ENDPOINT, HF_HOME.
+#
 # The file is intentionally the only checked-in server command file. Update this
 # file in future changes instead of creating another *_COMMANDS.txt file.
 
 RUN_MODE="${RUN_MODE:-correctness}"
-REPO="${REPO:-/home/t50063365/workspace/repos/MegaKernel-vLLM}"
-MODEL="${MODEL:-/home/t50063365/models/Qwen3-0.6B}"
-PREFERRED_GPUS="${PREFERRED_GPUS:-5 6 1 3}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$SCRIPT_DIR}"
+MODEL="${MODEL:-${NANOVLLM_MODEL_PATH:-$HOME/models/Qwen3-0.6B}}"
+# Space-separated physical GPU ids; select_gpu() picks the one with the most free
+# memory. Point it at the GPUs you are allowed to use on a shared box.
+PREFERRED_GPUS="${PREFERRED_GPUS:-0}"
 
 cd "$REPO"
 
-# The server already has uv/.venv configured by setup_server.sh. These settings
-# keep package/model downloads on the configured domestic mirrors when needed.
+# The venv is created by setup_server.sh. Point the package index at a mirror
+# only if the machine cannot reach PyPI directly.
 source .venv/bin/activate
 export PYTHONPATH="$REPO/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
@@ -47,7 +52,7 @@ export UV_SYSTEM_CERTS="${UV_SYSTEM_CERTS:-true}"
 export UV_PYTHON_DOWNLOADS=0
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
-export NANOVLLM_PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://mirrors.huaweicloud.com/repository/pypi/simple/}"
+export NANOVLLM_PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://pypi.org/simple/}"
 # Tensor-parallel rendezvous uses an automatically selected local port. Set
 # NANOVLLM_DIST_PORT only when an externally controlled fixed port is required.
 
@@ -199,7 +204,7 @@ run_correctness() {
   # WMMA vs scalar megakernel, cascade-aware gate.
   # The batched megakernel and WMMA tensor-core paths are not bit-identical: a
   # ~1-ulp bf16 reduction-order difference at some layer cascades into a token
-  # flip at greedy decode (documented in AGENTS.md). The scalar megakernel also
+  # flip at greedy decode (see CONTRIBUTING.md). The scalar megakernel also
   # diverges from torch-eager by ~1-ulp, so the meaningful gate is WMMA vs
   # scalar, with the cascade classified separately: PASS (identical),
   # CASCADE (divergence only at a decode token >= 1, expected ulp cascade),
@@ -248,8 +253,8 @@ run_correctness() {
 
 run_model_download() {
   mkdir -p "$(dirname "$MODEL")"
-  export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-  export HF_HOME="${HF_HOME:-/home/t50063365/.cache/huggingface}"
+  export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+  export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
   if ! command -v hf >/dev/null 2>&1; then
     uv pip install --python "$REPO/.venv/bin/python" \

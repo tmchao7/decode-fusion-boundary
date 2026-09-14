@@ -193,7 +193,7 @@ class ServerCommandReferenceTests(unittest.TestCase):
         return match.group(1)
 
     def test_no_second_command_file_exists(self) -> None:
-        """AGENTS.md: exactly one checked-in server command file."""
+        """CONTRIBUTING.md: exactly one checked-in server command file."""
 
         extras = [
             path.name

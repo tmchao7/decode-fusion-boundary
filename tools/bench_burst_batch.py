@@ -32,7 +32,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-MODEL = "/home/t50063365/models/Qwen3-0.6B"
+DEFAULT_MODEL = os.environ.get(
+    "NANOVLLM_MODEL_PATH", os.path.expanduser("~/models/Qwen3-0.6B")
+)
 MAX_BATCH_SIZE = 32
 SAFE_BURST_BATCH = 8
 
@@ -148,7 +150,7 @@ def summarize(walls: list[float], total_tokens: int) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--prompt-length", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--batch-sizes", default="1,2,3,4,5,6,7,8,10,16,32")

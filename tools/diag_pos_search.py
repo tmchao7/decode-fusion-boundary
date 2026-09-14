@@ -19,10 +19,13 @@ def main():
     get_extension()
     from nanovllm.backends.megakernel.model import _rope_tables
 
-    model_path = "/home/t50063365/models/Qwen3-0.6B"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+    model_path = os.environ.get(
+        "NANOVLLM_MODEL_PATH", os.path.expanduser("~/models/Qwen3-0.6B")
+    )
 
-    diag_dir = "/home/t50063365/tmp/opencode/diag"
+    diag_dir = os.environ.get(
+        "NANOVLLM_DIAG_DIR", os.path.expanduser("~/.cache/nanovllm/diag")
+    )
     mega_data = torch.load(os.path.join(diag_dir, "layer0_megakernel.pt"), weights_only=True)
     torch_data = torch.load(os.path.join(diag_dir, "layer0_torch.pt"), weights_only=True)
 

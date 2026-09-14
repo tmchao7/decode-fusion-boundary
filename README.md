@@ -1,187 +1,155 @@
 # Megakernel-vLLM
 
-nano-vLLM extended with a Megakernel decode backend for Qwen3-0.6B on A100.
-The runtime is a **hybrid dispatch**: batch=1 uses a fused cooperative
-Megakernel (device-side EOS, no per-step host launch); batch≥2 falls back to
-the torch path (the A/B comparison uses CUDA Graph; inside the same
-`decode_backend="megakernel"` engine the fallback is eager, because that engine
-does not capture a graph). This split is the measured conclusion, not a
-placeholder — see `docs/07` §10.
+A fused persistent **Megakernel** decode backend for Qwen3-0.6B on nano-vLLM, and
+the measurement tooling that decided how it should be dispatched.
 
-> **Status: frozen.** The question this project set out to answer is settled
-> with measured evidence: batch=1 wins by removing per-step host overhead;
-> at batch>1 the device side has no headroom to win, so the R3 kernel rewrite is
-> not worth attempting (`DEVICE_BORDERLINE`, `megakernel_could_win=false`).
-> Remaining P1/P2 items are frozen as documented limitations — see
-> `docs/10_交接文档.md` §1 and §5.9 before changing code.
+**Headline result (A100-SXM4-80GB, Qwen3-0.6B, BF16, greedy):** at **batch=1**
+the Megakernel is **1.31x faster end-to-end than CUDA Graph** (2.241 vs 2.944
+ms/token) by eliminating the per-step host/launch round trip — even though its
+*pure kernel* time is 2.6x slower. At **batch≥2** CUDA Graph wins by 1–2 orders
+of magnitude, so the runtime keeps it for batch>1. Both halves of that split are
+backed by on-machine measurements in [`docs/06`](docs/06_实际运行数据.md) and the
+decision rule in [`docs/07` §10](docs/07_架构结论_megakernel为何打不过cudagraph.md).
 
-## Architecture
-
-```
-batch == 1  →  Megakernel persistent/paged kernel  (1.31x faster than cudagraph)
-batch >= 2  →  torch-cudagraph fallback             (megakernel is 1.45–134.3x the device floor)
+```text
+batch == 1  ->  Megakernel persistent/paged kernel   (one cooperative launch, device-side EOS)
+batch >= 2  ->  torch path                           (cudagraph in the A/B; eager inside this engine)
 ```
 
-Three backends are available: `torch-eager` (reference), `torch-cudagraph`
-(production), and `megakernel` (experimental, batch=1 only by default).
-Unsupported requests fall back automatically and are marked in benchmark
-output.
+> **Status: research project, frozen.** The question it set out to answer is
+> settled: batch=1 wins on host-overhead elimination; at batch>1 the device side
+> has no headroom left, so the fused batch rewrite is not worth attempting
+> (measured verdict `DEVICE_BORDERLINE`, `megakernel_could_win=false`).
+> Remaining P1/P2 findings are frozen as documented limitations — read
+> [`docs/10`](docs/10_交接文档.md) §1 and §5.9 before changing code.
 
-## Why This Split (measured on A100)
+## Why this split (measured, not assumed)
 
 | fact | value | source |
 |---|---:|---|
-| attainable HBM bandwidth | 1699 GB/s (83.3% of the A100-80GB 2039 GB/s spec) | `bench_roofline_a100.py` |
-| weight floor (tied_embedding=True) | 1.192 GB → 0.585 ms/step spec, 0.701 ms measured | `roofline.py` |
-| device lower bound (probe + LM head) | 1.548 ms/step (measured) | `bench_burst_lower_bound.py` + `verdict.py` |
-| cudagraph host-free replay | 0.020–0.029 ms/step (b1–b32; verdict uses the largest batch) | `bench_burst_lower_bound.py` |
-| host overlay per step | 0.014 ms (b1/b8/b32; not recoverable) | same |
-| megakernel batch=1 vs cudagraph | **1.31x E2E win** | `benchmarks.compare` |
-| megakernel batch=10 vs cudagraph | 48.3x the device floor | `account_decode.py` |
-| binary verdict | **`DEVICE_BORDERLINE`** (measured) | `tools/verdict` → `results/a100_verdict.json` |
+| batch=1 E2E, megakernel vs cudagraph | **1.31x win** (2.241 vs 2.944 ms/token) | `benchmarks.compare`, `tools/bench_nosync.py` |
+| batch=1 pure decode kernel | megakernel 1.89 ms vs cudagraph 0.74 ms (**2.6x slower**) | nsys |
+| batch=1 host/launch cost per step | **~2.2 ms** — where the 1.31x actually comes from | host/device ledger, `tools/account_decode.py` |
+| batch≥2 megakernel-burst per step | 22.7 ms (b2) … 207.9 ms (b32) vs cudagraph 3.3–3.5 ms | `tools/bench_burst_batch.py` |
+| attainable HBM bandwidth | 1699 GB/s (83.3% of the 2039 GB/s A100-80GB spec) | `tools/bench_roofline_a100.py` |
+| weight floor (tied embeddings) | 1.192 GB/step → 0.585 ms spec, 0.701 ms measured | `src/nanovllm/roofline.py` |
+| full device lower bound (probe + LM head) | **1.548 ms/step** > 1.5 ms threshold | `tools/bench_burst_lower_bound.py` + `tools/verdict.py` |
+| cudagraph host-free replay | 0.020–0.029 ms/step | same |
+| binary verdict | **`DEVICE_BORDERLINE`**, `megakernel_could_win=false` | `tools/verdict.py` → `results/a100_verdict.json` |
 
-The device floor (1.548 ms, the `full_device_floor_ms` JSON field) is **above** the
-1.5 ms recoverable threshold, and cudagraph's host-free replay (0.029 ms at the
-batch the verdict selects) is far below it — so there is no
-device-side or host-side headroom for a batch>1 megakernel to win. The verdict
-is `DEVICE_BORDERLINE`, regenerated from `results/a100_verdict.json` by
-`RUN_MODE=roofline` on the server (round 14, `fe0d4f3`). See `docs/07` §10.4 and `docs/06` §7.
+The lower-bound probe streams all 28 layers of weights plus 336 grid syncs and
+still takes 1.365 ms/step; adding the LM-head read gives 1.548 ms, above the
+1.5 ms "worth rewriting" line. Since cudagraph's host-free replay is only
+~0.03 ms, a persistent batch>1 kernel has nothing to win on the device side —
+so the project stops there on evidence rather than after a rewrite.
 
-## Repository Layout
+## Install
 
-```text
-src/nanovllm/             Core runtime, scheduler, model, and public API
-src/nanovllm/backends/    Execution backends
-  megakernel/             Qwen CUDA extension, wrapper, and kernel sources
-benchmarks/               Workload definitions and benchmark entrypoints
-tests/                    CPU-safe unit tests
-tools/                    Correctness, environment, and plotting utilities
-docs/                     Kernel design and server runbook
-examples/                 Minimal inference examples
+Local (CPU-only) development needs Python 3.10–3.12:
+
+```bash
+python -m pip install -e .
+PYTHONPATH=src python -m unittest discover -s tests -v   # 287 tests; a few need torch/transformers
+python -m compileall src/nanovllm benchmarks tools
 ```
 
-## Server Environment
-
-Use `uv` for fast Python environment setup. The setup script reuses an
-existing server Python 3.10–3.12, explicitly avoids downloading a managed
-CPython, installs a CUDA-enabled PyTorch wheel and project dependencies, and
-installs the repository in editable mode. The server must provide `nvidia-smi`
-and `nvcc`.
+On a GPU machine you additionally need an NVIDIA driver, `nvcc`, and a
+CUDA-enabled PyTorch. `setup_server.sh` creates a `uv` virtualenv from an
+*existing* system Python (it deliberately avoids downloading a managed CPython):
 
 ```bash
 bash setup_server.sh
 source .venv/bin/activate
-python -m tools.verify_server_env
+NANOVLLM_MODEL_PATH=~/models/Qwen3-0.6B python -m tools.verify_server_env
 ```
 
-Set `NANOVLLM_MODEL_PATH` when the model path should also be checked.
-
-## Quick Start
+## Quick start
 
 ```python
 from nanovllm import LLM, SamplingParams
 
-llm = LLM("/PATH/TO/Qwen3-0.6B", enforce_eager=True)
-params = SamplingParams(temperature=0.6, max_tokens=128)
-outputs = llm.generate(["Explain KV cache in one paragraph."], params)
-print(outputs[0]["text"])
-```
+model = "~/models/Qwen3-0.6B"          # or set NANOVLLM_MODEL_PATH
 
-For Megakernel decode:
+# Megakernel decode (batch=1 path)
+llm = LLM(model, decode_backend="megakernel", max_num_seqs=1, max_model_len=2048)
+params = SamplingParams(temperature=0.0, max_tokens=128)
+print(llm.generate(["Explain the KV cache in one paragraph."], params)[0]["text"])
+```
 
 ```python
-llm = LLM(
-    "/PATH/TO/Qwen3-0.6B",
-    decode_backend="megakernel",
-    max_num_seqs=1,
-    max_model_len=2048,
-)
-params = SamplingParams(temperature=0.0, max_tokens=128)
+# torch path (eager or CUDA Graph), the batch≥2 path
+llm = LLM(model, decode_backend="torch", enforce_eager=False)
 ```
 
-## Correctness and Benchmarking
+The Megakernel contract is deliberately narrow: Qwen3-0.6B, BF16, greedy
+sampling, decode-only, `max_model_len <= 2048`. Anything outside it falls back
+to the torch path with an explicit reason (and `LLMEngine` warns at startup if
+you set `decode_backend="megakernel"` without `max_model_len=2048`).
 
-Run the short correctness gate before long experiments:
+## Reproducing the measurements
+
+Every GPU-machine command lives in the single [`SERVER_COMMANDS.txt`](SERVER_COMMANDS.txt).
+Run it from the checkout and select a phase:
 
 ```bash
-CUDA_LAUNCH_BLOCKING=1 NANOVLLM_CUDA_ARCH=sm_80 \
-python -m tools.correctness_smoke /PATH/TO/Qwen3-0.6B \
-  --workload-ids short_qa,math_reasoning,code_generation,code_debugging \
-  --max-tokens 8 --require-megakernel --allow-cascade \
-  --json results/a100-correctness.json
+bash SERVER_COMMANDS.txt                    # correctness gate (default)
+RUN_MODE=build     bash SERVER_COMMANDS.txt # clean CUDA-extension rebuild
+RUN_MODE=correctness bash SERVER_COMMANDS.txt
+RUN_MODE=benchmark bash SERVER_COMMANDS.txt # eager / cudagraph / megakernel A/B
+RUN_MODE=nosync    bash SERVER_COMMANDS.txt # batch=1 burst vs cudagraph
+RUN_MODE=account   bash SERVER_COMMANDS.txt # per-step host/device ledger
+RUN_MODE=roofline  bash SERVER_COMMANDS.txt # bandwidth + device lower-bound probe + verdict
+RUN_MODE=profile   bash SERVER_COMMANDS.txt # short nsys capture
 ```
 
-Run controlled prompt-length and batch experiments:
+Paths and GPU selection come from environment variables (`REPO`,
+`NANOVLLM_MODEL_PATH`, `PREFERRED_GPUS`, `NANOVLLM_PYPI_INDEX_URL`), so the file
+is portable. `tools/verdict.py` turns the probe JSONs into a reproducible
+verdict with thresholds locked by `tests/test_verdict.py`; it reports
+`NEEDS_DATA` rather than guessing when a probe has not run.
 
-```bash
-NANOVLLM_CUDA_ARCH=sm_80 \
-python -m benchmarks.compare /PATH/TO/Qwen3-0.6B \
-  --suite performance \
-  --workloads benchmarks/workloads.json \
-  --backends torch-eager,torch-cudagraph,megakernel \
-  --batch-sizes 1,8,32 --max-tokens 128 --warmup 2 --runs 10 \
-  --json results/a100.json --markdown results/a100.md
+## Correctness policy
+
+**Do not gate on token equality with torch-eager.** WMMA and scalar kernels
+differ from torch's fused bf16 kernels by ~1–2 ULP in reduction order, which
+cascades into an occasional token flip at greedy decoding. Use the three-way
+gate (`tools/correctness_wmma_vs_scalar.py`, mirrored in
+`tools/correctness_smoke.py`): **PASS** (identical), **CASCADE** (divergence only
+at decode token ≥ 1 — expected), **FAIL** (prefill-token-0, request-count, or
+length mismatch — a real bug). See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Repository layout
+
+```text
+src/nanovllm/               Runtime: engine/ (scheduler, blocks, model runner),
+                            layers/, models/, backends/megakernel/ (CUDA + bindings),
+                            roofline.py, rope_config.py
+benchmarks/                 Workload definitions and A/B entrypoints
+tools/                      Correctness gates, probes, profiling, plotting
+tests/                      Focused unittest suite
+docs/                       Ordered documentation set (Chinese)
+examples/                   Minimal inference example
+SERVER_COMMANDS.txt         The single GPU-machine command file (RUN_MODE phases)
 ```
 
-Run natural-language workloads separately:
-
-```bash
-NANOVLLM_CUDA_ARCH=sm_80 \
-python -m benchmarks.compare /PATH/TO/Qwen3-0.6B \
-  --suite realistic --workloads benchmarks/workloads.json \
-  --json results/a100-realistic.json --markdown results/a100-realistic.md
-```
-
-Generate plots:
-
-```bash
-python -m tools.plot_metrics results/a100.json --output-dir results/a100-plots
-```
-
-The benchmark records TTFT, TPOT, ITL, E2E latency, prefill/decode/output
-throughput, CUDA Event time, peak memory, fallback reasons, and correctness.
-Nsight profiling and the server workflow are documented in `docs/08_服务器运行手册.md`.
-
-## Development Checks
-
-```bash
-python -m unittest discover -s tests -v
-python -m compileall src/nanovllm benchmarks tools
-```
-
-## 中文项目说明
+## Documentation (中文)
 
 按阅读顺序：
 
-- [01 项目说明](docs/01_项目说明.md)：**先读这个**。最终形态（batch=1 megakernel / batch>1 cudagraph）、项目定位、集成边界；
-- [02 指标说明](docs/02_指标说明.md)：TTFT、TPOT、ITL、E2E、吞吐、显存和正确性口径；
-- [03 Megakernel 设计说明](docs/03_Megakernel设计说明.md)：结构、KV cache 契约、算子覆盖、融合边界、已知边界；
+- [01 项目说明](docs/01_项目说明.md)：**先读这个**。最终形态、项目定位、集成边界；
+- [02 指标说明](docs/02_指标说明.md)：TTFT、TPOT、ITL、E2E、吞吐、显存与正确性口径；
+- [03 Megakernel 设计说明](docs/03_Megakernel设计说明.md)：结构、KV cache 契约、算子覆盖、融合边界；
 - [04 基准测试方法](docs/04_基准测试方法.md)：实验矩阵、运行步骤、结果保存、Nsight 用法；
 - [05 对比基线与公平性](docs/05_对比基线与公平性.md)：对照谁、怎么测、三处必须披露的不对称；
 - [06 实际运行数据](docs/06_实际运行数据.md)：已实测 / 待标定 / 待跑 三类数字，含 batch 扫描与 host/device 账本；
-- [07 架构结论：megakernel 为何打不过 cudagraph](docs/07_架构结论_megakernel为何打不过cudagraph.md)：机制拆解 + 外部印证 + 判定规则；
-- [08 服务器运行手册](docs/08_服务器运行手册.md)：A100/V100 环境、RUN_MODE 用法、profiling 注意事项；
-- [09 集成问题清单](docs/09_集成问题清单.md)：P0/P1/P2 待办与已验证项；
-- [10 交接文档](docs/10_交接文档.md)：**下一个 agent 从这里开始**（做了什么、还剩什么、怀疑什么）；
-- [服务器命令清单](SERVER_COMMANDS.txt)：可直接复制执行的服务器命令。
+- [07 架构结论](docs/07_架构结论_megakernel为何打不过cudagraph.md)：根因拆解 + 外部印证 + 判定规则；
+- [08 服务器运行手册](docs/08_服务器运行手册.md)：环境、RUN_MODE 用法、profiling 注意事项；
+- [09 集成问题清单](docs/09_集成问题清单.md)：P0/P1/P2 与已验证项；
+- [10 交接文档](docs/10_交接文档.md)：工程日志（每轮改了什么、什么被冻结）。
 
-## Host/Device Accounting and the High-Batch Verdict
+## Credits
 
-`tools/account_decode.py` splits each measured decode step into wall time, GPU
-time and host residual (and reads both the `benchmarks.compare` and
-`bench_burst_batch` JSON schemas). `tools/verdict.py` turns the probe outputs
-into a reproducible verdict — `DEVICE_BORDERLINE`, `DEVICE_AT_FLOOR`,
-`DEVICE_UNREACHABLE`, `DEVICE_RECOVERABLE`, `NEEDS_CALIBRATION` or
-`NEEDS_DATA` — with thresholds locked by `tests/test_verdict.py`. The verdict
-includes an LM head stream correction (the probe skips `lm_head`, so the full
-device floor = probe + 0.183 ms at 1699 GB/s).
-
-```bash
-python -m nanovllm.roofline --batch-sizes 1,8,32 --seq-len 160 --check-kernel
-python -m tools.account_decode results/a100_account.json --seq-len 160
-python -m tools.verdict --results-dir results
-```
-
-The verdict tool deliberately reports `NEEDS_DATA` rather than guessing when a
-probe has not run, and `DEVICE_AT_FLOOR` when the measured device time already
-sits near the floor (probe fast does not imply a win).
+Built on [nano-vLLM](https://github.com/GeeeekExplorer/nano-vLLM) (model
+runtime, paged KV cache, scheduler) and [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B).
+The fused-kernel direction is inspired by the megakernel / persistent-kernel
+literature linked in `docs/07` §9.

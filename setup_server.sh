@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Create a uv virtualenv for the GPU machine from an existing system Python.
+#
+# Overridable environment variables:
+#   NANOVLLM_VENV              virtualenv directory (default: .venv)
+#   NANOVLLM_PYTHON_VERSION    preferred system Python minor (default: 3.11)
+#   NANOVLLM_PYTHON_BIN        exact interpreter to use
+#   NANOVLLM_TORCH_VERSION     torch version to install (default: 2.8.0)
+#   NANOVLLM_TORCH_CUDA_INDEX  CUDA wheel index (default: official cu128)
+#   NANOVLLM_PYPI_INDEX_URL    package index (default: official PyPI; point it
+#                              at a mirror on restricted networks)
+
 ENV_DIR="${NANOVLLM_VENV:-.venv}"
 PYTHON_VERSION="${NANOVLLM_PYTHON_VERSION:-3.11}"
 PYTHON_BIN="${NANOVLLM_PYTHON_BIN:-}"
 TORCH_VERSION="${NANOVLLM_TORCH_VERSION:-2.8.0}"
 TORCH_CUDA_INDEX="${NANOVLLM_TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu128}"
-PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://mirrors.huaweicloud.com/repository/pypi/simple/}"
+PYPI_INDEX_URL="${NANOVLLM_PYPI_INDEX_URL:-https://pypi.org/simple/}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${ROOT_DIR}/${ENV_DIR}"
 
@@ -81,18 +92,20 @@ uv pip install --python "${PYTHON}" \
 uv pip install --python "${PYTHON}" \
   --index-url "${PYPI_INDEX_URL}" \
   ninja packaging
-# Prefer the fast domestic mirror for torch and its nvidia-* dependencies;
-# keep the official CUDA index as a fallback for packages not mirrored there.
+# Install torch from the configured package index, falling back to the official
+# CUDA wheel index for packages the mirror does not carry.
 uv pip install --python "${PYTHON}" \
   "torch==${TORCH_VERSION}" \
   --index-url "${PYPI_INDEX_URL}" \
   --extra-index-url "${TORCH_CUDA_INDEX}"
 
 # FlashAttention is installed separately because it may need a local CUDA build.
-grep -v '^flash-attn' requirements.server.txt > /tmp/nano-vllm-requirements-no-flash.txt
+tmp_requirements="$(mktemp)"
+trap 'rm -f "${tmp_requirements}"' EXIT
+grep -v '^flash-attn' requirements.server.txt > "${tmp_requirements}"
 uv pip install --python "${PYTHON}" \
   --index-url "${PYPI_INDEX_URL}" \
-  --requirement /tmp/nano-vllm-requirements-no-flash.txt
+  --requirement "${tmp_requirements}"
 uv pip install --python "${PYTHON}" \
   --index-url "${PYPI_INDEX_URL}" \
   "flash-attn>=2.7,<3" \
