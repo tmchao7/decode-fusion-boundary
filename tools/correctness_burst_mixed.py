@@ -27,6 +27,19 @@ the regression:
    truncates the short row back to its cap. So ``--allow-cascade`` is safe here
    *only because* arm 1 carries the detection.
 
+**``--short-tokens`` must be >= 2, and the tool requires at least one genuinely
+mixed-length burst.**  Prefill already produces the first completion token, so
+a request with ``max_tokens=1`` is FINISHED during prefill
+(``scheduler.postprocess``) and never enters a burst -- the batch would then be
+all-long, ``min(budget) == max(budget)``, and the tripwire would pass without
+having exercised the mixed path at all.  ``--short-tokens 2`` is the smallest
+value that leaves the short row in the burst with a 1-token budget next to the
+long row's ``burst_cap`` (64), and it is also the value that actually overruns
+under the bug: with prompt 250, ``len(seq) = 252`` fits in one 256-token block,
+so reserving that row's own budget and then running 64 steps writes into the
+next block-table entry.  The ``mixed_budget_bursts`` counter makes this
+self-checking: zero mixed bursts is a hard failure, not a pass.
+
 The reference prompt length is chosen near ``kvcache_block_size`` (256) so that
 a ``max_steps = max(budget)`` regression would make the short row write across
 a block boundary into the padded block-table entry (physical block 0 after the
@@ -72,6 +85,44 @@ def burst_guard_violations(guard: dict | None) -> int:
     )
 
 
+def burst_guard_rejection(guard: dict | None, *, short_tokens: int) -> str | None:
+    """Reason this run does not validate the mixed-length burst guard, if any.
+
+    Returns ``None`` only when the run actually exercised the contract: at
+    least one burst was scheduled, at least one of them had *mixed* per-sequence
+    budgets, and none violated the max_steps / reservation contract.  A run
+    where every burst had uniform budgets proves nothing (``min == max`` makes
+    the contract vacuous), which is what a ``--short-tokens 1`` run produces
+    because prefill consumes that sequence's only token.
+    """
+
+    guard = guard or {}
+    observed = int(guard.get("bursts_observed") or 0)
+    if observed <= 0:
+        return (
+            "the megakernel-burst backend ran but the scheduler observed no "
+            "burst; the mixed-length path was not exercised"
+        )
+    violations = burst_guard_violations(guard)
+    if violations:
+        return (
+            "the schedule_burst contract was violated (max_steps must equal the "
+            "minimum budget and every selected sequence must be reserved for it)"
+        )
+    mixed = int(guard.get("mixed_budget_bursts") or 0)
+    if mixed <= 0:
+        return (
+            "no burst had mixed per-sequence budgets, so the overrun this guard "
+            f"targets could not occur (min == max everywhere); --short-tokens="
+            f"{short_tokens} leaves no short row in the burst. Prefill emits the "
+            "first completion token, so max_tokens=1 finishes during prefill and "
+            "never reaches schedule_burst(); use --short-tokens 2 so the short "
+            "row enters the burst with a 1-token budget next to the long row's "
+            "burst_cap (64)"
+        )
+    return None
+
+
 def run_backend(model: str, name: str, prompts: list[list[int]], caps: list[int]) -> dict:
     import torch
     from nanovllm import LLM, SamplingParams
@@ -99,6 +150,9 @@ def run_backend(model: str, name: str, prompts: list[list[int]], caps: list[int]
         scheduler = getattr(llm, "scheduler", None)
         result["burst_guard"] = {
             "bursts_observed": int(getattr(scheduler, "bursts_observed", 0) or 0),
+            "mixed_budget_bursts": int(
+                getattr(scheduler, "burst_mixed_budget_bursts", 0) or 0
+            ),
             "max_steps_violations": int(
                 getattr(scheduler, "burst_max_steps_violations", 0) or 0
             ),
@@ -181,7 +235,17 @@ def main() -> None:
         default=[2, 4, 5],
     )
     parser.add_argument("--prompt-length", type=int, default=250)
-    parser.add_argument("--short-tokens", type=int, default=1)
+    parser.add_argument(
+        "--short-tokens",
+        type=int,
+        default=2,
+        help=(
+            "per-sequence max_tokens for the short rows.  Must be >= 2: prefill "
+            "emits the first completion token, so max_tokens=1 finishes during "
+            "prefill and never enters a burst, which would make the mixed-budget "
+            "check vacuous (see the module docstring)."
+        ),
+    )
     parser.add_argument("--long-tokens", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--backends", default="torch-eager,megakernel-burst")
@@ -202,8 +266,13 @@ def main() -> None:
         parser.error("--backends must include torch-eager as the correctness reference")
     if any(size <= 0 for size in args.batch_sizes):
         parser.error("--batch-sizes must contain positive integers")
-    if args.short_tokens < 1 or args.long_tokens < 1:
-        parser.error("--short-tokens and --long-tokens must be >= 1")
+    if args.short_tokens < 2 or args.long_tokens < 1:
+        parser.error(
+            "--short-tokens must be >= 2 (prefill consumes the first token, so "
+            "max_tokens=1 never reaches the burst) and --long-tokens >= 1"
+        )
+    if args.short_tokens >= args.long_tokens:
+        parser.error("--short-tokens must be smaller than --long-tokens")
 
     results = []
     for batch_size in args.batch_sizes:
@@ -257,20 +326,13 @@ def main() -> None:
             burst_guard = result.get("burst_guard") or {}
             checks[backend]["burst_guard"] = burst_guard
             if backend == "megakernel-burst" and used_megakernel:
-                observed = int(burst_guard.get("bursts_observed") or 0)
-                violations = burst_guard_violations(burst_guard)
-                if observed <= 0:
+                rejection = burst_guard_rejection(
+                    burst_guard, short_tokens=args.short_tokens
+                )
+                if rejection is not None:
                     raise SystemExit(
-                        f"megakernel-burst ran but the scheduler observed no burst "
-                        f"for {case_id}; the mixed-length path was not exercised"
-                    )
-                if violations:
-                    raise SystemExit(
-                        f"mixed burst OVERRUN for {case_id}: the scheduler's "
-                        f"schedule_burst contract was violated "
-                        f"(max_steps must equal the minimum budget and every "
-                        f"selected sequence must be reserved for it); "
-                        f"burst_guard={burst_guard}"
+                        f"mixed burst guard did not validate {case_id}: "
+                        f"{rejection}; burst_guard={burst_guard}"
                     )
             if status == "FAIL":
                 raise SystemExit(

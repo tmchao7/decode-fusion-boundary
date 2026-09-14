@@ -215,13 +215,19 @@ run_correctness() {
       2>&1 | tee results/a100_correctness_wmma_vs_scalar.log
 
   # Mixed max_tokens burst regression guard (docs/10 §5.6).
-  # A batch with per-sequence max_tokens=1 next to max_tokens=200, all
-  # ignore_eos=True so the burst path is taken. prompt_len=250 sits next to
-  # kvcache_block_size=256, so a max_steps=max(budget) regression would make
-  # the short row write across a block boundary into the padded block-table
-  # entry (physical block 0 after the §8 padding fix), corrupting a neighbour.
-  # The schedule_burst fix (max_steps=min(budget)) keeps every row inside its
-  # reserved blocks; this confirms no corruption surfaces on the GPU.
+  # A batch with per-sequence max_tokens=2 next to max_tokens=200, all
+  # ignore_eos=True so the burst path is taken.  --short-tokens must be >= 2:
+  # prefill already emits the first completion token, so max_tokens=1 is
+  # FINISHED during prefill and never enters a burst -- the batch would then be
+  # all-long, min(budget) == max(budget), and the tripwire would pass without
+  # exercising the mixed path.  With short=2 the short row joins the first burst
+  # with a 1-token budget next to the long row's burst_cap=64, and prompt_len=250
+  # puts len(seq)=252 inside a single 256-token block, so a max_steps=max(budget)
+  # regression writes into the padded block-table entry (physical block 0 after
+  # the §8 padding fix), corrupting a neighbour.  The schedule_burst fix
+  # (max_steps=min(budget)) keeps every row inside its reserved blocks; the tool
+  # fails unless it observes a genuinely mixed-budget burst and zero contract
+  # violations (see tools/correctness_burst_mixed.py).
   timeout 600s env CUDA_LAUNCH_BLOCKING=1 \
     TORCH_SHOW_CPP_STACKTRACES=1 \
     NANOVLLM_CUDA_DEBUG=1 \
@@ -229,7 +235,7 @@ run_correctness() {
       "$MODEL" \
       --batch-sizes 2,4,5 \
       --prompt-length 250 \
-      --short-tokens 1 \
+      --short-tokens 2 \
       --long-tokens 200 \
       --backends torch-eager,megakernel-burst \
       --require-megakernel \

@@ -5,7 +5,7 @@
 > - 第 6 版新增 **§10 host/device 账本 + 高并发可行性判定**：把"每步必须流的权重
 >   1.192 GB / 下界 0.585 ms 规格、0.69 ms 实测可达"（`tied_embedding=True`，
 >   原值 1.503 GB / 0.97 ms 是双重计算 embedding+lm_head 的误算）、"cudagraph
->   每步 GPU 只占 21-25%、host 残差 2.2-2.8 ms"、"batch≈173 才转算力 bound"算成
+>   每步 GPU 只占 21-25%、host 残差 2.2-2.8 ms"、"batch≈176 才转算力 bound"算成
 >   可证伪的账；给出三句话判语
 >   （**device 侧翻盘不可行，E2E 侧可赚的全是 host**），并列出三个便宜的证伪
 >   实验（device 下界 probe / 可达带宽标定 / host 消除上界）。新增
@@ -56,7 +56,7 @@ batch>1 下把 SM 用满、张量核全开，且每个 GEMM 独立、不被层�
 
 > **第 6 版补一句更硬的账（详见 §10）**：device 侧其实**没有翻盘空间**——每步必须流
 > 1.192 GB 权重（`tied_embedding=True`），HBM 墙是 0.585 ms/step（规格 2039 GB/s）
-> 或 0.69 ms/step（实测可达 1728 GB/s），而 cudagraph 的 batched cuBLAS
+> 或 0.702 ms/step（实测可达 1699 GB/s），而 cudagraph 的 batched cuBLAS
 > 在 b1→b8 已经是 0.74→0.77 ms/step，贴着这堵墙。它的 tok/s 随 batch 涨，涨的是
 > **把固定 ~2.5 ms/step 的 host 开销摊薄**，不是 GPU 变快。所以高并发下的真实命题是
 > 「谁能把每步 host 从 2.5 ms 压到 0」，megakernel 的对手不是 cudagraph 的算力，
@@ -286,7 +286,7 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
 | **roofline 模型 + host/device 账本**（`roofline.py` / `tools/account_decode.py`） | ✅ 已落地（本地 26+6 单测） | 每步权重 1.192 GB（`tied_embedding=True`）、下界 0.585 ms（规格）/ 0.69 ms（实测）；已量化 host 残差 2.2-2.8 ms（§10） |
 | **实验 A：device 下界 probe**（只读权重 + barrier，不做计算） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | **实测 1.365 ms（per-layer）+ 0.183 ms（lm_head 修正）= 1.548 ms > 1.5 ms → BORDERLINE（§10.4）** |
 | **实验 B：可达带宽标定**（1.192 GB `__ldg` 流式读） | ✅ A100 已跑（`tools/bench_roofline_a100.py`） | 1699 GB/s（83.3% 规格），解决"0.74 ms ⇒ 1.61 TB/s 超规格"的矛盾（§10.4） |
-| **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | host-free replay 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.011–0.014 ms（§9.8 象限 D） |
+| **实验 C：host 消除上界**（cudagraph 单步连续 replay N 步） | ✅ A100 已跑（`tools/bench_burst_lower_bound.py`） | host-free replay 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.014 ms（§9.8 象限 D） |
 | **二值判定工具**（`tools/verdict.py` + `tests/test_verdict.py`） | ✅ 已落地（26 个单测覆盖全部分支） | 六种 verdict 枚举；probe/带宽/账号任一缺失即 `NEEDS_DATA`，不猜结论；含 LM head 修正 |
 
 ## 7. 结论（更新为可执行判语）
@@ -296,7 +296,7 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
    决定了 batch>1 无法通过「优化某个 kernel」翻盘。
 2. **device 侧本身没有翻盘空间（第 6 版新增定量判语）**：每步必须流 1.192 GB 权重
    （`tied_embedding=True`），在规格 2039 GB/s 下界 0.585 ms/step、在实测可达
-   1728 GB/s 下界 0.69 ms/step，而 batch≈173 之前都是
+   1699 GB/s 下界 0.702 ms/step，而 batch≈176 之前都是
    memory bound。cudagraph 的 batched cuBLAS 已经贴着这堵墙（0.74-0.77 ms/step，
    且 b1→b8 几乎不变），所以 "把某个 GEMM 写得更快"在数学上没有余量。胜负不在 device 侧。
 3. **唯一可持续的战略胜利点是消除每步 host 开销**：batch=1 走 persistent kernel +
@@ -571,33 +571,34 @@ block 干活"——这些都对，但**没有回答"device 侧还剩多少可赚
 **decode 每步的算术强度极低**（b1/seq224 约 1.04 FLOP/byte，远低于 A100 的
 ~200 FLOP/byte 机器平衡点），所以任一步的价值都落在 `max(权重流式读, 张量核算力)`
 上。权重墙在**规格 2039 GB/s**（SXM4-80GB）下是 **0.585 ms**，在**实测可达
-1728 GB/s** 下是 **0.690 ms**（`bandwidth.best_gbps`，见 [06](06_实际运行数据.md) §3）：
+1699 GB/s**（第 14 轮重跑）下是 **0.702 ms**（`bandwidth.best_gbps`，
+见 [06](06_实际运行数据.md) §3）：
 
-| batch | 权重下界 @1728 GB/s | 张量核下界(312 TFLOP/s) | 判决 |
+| batch | 权重下界 @1699 GB/s | 张量核下界(312 TFLOP/s) | 判决 |
 |------:|-------------------:|-----------------------:|:-----|
-| 1 | 0.690 ms | 0.004 ms | memory |
-| 8 | 0.690 ms | 0.032 ms | memory |
-| 32 | 0.690 ms | 0.128 ms | memory |
-| 173 | 0.690 ms | 0.690 ms | **crossover** |
+| 1 | 0.702 ms | 0.004 ms | memory |
+| 8 | 0.702 ms | 0.032 ms | memory |
+| 32 | 0.702 ms | 0.128 ms | memory |
+| 176 | 0.702 ms | 0.702 ms | **crossover** |
 
-**只有到 batch≈173（seq224，按实测带宽）才会变成算力 bound**（按规格 2039 GB/s
+**只有到 batch≈176（seq224，按实测带宽）才会变成算力 bound**（按规格 2039 GB/s
 约 batch≈147；这还只是按峰值 312 TFLOP/s 算；实测 cuBLAS 路径只有个位数
 TFLOP/s，所以现实里全程都是权重带宽 bound）。
 
 > 结论一句话：**在这台硬件上，任何"完美"的 decode 实现（不管是不是 megakernel）
-> 的 device 侧下界，就是同一堵 0.585–0.69 ms/step 的 HBM 墙。** megakernel 与
+> 的 device 侧下界，就是同一堵 0.585–0.702 ms/step 的 HBM 墙。** megakernel 与
 > cudagraph 在 device 侧争的不是"效率上界"，而是"谁更接近这堵墙"。
 
 > **常量提醒**：旧版本这里写 "1555 GB/s / 0.77 ms"——1555 是 **40GB** 版 A100 的
 > 规格，本机是 80GB（2039 GB/s）。旧值把墙抬高了 32%，也正是"0.74 ms 超规格 ⇒
 > 必然漏采"这个假警报的来源（见 [10](10_交接文档.md) §5.1）。
 
-> **实测补充**（2026-09-13 A100 probe）：纯权重流式下界（per-layer only，
-> 不含 lm_head）实测 1.363 ms（含 0.661 ms barrier），补回 lm_head 0.180 ms
-> 后完整下界 **1.543 ms** > 1.5 ms → **预期** verdict `DEVICE_BORDERLINE`
-> （工具待重跑，见 [06](06_实际运行数据.md) §7）。0.69 ms 是无 barrier 的纯 HBM
-> 墙；1.543 ms 是含 336 次 grid.sync 的实测下界。cudagraph 实测 0.74 ms
-> = 1.07x 实测墙，即**已经贴墙**。
+> **实测补充**（2026-09-13 A100 probe，第 14 轮 `fe0d4f3` 重跑确认）：纯权重流式
+> 下界（per-layer only，不含 lm_head）实测 **1.365 ms**（含 0.673 ms barrier），
+> 补回 lm_head **0.183 ms** 后完整下界 **1.548 ms** > 1.5 ms → verdict
+> **实测** `DEVICE_BORDERLINE`（见 [06](06_实际运行数据.md) §7）。0.702 ms 是无
+> barrier 的纯 HBM 墙；1.548 ms 是含 336 次 grid.sync 的实测下界。cudagraph 实测
+> 0.74 ms = 1.06x 实测墙，即**已经贴墙**。
 
 ### 10.2 实测账本：GPU 只占每步的 ~21-25%
 
@@ -656,14 +657,14 @@ megakernel 若能追平 device 侧: 0.77 + ~0.66 (barrier) + ~0.18 (lm_head) + ~
 |---|---|---|---|
 | **A. device 下界 probe** | 一个只做"28 层权重流式读 + 每层 ~12 次 barrier、不做计算"的 cooperative kernel，grid=80，batch∈{1,8,32}（`tools/bench_burst_lower_bound.py`） | 每步 ≤1.5 ms ⇒ 值得做 R3；**>3 ms ⇒ 判定高并发翻盘不可行，停止 kernel 重构** | **1.365 ms（per-layer）+ 0.183 ms（lm_head 修正）= 1.548 ms → BORDERLINE（实测）** |
 | **B. 可达带宽标定** | 向量化 `__ldg` 流式读 1.192 GB 的微基准（`tools/bench_roofline_a100.py`） | 标定真实可达带宽，用来判定 10.2 里"0.74 ms 是否超过本机能力" | **1699 GB/s（83.3% 规格）→ 0.74 ms 隐含 1611 GB/s，可达，不是漏采** |
-| **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **host-free 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.011–0.014 ms（不可回收）** |
+| **C. host 消除上界** | cudagraph 单步捕获后连续 replay N 步（不插 host 同步），测每步墙钟 | 给出"host 全消除后 cudagraph 能到多快" | **host-free 0.020–0.029 ms/step（b1–b32；verdict 取最大 batch = 0.029）；host overlay 0.014 ms（不可回收）** |
 
 **verdict**：**实测** `DEVICE_BORDERLINE`（完整下界 1.548 ms 刚过 1.5 ms；已用
 合并后的 `tools/verdict.py` 重跑 `RUN_MODE=roofline` 确认（第 14 轮 `fe0d4f3`），见 [06](06_实际运行数据.md)
 §7）。`full_device_floor_ms` 以 verdict JSON 为准。但三个实测事实让 R3 不值得做：
 (1) host overlay 0.014 ms（b32）不可回收；(2) cudagraph host-free replay 0.029 ms
 （b32，verdict 选取的行），megakernel 没有 device 侧空间可赢；(3) 实测
-megakernel-burst b>1 是完整下界的 **14.7–134.7x**（b2 22.704 ms、b32 207.885 ms）。
+megakernel-burst b>1 是完整下界的 **14.7–134.3x**（b2 22.704 ms、b32 207.885 ms）。
 **结论：固化"batch>1 回退 cudagraph"，不再投入 R3。**
 
 **10.2 的表里那个"内部矛盾"是常量错，不是漏采**：0.74 ms/step 流 1.192 GB 需要
@@ -740,7 +741,7 @@ P1 项）。
 
 - 工具会主动打**标定告警**：凡是实测 per-step GPU 时间低于权重下界（0.585 ms
   @2039 GB/s 规格）的行，都会提示先跑 `RUN_MODE=roofline` 的带宽标定。
-  注意 0.74 ms 隐含 1611 GB/s **不**触发（低于 2039 规格、也低于 1728 实测可达）；
+  注意 0.74 ms 隐含 1611 GB/s **不**触发（低于 2039 规格、也低于 1699 实测可达）；
   只有隐含带宽真的超过标定值才告警。
   这类告警**不是**工具错误（`--warnings-as-errors` 只对 cadence 不一致失败），
   而是"这一行的 headroom 在标定前别信"的强制提示。

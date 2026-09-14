@@ -10,7 +10,7 @@ measured conclusion, not a placeholder — see `docs/07` §10.
 
 ```
 batch == 1  →  Megakernel persistent/paged kernel  (1.31x faster than cudagraph)
-batch >= 2  →  torch-cudagraph fallback             (megakernel is 1.45–134.7x the device floor)
+batch >= 2  →  torch-cudagraph fallback             (megakernel is 1.45–134.3x the device floor)
 ```
 
 Three backends are available: `torch-eager` (reference), `torch-cudagraph`
@@ -26,9 +26,9 @@ output.
 | weight floor (tied_embedding=True) | 1.192 GB → 0.585 ms/step spec, 0.701 ms measured | `roofline.py` |
 | device lower bound (probe + LM head) | 1.548 ms/step (measured) | `bench_burst_lower_bound.py` + `verdict.py` |
 | cudagraph host-free replay | 0.020–0.029 ms/step (b1–b32; verdict uses the largest batch) | `bench_burst_lower_bound.py` |
-| host overlay per step | 0.011–0.014 ms (b32–b1; not recoverable) | same |
+| host overlay per step | 0.014 ms (b1/b8/b32; not recoverable) | same |
 | megakernel batch=1 vs cudagraph | **1.31x E2E win** | `benchmarks.compare` |
-| megakernel batch=10 vs cudagraph | 48.5x the device floor | `account_decode.py` |
+| megakernel batch=10 vs cudagraph | 48.3x the device floor | `account_decode.py` |
 | binary verdict | **`DEVICE_BORDERLINE`** (measured) | `tools/verdict` → `results/a100_verdict.json` |
 
 The device floor (1.548 ms, the `full_device_floor_ms` JSON field) is **above** the
@@ -165,7 +165,7 @@ into a reproducible verdict — `DEVICE_BORDERLINE`, `DEVICE_AT_FLOOR`,
 `DEVICE_UNREACHABLE`, `DEVICE_RECOVERABLE`, `NEEDS_CALIBRATION` or
 `NEEDS_DATA` — with thresholds locked by `tests/test_verdict.py`. The verdict
 includes an LM head stream correction (the probe skips `lm_head`, so the full
-device floor = probe + 0.180 ms at 1728 GB/s).
+device floor = probe + 0.183 ms at 1699 GB/s).
 
 ```bash
 python -m nanovllm.roofline --batch-sizes 1,8,32 --seq-len 160 --check-kernel

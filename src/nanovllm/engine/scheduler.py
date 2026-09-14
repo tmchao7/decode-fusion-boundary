@@ -20,6 +20,7 @@ class Scheduler:
         # Counters are bounded; the last-burst fields describe the most recent
         # schedule_burst() call.
         self.bursts_observed = 0
+        self.burst_mixed_budget_bursts = 0
         self.burst_max_steps_violations = 0
         self.burst_reservation_violations = 0
         self.last_burst_max_steps = 0
@@ -160,6 +161,11 @@ class Scheduler:
         self.last_burst_reserved_tokens = [
             len(seq.block_table) * self.block_size - len(seq) for seq in seqs
         ]
+        if len(set(selected_budgets)) > 1:
+            # A genuinely mixed-length burst.  The guard needs at least one of
+            # these to be meaningful: with uniform budgets min == max, so the
+            # contract below holds trivially and the overrun cannot occur.
+            self.burst_mixed_budget_bursts += 1
         if max_steps != min((budget for _, budget in candidates), default=0):
             self.burst_max_steps_violations += 1
         if any(reserved < max_steps for reserved in self.last_burst_reserved_tokens):
