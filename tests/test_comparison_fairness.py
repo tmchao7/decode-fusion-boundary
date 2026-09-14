@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from nanovllm.engine.burst_policy import (  # noqa: E402
     burst_batch_eligibility,
     burst_eos_token,
+    clamp_burst_batch,
 )
 
 
@@ -213,6 +214,32 @@ class CudagraphPaddingDocumentationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("对比公平性", arch)
         self.assertIn("graph_bs", arch)
+
+
+class BurstBatchClampTests(unittest.TestCase):
+    """The burst selection must respect the batch kernel's launch limit.
+
+    ``burst_batch_eligibility`` is torch-free and cannot see the WMMA occupancy
+    limit, so ``LLMEngine._burst_batch_limit`` clamps the selection with
+    ``clamp_burst_batch``.  Without it, ``megakernel_burst_batch`` above the
+    limit makes the burst binding's TORCH_CHECK raise inside ``run_burst``,
+    which poisons CUDA and kills the engine instead of falling back.
+    """
+
+    def test_clamps_to_the_kernel_limit(self) -> None:
+        self.assertEqual(clamp_burst_batch(16, 10), 10)
+        self.assertEqual(clamp_burst_batch(32, 10), 10)
+
+    def test_keeps_a_config_below_the_limit(self) -> None:
+        self.assertEqual(clamp_burst_batch(8, 10), 8)
+        self.assertEqual(clamp_burst_batch(10, 10), 10)
+
+    def test_unknown_limit_keeps_the_configured_value(self) -> None:
+        # No CUDA: the binding still rejects a genuinely unsupported batch and
+        # the CPU path has no kernel to launch.
+        self.assertEqual(clamp_burst_batch(16, None), 16)
+        self.assertEqual(clamp_burst_batch(16, 0), 16)
+        self.assertEqual(clamp_burst_batch(16, -1), 16)
 
 
 if __name__ == "__main__":

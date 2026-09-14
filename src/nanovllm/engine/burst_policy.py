@@ -47,7 +47,8 @@ def burst_batch_eligibility(config: Any, seqs: Sequence[Any]) -> tuple[bool, str
     if len(seqs) > 1 and not getattr(config, "megakernel_batch_decode", False):
         return (
             False,
-            "batch>1 defaults to cudagraph unless megakernel_batch_decode is set",
+            "batch>1 falls back to the torch path unless megakernel_batch_decode "
+            "is set",
         )
     return True, ""
 
@@ -64,3 +65,24 @@ def burst_eos_token(config: Any, seqs: Sequence[Any]) -> int:
         return -1
     eos = getattr(config, "eos", -1)
     return -1 if eos is None else int(eos)
+
+
+def clamp_burst_batch(configured: int, kernel_limit: int | None) -> int:
+    """Clamp a configured burst batch to the kernel's real launch limit.
+
+    ``burst_batch_eligibility`` is deliberately torch-free and therefore cannot
+    see the batch kernel's occupancy limit (``wmma_max_supported_batch``: the
+    cooperative grid is partitioned per sequence).  A ``megakernel_burst_batch``
+    above that limit makes the burst binding's ``TORCH_CHECK`` raise *inside*
+    ``run_burst``, which poisons CUDA and kills the engine instead of falling
+    back.  Clamp the burst selection here instead.
+
+    ``kernel_limit`` of ``None`` or ``<= 0`` means "unknown" (no CUDA), in which
+    case the configured value is kept -- the binding still rejects a genuinely
+    unsupported batch, and the CPU path has no kernel to launch.
+    """
+
+    configured = int(configured)
+    if kernel_limit is None or int(kernel_limit) <= 0:
+        return configured
+    return min(configured, int(kernel_limit))

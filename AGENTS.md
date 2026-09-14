@@ -52,13 +52,18 @@ verify fine), **first go back to the most basic parameter/config settings** befo
 instrumenting kernel internals. More than once the real root cause was a trivial
 config-resolution bug, not the fused math.
 
-- **Qwen3 `rope_theta` lives in `rope_scaling`, not as a top-level config field.**
-  Qwen3-0.6B stores it as `rope_scaling={"rope_theta": 1000000, "rope_type": "default"}`.
-  `getattr(config, "rope_theta", 10000.0)` silently falls back to the default
-  `10000.0`, producing wrong cos/sin tables. nano-vLLM's `models/qwen3.py`
-  (`Qwen3Attention.__init__`) resolves it via `rope_scaling.get("rope_theta", ...)`;
-  the Megakernel weight loader (`backends/megakernel/model.py`) must do the same.
-  Fixed by adding `_resolve_rope_theta(config)` there.
+- **Never read `rope_theta` by hand; go through `nanovllm/rope_config.py`.**
+  The shipped Qwen3-0.6B `config.json` has a **top-level** `"rope_theta": 1000000`
+  with `"rope_scaling": null` (an earlier version of this note claimed it lived in
+  `rope_scaling` — that was wrong for this checkpoint). Some Qwen3 variants do
+  embed it in `rope_scaling`, and newer transformers renames the field to
+  `rope_parameters`, so several spellings exist in the wild.
+  `models/qwen3.py` and `backends/megakernel/model.py` used to resolve it
+  independently, with *opposite* precedence and different defaults (1e6 vs 1e4),
+  so a checkpoint where the keys disagreed silently got two different cos/sin
+  tables. Both now call `resolve_rope_theta()` (top-level → nested → 1e6), and
+  `assert_supported_rope_type()` raises on YaRN/linear/dynamic instead of
+  silently ignoring the scaling.
 - Because Qwen3 `rope_theta=1e6` with `head_dim=128` keeps low-frequency indexes
   near identity (cos≈1, sin≈0), a wrong theta/position shows up as *asymmetric*
   element errors: elements paired with a large-cos index blow up, pairs with

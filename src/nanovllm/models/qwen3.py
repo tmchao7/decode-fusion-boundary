@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.rope_config import assert_supported_rope_type, resolve_rope_theta
 
 
 class Qwen3Attention(nn.Module):
@@ -23,7 +24,6 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -51,8 +51,10 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
+        # ``rope_theta`` is already fully resolved by the caller through
+        # nanovllm.rope_config; re-applying rope_scaling here would restore the
+        # old "rope_scaling wins" precedence and diverge from the Megakernel
+        # loader again.
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -132,8 +134,7 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=resolve_rope_theta(config),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -166,6 +167,9 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        # Fail loudly on a RoPE scaling this project does not implement instead
+        # of silently producing unscaled positions (see nanovllm.rope_config).
+        assert_supported_rope_type(config)
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

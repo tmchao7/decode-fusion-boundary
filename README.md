@@ -3,8 +3,17 @@
 nano-vLLM extended with a Megakernel decode backend for Qwen3-0.6B on A100.
 The runtime is a **hybrid dispatch**: batch=1 uses a fused cooperative
 Megakernel (device-side EOS, no per-step host launch); batch≥2 falls back to
-standard CUDA Graph (full SM + tensor cores, no padding). This split is the
-measured conclusion, not a placeholder — see `docs/07` §10.
+the torch path (the A/B comparison uses CUDA Graph; inside the same
+`decode_backend="megakernel"` engine the fallback is eager, because that engine
+does not capture a graph). This split is the measured conclusion, not a
+placeholder — see `docs/07` §10.
+
+> **Status: frozen.** The question this project set out to answer is settled
+> with measured evidence: batch=1 wins by removing per-step host overhead;
+> at batch>1 the device side has no headroom to win, so the R3 kernel rewrite is
+> not worth attempting (`DEVICE_BORDERLINE`, `megakernel_could_win=false`).
+> Remaining P1/P2 items are frozen as documented limitations — see
+> `docs/10_交接文档.md` §1 and §5.9 before changing code.
 
 ## Architecture
 

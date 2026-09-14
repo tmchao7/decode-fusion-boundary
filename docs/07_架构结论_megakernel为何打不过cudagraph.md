@@ -304,8 +304,12 @@ megakernel batch=8   ~9.66 ms/token   （agent 实测；cudagraph 0.461 = 21x �
    cudagraph 每步仍在付 ~2.5 ms host（§10.2），**这部分对两条路径都同样可赚**。
    所以真实命题是"谁能把每步 host 从 2.5 ms 压到 0"，不是"megakernel 比 cudagraph
    算得快"。
-4. **务实集成（✅ 已落地）**：batch=1 走 megakernel persistent；batch>1 回退 cudagraph
-   （megakernel 批处理路径不占优，不值得付出层间串行 + 多 launch 的代价）。WMMA batch
+4. **务实集成（✅ 已落地）**：batch=1 走 megakernel persistent；batch>1 回退 torch
+   路径（megakernel 批处理路径不占优，不值得付出层间串行 + 多 launch 的代价）。
+   ⚠️ 口径：A/B 对比里的回退是**独立的 torch-cudagraph 引擎**；同一个
+   `decode_backend="megakernel"` 引擎内回退时 `use_cudagraph` 为 False，所以那条
+   路径是 **eager**（见 [10](10_交接文档.md) §1 与 §5.9 第 9 条）。
+   WMMA batch
    保留为显式开关 `megakernel_batch_decode=True` 供正确性研究。`MegakernelBackend.
    compatibility()`（`backend.py:93-100`）默认对 batch>1 返回 not supported →
    `model_runner.run` 自动回退 torch+cudagraph；`_should_burst`（`llm_engine.py:99-103`）
@@ -665,7 +669,8 @@ megakernel 若能追平 device 侧: 0.77 + ~0.66 (barrier) + ~0.18 (lm_head) + ~
 (1) host overlay 0.014 ms（b32）不可回收；(2) cudagraph host-free replay 0.029 ms
 （b32，verdict 选取的行），megakernel 没有 device 侧空间可赢；(3) 实测
 megakernel-burst b>1 是完整下界的 **14.7–134.3x**（b2 22.704 ms、b32 207.885 ms）。
-**结论：固化"batch>1 回退 cudagraph"，不再投入 R3。**
+**结论：固化"batch>1 回退 torch 路径（对比基准是 cudagraph；同引擎内是 eager）"，
+不再投入 R3。**
 
 **10.2 的表里那个"内部矛盾"是常量错，不是漏采**：0.74 ms/step 流 1.192 GB 需要
 1611 GB/s。旧文档说这超过 "A100 HBM2e 的 1.555 TB/s 规格"——但 1555 GB/s 是

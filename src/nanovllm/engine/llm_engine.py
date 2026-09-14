@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.burst_policy import burst_batch_eligibility
+from nanovllm.engine.burst_policy import burst_batch_eligibility, clamp_burst_batch
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.metrics import CudaEventTimer, MetricsCollector, nvtx_range
@@ -26,7 +26,25 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
         Sequence.block_size = config.kvcache_block_size
+        # The Megakernel contract fixes max_model_len at 2048 and the check is
+        # inside compatibility(), which is only reached per step -- a user who
+        # sets decode_backend="megakernel" but leaves the 4096 default gets a
+        # silent full fallback.  Say it once, loudly.
+        if config.decode_backend == "megakernel" and config.max_model_len > 2048:
+            warnings.warn(
+                "decode_backend='megakernel' requires max_model_len <= 2048 "
+                f"(got {config.max_model_len}); every request will fall back to "
+                "the torch path. Pass max_model_len=2048 to actually use the "
+                "Megakernel.",
+                RuntimeWarning,
+            )
         self._exited = False
+        # Burst path guards (see _step_burst): a burst that makes no progress
+        # must not spin the caller's while-loop, and the burst selection must
+        # respect the batch kernel's real launch limit.  The limit is queried
+        # once and cached -- it costs CUDA driver calls.
+        self._burst_disabled = False
+        self._burst_batch_limit_cache: int | None = None
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -85,6 +103,8 @@ class LLMEngine:
             return False
         if mr._cuda_poisoned:
             return False
+        if self._burst_disabled:
+            return False
         if self.scheduler.waiting:
             return False
         eligible, _ = burst_batch_eligibility(
@@ -92,11 +112,33 @@ class LLMEngine:
         )
         return eligible
 
+    def _burst_batch_limit(self) -> int:
+        """Cached burst batch limit, clamped to the batch kernel's real limit.
+
+        ``burst_batch_eligibility`` is torch-free and cannot see the kernel's
+        occupancy limit, so the clamp happens here.  Queried once: the limit
+        costs CUDA driver calls and does not change for a given extension.
+        """
+
+        if self._burst_batch_limit_cache is None:
+            configured = int(getattr(self.config, "megakernel_burst_batch", 8))
+            kernel_limit: int | None = None
+            try:
+                from nanovllm.backends.megakernel.backend import wmma_batch_limit
+
+                kernel_limit = int(wmma_batch_limit(configured))
+            except Exception:
+                kernel_limit = None
+            self._burst_batch_limit_cache = clamp_burst_batch(
+                configured, kernel_limit
+            )
+        return self._burst_batch_limit_cache
+
     def _step_burst(self, metrics: MetricsCollector | None):
         """Execute one no-sync burst and return ``(outputs, num_tokens)``."""
         seqs, max_steps = self.scheduler.schedule_burst(
             burst_cap=getattr(self.config, "megakernel_burst_cap", 64),
-            max_batch=getattr(self.config, "megakernel_burst_batch", 8),
+            max_batch=self._burst_batch_limit(),
         )
         if not seqs or max_steps <= 0:
             return self._step_normal(metrics)
@@ -153,6 +195,21 @@ class LLMEngine:
             for seq in seqs
             if seq.is_finished
         ]
+        if total_new == 0:
+            # A burst that appended nothing would spin the caller's
+            # ``while not is_finished()`` loop forever: no sequence finished,
+            # no token was produced, and _should_burst() would stay true.  This
+            # happens when the launch aborts (all rows come back -1) rather
+            # than raising.  postprocess_burst has already trimmed the burst
+            # allocations, so rerun this step through the step-wise path and
+            # stop using burst for this engine.
+            self._burst_disabled = True
+            warnings.warn(
+                "Megakernel burst produced no tokens; disabling the burst path "
+                "and falling back to the step-wise schedule for this engine.",
+                RuntimeWarning,
+            )
+            return self._step_normal(metrics)
         return outputs, -total_new
 
     def _step_normal(self, metrics: MetricsCollector | None):

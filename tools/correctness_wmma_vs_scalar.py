@@ -101,11 +101,24 @@ def classify(scalar: list[list[int]], wmma: list[list[int]]) -> tuple[str, list[
         (token >= 1; token 0 is the torch prefill output and must always
         match), and each diverging request is not length-mismatched.  This is
         the documented ~1-ulp cascade, not a correctness failure.
-      - FAIL: diverges at token 0 (prefill mismatch -> real problem) or a
-        length mismatch.
+      - FAIL: diverges at token 0 (prefill mismatch -> real problem), a
+        request-count mismatch, or a per-request length mismatch.
     """
     details = []
     real_fail = False
+    # A request-count mismatch must fail: zip() would silently drop the extra
+    # requests, and this tool exists precisely to catch a backend returning
+    # fewer sequences than the other.  Without this check a short WMMA result
+    # was reported as PASS.
+    if len(scalar) != len(wmma):
+        real_fail = True
+        details.append(
+            {
+                "seq": min(len(scalar), len(wmma)),
+                "kind": "count",
+                "d": len(scalar) - len(wmma),
+            }
+        )
     for i, (s, w) in enumerate(zip(scalar, wmma)):
         if s == w:
             continue

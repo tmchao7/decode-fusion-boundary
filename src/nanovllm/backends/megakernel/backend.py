@@ -158,8 +158,12 @@ class MegakernelBackend:
         if len(seqs) > 1 and not _get_attr(config, "megakernel_batch_decode", False):
             return Compatibility(
                 False,
-                "batch>1 defaults to cudagraph (megakernel_batch_decode=False); "
-                "set megakernel_batch_decode=True to force megakernel batch",
+                "batch>1 falls back to the torch path unless "
+                "megakernel_batch_decode is set. In this engine that fallback "
+                "is eager (decode_backend='megakernel' disables CUDA-graph "
+                "capture); the A/B comparison runs torch-cudagraph in a "
+                "separate engine. Set megakernel_batch_decode=True to force "
+                "the megakernel batch kernel.",
             )
 
         hf_config = _get_attr(config, "hf_config")

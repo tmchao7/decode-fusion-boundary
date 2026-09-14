@@ -6,6 +6,12 @@ import struct
 
 import torch
 
+from nanovllm.rope_config import (
+    QWEN3_DEFAULT_ROPE_THETA,
+    assert_supported_rope_type,
+    resolve_rope_theta,
+)
+
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
@@ -25,23 +31,19 @@ _generate_nosync_paged_batch = torch.ops.nanovllm_megakernel_C.generate_nosync_p
 LDG_LM_NUM_BLOCKS = int(os.getenv("LDG_LM_NUM_BLOCKS", "1280"))
 
 
-def _resolve_rope_theta(config, default: float = 10000.0) -> float:
-    """Resolve the RoPE base frequency from a HuggingFace/transformers config.
+def _resolve_rope_theta(config, default: float = QWEN3_DEFAULT_ROPE_THETA) -> float:
+    """Resolve the RoPE base frequency, identically to nano-vLLM's Qwen3 model.
 
-    Qwen3-0.6B stores ``rope_theta`` inside the ``rope_scaling`` dict (as
-    ``rope_scaling={"rope_theta": 1000000, "rope_type": "default"}``) rather
-    than as a top-level attribute.  nano-vLLM's Qwen3 model handles this in
-    ``Qwen3Attention.__init__``; the Megakernel weight loader must do the
-    same or the cos/sin tables will use the wrong frequency.
+    Delegates to :func:`nanovllm.rope_config.resolve_rope_theta`.  The two paths
+    used to resolve ``rope_theta`` with opposite precedence and different
+    defaults (top-level first here, ``rope_scaling`` first there; 1e4 vs 1e6),
+    so a checkpoint where the keys disagree silently got different cos/sin
+    tables.  The shipped Qwen3-0.6B has top-level ``rope_theta: 1000000`` with
+    ``rope_scaling: null``; the shared resolver also honours checkpoints that
+    embed the frequency in ``rope_scaling``.
     """
-    rope_theta = getattr(config, "rope_theta", None)
-    if rope_theta is None:
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", default)
-        else:
-            rope_theta = default
-    return float(rope_theta)
+
+    return resolve_rope_theta(config, default)
 
 
 def _rope_tables(rope_theta: float = 10000.0):
@@ -87,6 +89,7 @@ def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     state = model.state_dict()
 
+    assert_supported_rope_type(model.config)
     cos_table, sin_table = _rope_tables(
         _resolve_rope_theta(model.config)
     )
@@ -166,6 +169,7 @@ def weights_from_nano_model(model, hf_config):
             ]
         )
 
+    assert_supported_rope_type(hf_config)
     cos_table, sin_table = _rope_tables(
         _resolve_rope_theta(hf_config)
     )
