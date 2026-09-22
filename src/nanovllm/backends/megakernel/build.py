@@ -90,6 +90,23 @@ def cuda_flags() -> list[str]:
     return flags + kernel_flags()
 
 
+def taskgraph_kernel_flags() -> list[str]:
+    """Flags for the task-graph kernel (see docs/11 §5.2).
+
+    Independent from the frozen batch=1 kernel's ``kernel_flags()`` so the two
+    paths can be tuned separately. The ``#ifndef`` fallbacks in
+    ``taskgraph_kernel.cu`` MUST equal these defaults; ``test_taskgraph_abi.py``
+    enforces the equality (same pattern as ``test_batch_launch_guards.py``).
+    """
+
+    return [
+        f"-DTG_NUM_BLOCKS={_env_int('TG_NUM_BLOCKS', 108)}",
+        f"-DTG_BLOCK_SIZE={_env_int('TG_BLOCK_SIZE', 256)}",
+        f"-DTG_INST_RING={_env_int('TG_INST_RING', 4)}",
+        "-DTG_MAX_BATCH=8",
+    ]
+
+
 def get_extension():
     """Build (or return cached) the CUDA extension."""
     global _module
@@ -101,8 +118,9 @@ def get_extension():
         sources=[
             os.path.join(_CSRC, "torch_bindings.cpp"),
             os.path.join(_CSRC, "kernel.cu"),
+            os.path.join(_CSRC, "taskgraph_kernel.cu"),
         ],
-        extra_cuda_cflags=cuda_flags(),
+        extra_cuda_cflags=cuda_flags() + taskgraph_kernel_flags(),
         extra_cflags=[f"-I{_CSRC}"],
         verbose=False,
     )

@@ -1,0 +1,878 @@
+"""Task-graph schedule construction for the Qwen3-0.6B megakernel.
+
+Builds the per-SM instruction stream (``inst_buf``) and bar-array dimensions
+for one decode step. Pure Python + torch (only for tensor creation), so the
+core logic is unit-testable without a GPU.
+
+See ``docs/11_task_graph重写设计.md`` §6 for the design. This module is the
+host-side counterpart of ``csrc/taskgraph_kernel.cu``: every instruction it
+emits must match an opcode + field layout the kernel knows how to dispatch.
+
+Layout-locked contract: ``TG_INST_WIDTH = 16`` and the opcode enum live in
+``csrc/tg_abi.h``. ``test_taskgraph_abi.py`` parses that header and enforces
+this module stays in sync with it.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+# =============================================================================
+# Instruction width + opcode enum. Mirrors csrc/tg_abi.h. The ABI test parses
+# the header and asserts these match; do not edit one without the other.
+# =============================================================================
+
+TG_INST_WIDTH = 16
+
+
+class TgOp:
+    NOP = 0
+    QKV_PROJ = 1
+    ATTN_DECODE = 2
+    ATTN_COMBINE = 3
+    O_PROJ = 4
+    FFN_UPGATE_ACT = 5
+    FFN_DOWN = 6
+    ADD_RMSNORM = 7
+    LM_HEAD = 8
+
+
+# =============================================================================
+# Bar dimension bookkeeping. See docs/11 §4.1.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TgBarDims:
+    """Lengths of the 7 dense-model bar arrays.
+
+    Each bar is a device ``uint32`` array zeroed per step. The index formulas
+    in :class:`TgBarIndex` map a (layer, batch, kv_head, split) onto a slot in
+    these arrays. Tests lock these formulas against the kernel's expectations.
+    """
+
+    bar_qkv: int      # layers * hkv
+    bar_attn: int      # layers * oproj_splits
+    bar_oproj: int     # layers
+    bar_silu: int      # layers * down_splits
+    bar_ffn_down: int  # layers
+    bar_layer: int     # layers
+    bar_combine: int   # layers * BS * hkv (0 when split==1 always)
+
+    @classmethod
+    def for_geometry(
+        cls,
+        num_layers: int,
+        hkv: int,
+        BS: int,
+        oproj_splits: int,
+        down_splits: int,
+        attn_splits: int,
+    ) -> "TgBarDims":
+        """Compute bar lengths for one (BS, tiling) geometry.
+
+        ``bar_combine`` is only needed when ``attn_splits > 1``; we always
+        allocate it (sized to the max splits) so a bucket can switch on split
+        without re-allocating. When ``attn_splits == 1`` it stays allocated at
+        ``layers * BS * hkv`` but is never produced/consumed.
+
+        ``bar_layer`` has ``num_layers + 1`` slots: layer L's ADD_RMSNORM
+        produces slot ``L+1``, and the next layer's QKV/FFN wait on slot ``L``
+        (or LM_HEAD waits on slot ``num_layers`` for the final layer). This
+        avoids the final layer colliding with its own input slot.
+        """
+        return cls(
+            bar_qkv=num_layers * hkv,
+            bar_attn=num_layers * oproj_splits,
+            bar_oproj=num_layers,
+            bar_silu=num_layers * down_splits,
+            bar_ffn_down=num_layers,
+            bar_layer=num_layers + 1,
+            bar_combine=num_layers * BS * hkv if attn_splits > 1 else 0,
+        )
+
+
+class TgBarIndex:
+    """Index formulas for each bar. Mirrors docs/11 §6.3.
+
+    Every method is a pure function of (layer, batch, kv_head, split); tests
+    lock them against the kernel's decoder. Keep these in one place so the
+    schedule builder and the tests share a single source of truth.
+    """
+
+    @staticmethod
+    def qkv(layer: int, hkv: int, kv_head: int) -> int:
+        return layer * hkv + kv_head
+
+    @staticmethod
+    def attn(layer: int, oproj_splits: int, split: int) -> int:
+        return layer * oproj_splits + split
+
+    @staticmethod
+    def oproj(layer: int) -> int:
+        return layer
+
+    @staticmethod
+    def silu(layer: int, down_splits: int, split: int) -> int:
+        return layer * down_splits + split
+
+    @staticmethod
+    def ffn_down(layer: int) -> int:
+        return layer
+
+    @staticmethod
+    def layer(layer: int) -> int:
+        return layer
+
+    @staticmethod
+    def combine(layer: int, BS: int, hkv: int, batch: int, kv_head: int) -> int:
+        return layer * (BS * hkv) + batch * hkv + kv_head
+
+
+# =============================================================================
+# Instruction encoding. Each builder returns a list of 16 ints.
+# =============================================================================
+
+
+def _inst(opcode: int, *fields: int) -> list[int]:
+    """Pad ``fields`` to TG_INST_WIDTH with zeros."""
+    out = [0] * TG_INST_WIDTH
+    out[0] = opcode
+    for i, v in enumerate(fields, start=1):
+        if i >= TG_INST_WIDTH:
+            raise ValueError(f"too many fields for instruction: {fields}")
+        out[i] = int(v)
+    return out
+
+
+def _pack_tile(tile_m: int, tile_n: int) -> int:
+    return (tile_m << 16) | (tile_n & 0xFFFF)
+
+
+def make_nop() -> list[int]:
+    return _inst(TgOp.NOP)
+
+
+def make_qkv_proj(
+    layer: int,
+    tile_n: int,
+    gemm_idx: int,
+    needs_rope: bool,
+    wait_bar_idx: int,
+    wait_target: int,
+    produce_bar_idx: int,
+    batch_row: int,
+) -> list[int]:
+    """TG_QKV_PROJ. See docs/11 §3.3.
+
+    ``gemm_idx``: 0=Q, 1=K, 2=V. ``needs_rope``: True for Q and K (RoPE + KV
+    cache write); False for V (V is written to KV cache without RoPE). The
+    schedule builder decides per gemm_idx.
+    """
+    return _inst(
+        TgOp.QKV_PROJ,
+        layer,
+        tile_n,
+        gemm_idx,
+        1 if needs_rope else 0,
+        wait_bar_idx,
+        wait_target,
+        produce_bar_idx,
+        batch_row,
+    )
+
+
+def make_attn_decode(
+    layer: int,
+    batch_idx: int,
+    kv_head_idx: int,
+    split_idx: int,
+    num_splits: int,
+    window_size: int,
+    wait_bar_idx: int,
+    wait_target: int,
+    produce_bar_idx: int,
+    produce_is_combine: bool,
+) -> list[int]:
+    """TG_ATTN_DECODE. ``produce_is_combine`` selects bar_combine vs bar_attn.
+
+    Encoded in bit 31 of ``produce_bar_idx`` (sign bit, since indices are
+    non-negative): if set, the kernel reads ``bar_combine[produce_bar_idx]``;
+    otherwise ``bar_attn[produce_bar_idx]``. This avoids a separate flag word.
+    """
+    produce = produce_bar_idx if not produce_is_combine else (produce_bar_idx | (1 << 31))
+    return _inst(
+        TgOp.ATTN_DECODE,
+        layer,
+        batch_idx,
+        kv_head_idx,
+        split_idx,
+        num_splits,
+        window_size,
+        wait_bar_idx,
+        wait_target,
+        produce,
+    )
+
+
+def make_attn_combine(
+    layer: int,
+    batch_idx: int,
+    kv_head_idx: int,
+    num_splits: int,
+    wait_bar_idx: int,
+    wait_target: int,
+    produce_bar_idx: int,
+) -> list[int]:
+    return _inst(
+        TgOp.ATTN_COMBINE,
+        layer,
+        batch_idx,
+        kv_head_idx,
+        num_splits,
+        wait_bar_idx,
+        wait_target,
+        produce_bar_idx,
+    )
+
+
+def make_gemm(
+    opcode: int,
+    layer: int,
+    tile_m: int,
+    tile_n: int,
+    split: int,
+    k_tiles: int,
+    wait_bar_idx: int,
+    wait_target: int,
+    produce_bar_idx: int,
+    extra_tiles: list[tuple[int, int]] | None = None,
+) -> list[int]:
+    """Generic GEMM instruction (O_PROJ / FFN_UPGATE_ACT / FFN_DOWN / LM_HEAD).
+
+    Packs the primary (tile_m, tile_n) plus up to 5 extra tiles sharing the
+    same dependency. ``extra_tiles`` lets one instruction cover multiple tiles
+    that all wait on the same bar and produce the same bar — the worker loop
+    fans the tiles out across its warps.
+    """
+    tiles = [(tile_m, tile_n)] + (extra_tiles or [])
+    if len(tiles) > 6:
+        raise ValueError(f"too many tiles per instruction: {len(tiles)} > 6")
+    tile_ids = [_pack_tile(m, n) for m, n in tiles]
+    return _inst(
+        opcode,
+        layer,
+        tile_m,
+        tile_n,
+        split,
+        k_tiles,
+        wait_bar_idx,
+        wait_target,
+        produce_bar_idx,
+        len(tiles),
+        *tile_ids,
+    )
+
+
+def make_add_rmsnorm(
+    layer: int,
+    batch_idx: int,
+    wait_oproj_idx: int,
+    wait_oproj_target: int,
+    wait_ffn_idx: int,
+    wait_ffn_target: int,
+    produce_bar_idx: int,
+    is_final_layer: bool,
+) -> list[int]:
+    return _inst(
+        TgOp.ADD_RMSNORM,
+        layer,
+        batch_idx,
+        wait_oproj_idx,
+        wait_oproj_target,
+        wait_ffn_idx,
+        wait_ffn_target,
+        produce_bar_idx,
+        1 if is_final_layer else 0,
+    )
+
+
+def make_lm_head(
+    layer: int,
+    tile_m: int,
+    tile_n: int,
+    wait_bar_idx: int,
+    wait_target: int,
+    extra_tiles: list[tuple[int, int]] | None = None,
+) -> list[int]:
+    """TG_LM_HEAD. No produce bar (terminal op). Uses make_gemm with produce=0."""
+    return make_gemm(
+        TgOp.LM_HEAD,
+        layer=layer,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        split=0,
+        k_tiles=0,
+        wait_bar_idx=wait_bar_idx,
+        wait_target=wait_target,
+        produce_bar_idx=0,
+        extra_tiles=extra_tiles,
+    )
+
+
+# =============================================================================
+# Tiling configuration per GEMM. Phase 0 uses conservative defaults; Phase 2
+# tunes per batch. Tile sizes are WMMA m16n16k16 multiples.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TgTiling:
+    """Tile sizes (in units of 16, the WMMA m16n16k16 dimension)."""
+
+    # M dimension tiles: batch is small (<=8), so tiles_M = ceil(BS/16) = 1.
+    # We don't tile M; one GEMM covers all rows.
+    qkv_bn: int = 16   # N tile for QKV (Q: 2048/16=128 tiles; K,V: 1024/16=64)
+    qkv_bk: int = 16
+    oproj_bn: int = 16  # O: 1024/16=64 tiles
+    oproj_bk: int = 16
+    ffn_bn: int = 16    # Gate/Up: 3072/16=192 tiles; Down: 1024/16=64 tiles
+    ffn_bk: int = 16
+    lm_head_bn: int = 16  # vocab 151936/16 = 9496 tiles
+    lm_head_bk: int = 16
+    oproj_splits: int = 1  # how O_PROJ's N tiles are split across bar_attn slots
+    down_splits: int = 1   # how FFN_DOWN's K tiles are split across bar_silu slots
+
+
+@dataclass(frozen=True)
+class TgGeometry:
+    """One (BS, tiling, attn_splits) configuration the schedule is built for."""
+
+    BS: int
+    num_layers: int
+    hkv: int
+    num_q_heads: int
+    head_dim: int
+    hidden: int
+    intermediate: int
+    vocab: int
+    q_size: int
+    kv_size: int
+    tiling: TgTiling
+    attn_splits: int  # static split count for this context bucket
+    max_attn_splits: int  # capacity of o_partial/lse_partial buffers
+
+
+# =============================================================================
+# Wave construction. Each wave is a list of instructions that are mutually
+# independent (can run in parallel). The placement step distributes them.
+# =============================================================================
+
+
+def _qkv_wait_target(layer: int, BS: int) -> int:
+    """Layer 0 doesn't wait (no previous rmsnorm); else wait for BS arrivals."""
+    return 0 if layer == 0 else BS
+
+
+def _qkv_wait_idx(layer: int) -> int:
+    """QKV waits on bar_layer[layer] (the previous ADD_RMSNORM produces there)."""
+    return TgBarIndex.layer(layer)
+
+
+_Q_TILES_PER_KV_HEAD = 16   # q_size=2048, bn=16 -> 128 tiles / 8 kv_heads = 16
+_KV_TILES_PER_KV_HEAD = 8   # kv_size=1024, bn=16 -> 64 tiles / 8 kv_heads = 8
+
+
+def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[list[int]]:
+    """Merge consecutive instructions with identical (opcode, wait, produce, split)
+    into single instructions carrying up to ``max_per_inst`` tiles.
+
+    This is a simple greedy pack: it groups runs of instructions that share
+    everything except (tile_m, tile_n) and emits one instruction per group with
+    the tiles in ``TILE_IDS``. The kernel's worker loop fans the packed tiles
+    out across its warps. Packing cuts inst_buf size by up to 6x without
+    changing the dependency graph.
+
+    Only applies to the generic GEMM opcodes (O_PROJ / FFN_UPGATE_ACT /
+    FFN_DOWN / LM_HEAD); QKV/ATTN/ADD_RMSNORM have opcode-specific layouts
+    without a TILE_IDS field.
+    """
+    if not instructions:
+        return []
+    out: list[list[int]] = []
+    i = 0
+    while i < len(instructions):
+        inst = instructions[i]
+        opcode = inst[0]
+        # Only pack generic GEMM opcodes.
+        if opcode not in (TgOp.O_PROJ, TgOp.FFN_UPGATE_ACT, TgOp.FFN_DOWN, TgOp.LM_HEAD):
+            out.append(inst)
+            i += 1
+            continue
+        # Group key: (opcode, layer, split, k_tiles, wait_idx, wait_target, produce_idx)
+        key = (inst[1], inst[4], inst[5], inst[6], inst[7], inst[8])
+        group: list[tuple[int, int]] = [(inst[2], inst[3])]
+        j = i + 1
+        while j < len(instructions) and len(group) < max_per_inst:
+            nxt = instructions[j]
+            if nxt[0] != opcode:
+                break
+            nxt_key = (nxt[1], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8])
+            if nxt_key != key:
+                break
+            group.append((nxt[2], nxt[3]))
+            j += 1
+        if len(group) == 1:
+            out.append(inst)
+        else:
+            out.append(
+                make_gemm(
+                    opcode,
+                    layer=inst[1],
+                    tile_m=group[0][0],
+                    tile_n=group[0][1],
+                    split=inst[4],
+                    k_tiles=inst[5],
+                    wait_bar_idx=inst[6],
+                    wait_target=inst[7],
+                    produce_bar_idx=inst[8],
+                    extra_tiles=group[1:],
+                )
+            )
+        i = j
+    return out
+
+
+def build_qkv_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 0: QKV projection. One instruction per (gemm_idx, tile_n).
+
+    Each tile belongs to exactly one kv_head:
+      - Q: tile_n // 16 = kv_head  (q_size=2048, 128 tiles, 16 tiles/kv_head)
+      - K: tile_n // 8  = kv_head  (kv_size=1024, 64 tiles, 8 tiles/kv_head)
+      - V: same as K
+
+    Producing into bar_qkv[layer*hkv + kv_head] lets attention for each
+    kv_head start as soon as ITS 16 Q + 8 K + 8 V tiles finish, without
+    waiting for other kv_heads (backfill). Q/K need RoPE; V does not.
+    """
+    wait_idx = _qkv_wait_idx(layer)
+    wait_target = _qkv_wait_target(layer, geo.BS)
+    out: list[list[int]] = []
+    bn = geo.tiling.qkv_bn
+    # Q: N = q_size = 2048 -> 128 tiles, 16 tiles per kv_head
+    for tile_n in range(geo.q_size // bn):
+        kv_head = tile_n // _Q_TILES_PER_KV_HEAD
+        produce = TgBarIndex.qkv(layer, geo.hkv, kv_head)
+        out.append(
+            make_qkv_proj(
+                layer=layer,
+                tile_n=tile_n,
+                gemm_idx=0,
+                needs_rope=True,
+                wait_bar_idx=wait_idx,
+                wait_target=wait_target,
+                produce_bar_idx=produce,
+                batch_row=0,
+            )
+        )
+    # K: N = kv_size = 1024 -> 64 tiles, 8 tiles per kv_head
+    for tile_n in range(geo.kv_size // bn):
+        kv_head = tile_n // _KV_TILES_PER_KV_HEAD
+        produce = TgBarIndex.qkv(layer, geo.hkv, kv_head)
+        out.append(
+            make_qkv_proj(
+                layer=layer,
+                tile_n=tile_n,
+                gemm_idx=1,
+                needs_rope=True,
+                wait_bar_idx=wait_idx,
+                wait_target=wait_target,
+                produce_bar_idx=produce,
+                batch_row=0,
+            )
+        )
+    # V: N = kv_size = 1024 -> 64 tiles, 8 tiles per kv_head
+    for tile_n in range(geo.kv_size // bn):
+        kv_head = tile_n // _KV_TILES_PER_KV_HEAD
+        produce = TgBarIndex.qkv(layer, geo.hkv, kv_head)
+        out.append(
+            make_qkv_proj(
+                layer=layer,
+                tile_n=tile_n,
+                gemm_idx=2,
+                needs_rope=False,
+                wait_bar_idx=wait_idx,
+                wait_target=wait_target,
+                produce_bar_idx=produce,
+                batch_row=0,
+            )
+        )
+    return out
+
+
+def _qkv_wait_per_kv(geo: TgGeometry) -> int:
+    """Attention for one kv_head waits for its 16 Q + 8 K + 8 V tiles = 32."""
+    return _Q_TILES_PER_KV_HEAD + 2 * _KV_TILES_PER_KV_HEAD
+
+
+def build_attn_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 1: ATTN_DECODE. One instruction per (batch, kv_head, split).
+
+    With static splits, num_splits is fixed for the bucket. split>1 produces
+    into bar_combine; split==1 produces into bar_attn directly.
+    """
+    wait_per_kv = _qkv_wait_per_kv(geo)
+    out: list[list[int]] = []
+    for batch in range(geo.BS):
+        for kv_head in range(geo.hkv):
+            wait_idx = TgBarIndex.qkv(layer, geo.hkv, kv_head)
+            for split in range(geo.attn_splits):
+                if geo.attn_splits > 1:
+                    produce_idx = TgBarIndex.combine(
+                        layer, geo.BS, geo.hkv, batch, kv_head
+                    )
+                    produce_is_combine = True
+                else:
+                    produce_idx = TgBarIndex.attn(
+                        layer, geo.tiling.oproj_splits, split
+                    )
+                    produce_is_combine = False
+                out.append(
+                    make_attn_decode(
+                        layer=layer,
+                        batch_idx=batch,
+                        kv_head_idx=kv_head,
+                        split_idx=split,
+                        num_splits=geo.attn_splits,
+                        window_size=0,  # Qwen3-0.6B: no sliding window in Phase 0
+                        wait_bar_idx=wait_idx,
+                        wait_target=wait_per_kv,
+                        produce_bar_idx=produce_idx,
+                        produce_is_combine=produce_is_combine,
+                    )
+                )
+    return out
+
+
+def build_attn_combine_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 2: ATTN_COMBINE (only when attn_splits > 1)."""
+    if geo.attn_splits <= 1:
+        return []
+    out: list[list[int]] = []
+    for batch in range(geo.BS):
+        for kv_head in range(geo.hkv):
+            wait_idx = TgBarIndex.combine(layer, geo.BS, geo.hkv, batch, kv_head)
+            # Combine produces into bar_attn for O_PROJ to consume.
+            # With oproj_splits=1, all combines produce bar_attn[layer*1 + 0].
+            produce_idx = TgBarIndex.attn(layer, geo.tiling.oproj_splits, 0)
+            out.append(
+                make_attn_combine(
+                    layer=layer,
+                    batch_idx=batch,
+                    kv_head_idx=kv_head,
+                    num_splits=geo.attn_splits,
+                    wait_bar_idx=wait_idx,
+                    wait_target=geo.attn_splits,
+                    produce_bar_idx=produce_idx,
+                )
+            )
+    return out
+
+
+def build_o_proj_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 3: O_PROJ. N = hidden = 1024 -> 64 tiles (bn=16)."""
+    wait_idx = TgBarIndex.attn(layer, geo.tiling.oproj_splits, 0)
+    # O_PROJ waits for all attention combines to finish: BS * hkv arrivals
+    # (when split>1) or BS * hkv attention decodes (when split==1).
+    wait_target = geo.BS * geo.hkv
+    produce = TgBarIndex.oproj(layer)
+    out: list[list[int]] = []
+    bn = geo.tiling.oproj_bn
+    for tile_n in range(geo.hidden // bn):
+        out.append(
+            make_gemm(
+                TgOp.O_PROJ,
+                layer=layer,
+                tile_m=0,
+                tile_n=tile_n,
+                split=0,
+                k_tiles=geo.q_size // geo.tiling.oproj_bk,
+                wait_bar_idx=wait_idx,
+                wait_target=wait_target,
+                produce_bar_idx=produce,
+            )
+        )
+    return out
+
+
+def build_ffn_upgate_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 4: FFN_UPGATE_ACT (gate + up fused). N = intermediate = 3072 -> 192 tiles.
+
+    Waits on bar_oproj (O_PROJ done) — NOT bar_layer — because FFN consumes
+    the POST-ATTENTION norm, not the previous layer's norm. The op body fuses:
+    residual add (x_resid + o_proj_out → x_attn) + post-attn RMSNorm + gate/up
+    GEMM + SiLU. Each tile instruction redundantly computes the per-row RMSNorm
+    (cheap relative to the GEMM); this avoids a separate POST_ATTN_NORM wave.
+    """
+    wait_idx = TgBarIndex.oproj(layer)
+    oproj_tiles = geo.hidden // geo.tiling.oproj_bn
+    wait_target = oproj_tiles  # all O_PROJ tiles must finish
+    out: list[list[int]] = []
+    bn = geo.tiling.ffn_bn
+    for tile_n in range(geo.intermediate // bn):
+        for split in range(geo.tiling.down_splits):
+            produce = TgBarIndex.silu(layer, geo.tiling.down_splits, split)
+            out.append(
+                make_gemm(
+                    TgOp.FFN_UPGATE_ACT,
+                    layer=layer,
+                    tile_m=0,
+                    tile_n=tile_n,
+                    split=split,
+                    k_tiles=geo.hidden // geo.tiling.ffn_bk,
+                    wait_bar_idx=wait_idx,
+                    wait_target=wait_target,
+                    produce_bar_idx=produce,
+                )
+            )
+    return out
+
+
+def build_ffn_down_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 5: FFN_DOWN. N = hidden = 1024 -> 64 tiles."""
+    out: list[list[int]] = []
+    bn = geo.tiling.ffn_bn
+    silu_tiles_per_split = geo.intermediate // (bn * geo.tiling.down_splits)
+    for tile_n in range(geo.hidden // bn):
+        for split in range(geo.tiling.down_splits):
+            wait_idx = TgBarIndex.silu(layer, geo.tiling.down_splits, split)
+            produce = TgBarIndex.ffn_down(layer)
+            out.append(
+                make_gemm(
+                    TgOp.FFN_DOWN,
+                    layer=layer,
+                    tile_m=0,
+                    tile_n=tile_n,
+                    split=split,
+                    k_tiles=silu_tiles_per_split,
+                    wait_bar_idx=wait_idx,
+                    wait_target=silu_tiles_per_split,
+                    produce_bar_idx=produce,
+                )
+            )
+    return out
+
+
+def build_add_rmsnorm_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
+    """Wave 6: ADD_RMSNORM. One instruction per batch row (per-row rmsnorm).
+
+    Always produces into ``bar_layer[layer + 1]``: the next layer's QKV/FFN
+    wait there. The final layer (layer == num_layers - 1) produces into
+    ``bar_layer[num_layers]``, which LM_HEAD waits on. ``bar_layer`` has
+    ``num_layers + 1`` slots to accommodate this without colliding with the
+    final layer's own input slot (``bar_layer[num_layers - 1]``).
+    """
+    is_final = layer == geo.num_layers - 1
+    oproj_target = geo.hidden // geo.tiling.oproj_bn  # oproj tile count
+    ffn_target = geo.hidden // geo.tiling.ffn_bn  # ffn_down tile count
+    out: list[list[int]] = []
+    for batch in range(geo.BS):
+        produce = TgBarIndex.layer(layer + 1)  # always layer+1
+        out.append(
+            make_add_rmsnorm(
+                layer=layer,
+                batch_idx=batch,
+                wait_oproj_idx=TgBarIndex.oproj(layer),
+                wait_oproj_target=oproj_target,
+                wait_ffn_idx=TgBarIndex.ffn_down(layer),
+                wait_ffn_target=ffn_target,
+                produce_bar_idx=produce,
+                is_final_layer=is_final,
+            )
+        )
+    return out
+
+
+def build_lm_head_wave(geo: TgGeometry) -> list[list[int]]:
+    """Wave 7 (last layer only): LM_HEAD. N = vocab = 151936 -> 9496 tiles.
+
+    Waits on ``bar_layer[num_layers]`` (produced by the final layer's
+    ADD_RMSNORM) with target = BS (all rows' final rmsnorm)."""
+    wait_idx = TgBarIndex.layer(geo.num_layers)  # == num_layers (the +1 slot)
+    wait_target = geo.BS  # all rows' final rmsnorm
+    out: list[list[int]] = []
+    bn = geo.tiling.lm_head_bn
+    for tile_n in range(geo.vocab // bn):
+        out.append(
+            make_lm_head(
+                layer=geo.num_layers - 1,
+                tile_m=0,
+                tile_n=tile_n,
+                wait_bar_idx=wait_idx,
+                wait_target=wait_target,
+            )
+        )
+    return out
+
+
+# =============================================================================
+# Per-layer wave assembly + LM_HEAD.
+# =============================================================================
+
+
+def build_layer_waves(geo: TgGeometry, layer: int) -> list[list[list[int]]]:
+    """Return the 7 named waves for one layer (LM_HEAD is separate).
+
+    GEMM waves (O_PROJ, FFN_UPGATE_ACT, FFN_DOWN) are tile-packed to cut
+    inst_buf size; QKV/ATTN/ADD_RMSNORM use opcode-specific layouts that
+    are not packed.
+    """
+    return [
+        build_qkv_wave(geo, layer),
+        build_attn_wave(geo, layer),
+        build_attn_combine_wave(geo, layer),
+        _pack_tiles(build_o_proj_wave(geo, layer)),
+        _pack_tiles(build_ffn_upgate_wave(geo, layer)),
+        _pack_tiles(build_ffn_down_wave(geo, layer)),
+        build_add_rmsnorm_wave(geo, layer),
+    ]
+
+
+# =============================================================================
+# Placement: round-robin across SMs. Adapted from cohere's _round_robin_waves
+# (schedule.py:1244-1267). Cursor persists across waves so waiters don't all
+# land on low-numbered SMs.
+# =============================================================================
+
+
+def place_round_robin(
+    waves: list[list[list[int]]], num_sms: int
+) -> list[list[list[int]]]:
+    """Distribute instructions across SMs round-robin.
+
+    Returns ``per_sm[sm]`` = list of instructions for that SM. Short SMs are
+    padded with NOP to ``max_inst`` later during serialization. The cursor
+    advances across waves (not reset per wave) so dependencies naturally spread.
+    """
+    per_sm: list[list[list[int]]] = [[] for _ in range(num_sms)]
+    cursor = 0
+    for wave in waves:
+        for inst in wave:
+            per_sm[cursor % num_sms].append(inst)
+            cursor += 1
+    return per_sm
+
+
+# =============================================================================
+# Serialization: per_sm -> flat inst_buf tensor + num_inst_per_sm.
+# =============================================================================
+
+
+def serialize_inst_buf(
+    per_sm: list[list[list[int]]], num_sms: int
+) -> tuple[list[int], list[int], int]:
+    """Pack ``per_sm`` into a flat int32 buffer + per-SM counts + max_inst.
+
+    Returns ``(flat_inst_buf, num_inst_per_sm, max_inst)`` where
+    ``flat_inst_buf`` has shape ``[num_sms, max_inst, TG_INST_WIDTH]`` (row-major),
+    short SMs padded with NOP.
+    """
+    max_inst = max((len(sm) for sm in per_sm), default=0)
+    if max_inst == 0:
+        max_inst = 1  # avoid zero-stride; the kernel still launches but does nothing
+    flat: list[int] = []
+    counts: list[int] = []
+    for sm in per_sm:
+        counts.append(len(sm))
+        for i in range(max_inst):
+            inst = sm[i] if i < len(sm) else make_nop()
+            flat.extend(inst)
+    return flat, counts, max_inst
+
+
+# =============================================================================
+# Top-level entry: build a complete schedule for one geometry.
+# =============================================================================
+
+
+@dataclass
+class TgSchedule:
+    """Output of :func:`build_schedule`."""
+
+    flat_inst_buf: list[int]          # [num_sms, max_inst, TG_INST_WIDTH]
+    num_inst_per_sm: list[int]        # [num_sms]
+    max_inst: int
+    bar_dims: TgBarDims
+    num_sms: int
+    total_instructions: int
+
+
+def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
+    """Build the full per-SM instruction stream for one decode step.
+
+    Assembles 28 layers × 7 waves + LM_HEAD, places them round-robin, and
+    serializes. Pure function of (geo, num_sms) — no GPU state, fully testable.
+    """
+    waves: list[list[list[int]]] = []
+    for layer in range(geo.num_layers):
+        waves.extend(build_layer_waves(geo, layer))
+    waves.append(_pack_tiles(build_lm_head_wave(geo)))
+
+    per_sm = place_round_robin(waves, num_sms)
+    flat, counts, max_inst = serialize_inst_buf(per_sm, num_sms)
+
+    bar_dims = TgBarDims.for_geometry(
+        num_layers=geo.num_layers,
+        hkv=geo.hkv,
+        BS=geo.BS,
+        oproj_splits=geo.tiling.oproj_splits,
+        down_splits=geo.tiling.down_splits,
+        attn_splits=geo.attn_splits,
+    )
+
+    total = sum(counts)
+    return TgSchedule(
+        flat_inst_buf=flat,
+        num_inst_per_sm=counts,
+        max_inst=max_inst,
+        bar_dims=bar_dims,
+        num_sms=num_sms,
+        total_instructions=total,
+    )
+
+
+# =============================================================================
+# Convenience: default geometry for Qwen3-0.6B.
+# =============================================================================
+
+
+def default_geometry(BS: int, attn_splits: int = 1) -> TgGeometry:
+    """Default Qwen3-0.6B geometry for one batch size + context bucket."""
+    return TgGeometry(
+        BS=BS,
+        num_layers=28,
+        hkv=8,
+        num_q_heads=16,
+        head_dim=128,
+        hidden=1024,
+        intermediate=3072,
+        vocab=151936,
+        q_size=2048,
+        kv_size=1024,
+        tiling=TgTiling(),
+        attn_splits=attn_splits,
+        max_attn_splits=4,  # capacity for o_partial/lse_partial
+    )
+
+
+if __name__ == "__main__":
+    # Smoke test: build a BS=1 schedule and print stats.
+    geo = default_geometry(BS=1, attn_splits=1)
+    sched = build_schedule(geo, num_sms=108)
+    print(f"BS=1, attn_splits=1, num_sms=108")
+    print(f"  total_instructions = {sched.total_instructions}")
+    print(f"  max_inst           = {sched.max_inst}")
+    print(f"  bar_dims           = {sched.bar_dims}")
+    print(f"  inst_buf size      = {len(sched.flat_inst_buf)} ints "
+          f"({len(sched.flat_inst_buf) * 4 / 1024:.1f} KiB)")

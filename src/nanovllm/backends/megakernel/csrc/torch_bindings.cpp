@@ -545,6 +545,148 @@ int64_t wmma_max_supported_batch() {
   return static_cast<int64_t>(ldg_wmma_max_supported_batch(0));
 }
 
+// =============================================================================
+// Task-graph megakernel bindings (Phase 1).
+//
+// tg_decode_step packs all tensor pointers + geometry into a TgLaunchDesc and
+// calls tg_launch_decode (cudaLaunchCooperativeKernel). The persistent kernel
+// walks the per-SM instruction stream, executing the full decode forward pass.
+//
+// tg_zero_regions clears scratch + bar arrays before each step. The
+// regions_packed tensor is [num_regions, 2] int64: each row is (ptr, bytes).
+// =============================================================================
+
+#include "tg_abi.h"
+
+extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
+                                  cudaStream_t stream);
+extern "C" void tg_launch_zero_regions(const tg::TgZeroRegion* regions,
+                                        int num_regions, cudaStream_t stream);
+
+static uint64_t tensor_ptr(const torch::Tensor& t) {
+  return reinterpret_cast<uint64_t>(t.data_ptr());
+}
+
+void tg_decode_step(
+    // instruction stream
+    torch::Tensor inst_buf, torch::Tensor num_inst_per_sm,
+    int64_t max_inst, int64_t num_sms,
+    // weights
+    torch::Tensor layer_weights_packed, torch::Tensor embed_weight,
+    torch::Tensor final_norm_weight, torch::Tensor cos_table,
+    torch::Tensor sin_table,
+    // KV cache + paging
+    torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor page_table,
+    torch::Tensor cache_seqlens, torch::Tensor row_active,
+    int64_t num_phys_pages, int64_t max_pages_per_seq,
+    int64_t page_block_size, int64_t kv_layer_stride,
+    // scratch buffers
+    torch::Tensor norm_out, torch::Tensor q_out, torch::Tensor k_out,
+    torch::Tensor v_out, torch::Tensor attn_out, torch::Tensor o_proj_out,
+    torch::Tensor x_attn, torch::Tensor post_attn_norm, torch::Tensor silu_out,
+    torch::Tensor ffn_down_out, torch::Tensor up_out, torch::Tensor x_ffn, torch::Tensor x_resid,
+    torch::Tensor lm_logits, torch::Tensor o_partial, torch::Tensor lse_partial,
+    // bars
+    torch::Tensor bar_qkv, torch::Tensor bar_attn, torch::Tensor bar_oproj,
+    torch::Tensor bar_silu, torch::Tensor bar_ffn_down, torch::Tensor bar_layer,
+    torch::Tensor bar_combine,
+    // geometry
+    int64_t num_layers, int64_t BS, int64_t hidden, int64_t intermediate,
+    int64_t q_size, int64_t kv_size, int64_t num_q_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t vocab_size,
+    int64_t oproj_splits, int64_t down_splits, int64_t max_attn_splits) {
+  // Build TgLaunchDesc on the stack.
+  tg::TgLaunchDesc desc{};
+
+  desc.num_sms = (int32_t)num_sms;
+  desc.inst_buf = tensor_ptr(inst_buf);
+  desc.num_inst_per_sm = tensor_ptr(num_inst_per_sm);
+  desc.max_inst = (int32_t)max_inst;
+
+  desc.layer_weights = tensor_ptr(layer_weights_packed);
+  desc.embed_weight = tensor_ptr(embed_weight);
+  desc.final_norm_weight = tensor_ptr(final_norm_weight);
+  desc.cos_table = tensor_ptr(cos_table);
+  desc.sin_table = tensor_ptr(sin_table);
+
+  desc.k_cache = tensor_ptr(k_cache);
+  desc.v_cache = tensor_ptr(v_cache);
+  desc.page_table = tensor_ptr(page_table);
+  desc.cache_seqlens = tensor_ptr(cache_seqlens);
+  desc.row_active = tensor_ptr(row_active);
+  desc.num_phys_pages = (int32_t)num_phys_pages;
+  desc.max_pages_per_seq = (int32_t)max_pages_per_seq;
+  desc.page_block_size = (int32_t)page_block_size;
+  desc.kv_layer_stride = (int64_t)kv_layer_stride;
+
+  desc.norm_out = tensor_ptr(norm_out);
+  desc.q_out = tensor_ptr(q_out);
+  desc.k_out = tensor_ptr(k_out);
+  desc.v_out = tensor_ptr(v_out);
+  desc.attn_out = tensor_ptr(attn_out);
+  desc.o_proj_out = tensor_ptr(o_proj_out);
+  desc.x_attn = tensor_ptr(x_attn);
+  desc.post_attn_norm = tensor_ptr(post_attn_norm);
+  desc.silu_out = tensor_ptr(silu_out);
+  desc.ffn_down_out = tensor_ptr(ffn_down_out);
+  desc.up_out = tensor_ptr(up_out);
+  desc.x_ffn = tensor_ptr(x_ffn);
+  desc.x_resid = tensor_ptr(x_resid);
+  desc.lm_logits = tensor_ptr(lm_logits);
+  desc.o_partial = tensor_ptr(o_partial);
+  desc.lse_partial = tensor_ptr(lse_partial);
+
+  desc.bars.bar_qkv = tensor_ptr(bar_qkv);
+  desc.bars.bar_attn = tensor_ptr(bar_attn);
+  desc.bars.bar_oproj = tensor_ptr(bar_oproj);
+  desc.bars.bar_silu = tensor_ptr(bar_silu);
+  desc.bars.bar_ffn_down = tensor_ptr(bar_ffn_down);
+  desc.bars.bar_layer = tensor_ptr(bar_layer);
+  desc.bars.bar_combine = tensor_ptr(bar_combine);
+
+  desc.num_layers = (int32_t)num_layers;
+  desc.BS = (int32_t)BS;
+  desc.hidden = (int32_t)hidden;
+  desc.intermediate = (int32_t)intermediate;
+  desc.q_size = (int32_t)q_size;
+  desc.kv_size = (int32_t)kv_size;
+  desc.num_q_heads = (int32_t)num_q_heads;
+  desc.num_kv_heads = (int32_t)num_kv_heads;
+  desc.head_dim = (int32_t)head_dim;
+  desc.vocab_size = (int32_t)vocab_size;
+  desc.oproj_splits = (int32_t)oproj_splits;
+  desc.down_splits = (int32_t)down_splits;
+  desc.max_attn_splits = (int32_t)max_attn_splits;
+  desc.timing = 0;
+
+  // Launch on the current CUDA stream.
+  c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
+  tg_launch_decode(&desc, stream.stream());
+}
+
+void tg_zero_regions_binding(torch::Tensor regions_packed,
+                              int64_t num_regions) {
+  if (num_regions <= 0) return;
+  // regions_packed is [num_regions, 2] int64: each row is (ptr, bytes).
+  const int64_t* raw = regions_packed.data_ptr<int64_t>();
+  // Copy to a small host/device buffer. For Phase 1, use a heap alloc + H2D.
+  // (Phase 2 will use a pre-allocated device buffer.)
+  std::vector<tg::TgZeroRegion> regions(num_regions);
+  for (int64_t i = 0; i < num_regions; i++) {
+    regions[i].ptr = (uint64_t)raw[i * 2 + 0];
+    regions[i].bytes = (uint64_t)raw[i * 2 + 1];
+  }
+  c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
+  // Upload to device (small, <1KB typically).
+  tg::TgZeroRegion* d_regions;
+  cudaMalloc(&d_regions, num_regions * sizeof(tg::TgZeroRegion));
+  cudaMemcpyAsync(d_regions, regions.data(),
+                   num_regions * sizeof(tg::TgZeroRegion),
+                   cudaMemcpyHostToDevice, stream.stream());
+  tg_launch_zero_regions(d_regions, (int)num_regions, stream.stream());
+  cudaFree(d_regions);
+}
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("decode(Tensor output_token, int input_token_id, "
           "Tensor embed_weight, Tensor layer_weights_packed, "
@@ -635,6 +777,44 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int num_layers, int max_steps, int eos_token, "
           "int block_size, int num_cache_blocks, float attn_scale) -> Tensor");
   ops.impl("generate_nosync_paged_batch", torch::kCUDA, &generate_nosync_paged_batch);
+
+  // ===========================================================================
+  // Task-graph megakernel bindings (Phase 1).
+  // ===========================================================================
+
+  ops.def(
+      "tg_decode_step("
+      // instruction stream
+      "Tensor inst_buf, Tensor num_inst_per_sm, int max_inst, int num_sms, "
+      // weights
+      "Tensor layer_weights_packed, Tensor embed_weight, "
+      "Tensor final_norm_weight, Tensor cos_table, Tensor sin_table, "
+      // KV cache + paging
+      "Tensor k_cache, Tensor v_cache, Tensor page_table, "
+      "Tensor cache_seqlens, Tensor row_active, "
+      "int num_phys_pages, int max_pages_per_seq, int page_block_size, "
+      "int kv_layer_stride, "
+      // scratch buffers (float intermediates + bf16 x_resid)
+      "Tensor norm_out, Tensor q_out, Tensor k_out, Tensor v_out, "
+      "Tensor attn_out, Tensor o_proj_out, Tensor x_attn, "
+       "Tensor post_attn_norm, Tensor silu_out, Tensor ffn_down_out, "
+       "Tensor up_out, "
+       "Tensor x_ffn, Tensor x_resid, Tensor lm_logits, "
+      "Tensor o_partial, Tensor lse_partial, "
+      // bars
+      "Tensor bar_qkv, Tensor bar_attn, Tensor bar_oproj, "
+      "Tensor bar_silu, Tensor bar_ffn_down, Tensor bar_layer, "
+      "Tensor bar_combine, "
+      // geometry
+      "int num_layers, int BS, int hidden, int intermediate, "
+      "int q_size, int kv_size, int num_q_heads, int num_kv_heads, "
+      "int head_dim, int vocab_size, int oproj_splits, int down_splits, "
+      "int max_attn_splits) -> ()");
+  ops.impl("tg_decode_step", torch::kCUDA, &tg_decode_step);
+
+  ops.def(
+      "tg_zero_regions(Tensor regions_packed, int num_regions) -> ()");
+  ops.impl("tg_zero_regions", torch::kCUDA, &tg_zero_regions_binding);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

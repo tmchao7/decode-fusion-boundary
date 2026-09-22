@@ -1,0 +1,1614 @@
+/**
+ * Task-Graph Megakernel for Qwen3-0.6B on A100 (sm_80).
+ *
+ * One persistent cooperative launch (grid = #SMs) executes the complete decode
+ * forward pass. Each SM runs one resident CTA that walks a host-built per-SM
+ * instruction stream (inst_buf). Task dependencies are expressed as atomic
+ * uint32 counters in global memory (bar_*): producers __threadfence + atomicAdd,
+ * consumers volatile-poll until >= target. No per-layer full-grid grid.sync().
+ *
+ * See docs/11_task_graph重写设计.md for the full design.
+ *
+ * Phase 0 (this file): skeleton — wait/arrive primitives, controller/worker
+ * loop, dispatch switch with stub op bodies. Phase 1 fills the op bodies.
+ *
+ * Primary target: NVIDIA A100 (sm_80). WMMA m16n16k16; no TMA, no wgmma.
+ */
+
+#include <cstdint>
+#include <cstdio>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+#include "tg_abi.h"
+
+using namespace tg;  // Bring TG_INST_WIDTH, TgOp, TgLaunchDesc, etc. into scope
+
+// =============================================================================
+// Model constants (Qwen3-0.6B) — mirrored from kernel.cu:25-32.
+// =============================================================================
+
+constexpr int TG_WARP_SIZE = 32;
+constexpr int TG_HIDDEN = 1024;
+constexpr int TG_INTERMEDIATE = 3072;
+constexpr int TG_NUM_Q_HEADS = 16;
+constexpr int TG_NUM_KV_HEADS = 8;
+constexpr int TG_HEAD_DIM = 128;
+constexpr int TG_Q_SIZE = TG_NUM_Q_HEADS * TG_HEAD_DIM;    // 2048
+constexpr int TG_KV_SIZE = TG_NUM_KV_HEADS * TG_HEAD_DIM;  // 1024
+constexpr int TG_VOCAB = 151936;
+constexpr int TG_NUM_LAYERS = 28;
+constexpr float TG_RMS_EPS = 1e-6f;
+
+// =============================================================================
+// Build-time configuration.
+//
+// These mirror the spirit of kernel.cu's LDG_* flags but are independent so
+// the task-graph path can be tuned without disturbing the frozen batch=1
+// kernel. build.py passes them as -D. The #ifndef fallbacks MUST equal the
+// build.py defaults; test_taskgraph_abi.py enforces this (same pattern as
+// test_batch_launch_guards.py).
+// =============================================================================
+
+#ifndef TG_NUM_BLOCKS
+#define TG_NUM_BLOCKS 108  // A100 has 108 SMs; use them all (no artificial cap)
+#endif
+#ifndef TG_BLOCK_SIZE
+#define TG_BLOCK_SIZE 256  // 8 warps/CTA; occupancy=1 block/SM via __launch_bounds__
+#endif
+#ifndef TG_INST_RING
+#define TG_INST_RING 4     // controller/worker double-buffer depth
+#endif
+#ifndef TG_MAX_BATCH
+#define TG_MAX_BATCH 8     // compile-time ceiling for scratch/bar sizing (BS ∈ {1,2,4,8})
+#endif
+
+constexpr int TG_NUM_WARPS = TG_BLOCK_SIZE / TG_WARP_SIZE;        // 8
+constexpr int TG_WORKER_WARPS = TG_NUM_WARPS - 1;                 // 7 (warp 0 is controller)
+
+// =============================================================================
+// Cross-SM barrier primitives (bar_wait / bar_arrive).
+//
+// The bar arrays are uint32 counters in GMEM. Producers atomicAdd, consumers
+// volatile-poll until >= target. This replaces per-layer grid.sync() with
+// fine-grained dependency signaling.
+//
+// Correctness argument (mirrors docs/11 §4.2):
+//  - Release: fence.acq_rel.gpu publishes this CTA's global writes to GPU
+//    scope BEFORE atomicAdd. Any CTA that later observes the incremented
+//    counter is guaranteed to see those writes.
+//  - Acquire: the consumer's fence.acq_rel.gpu (after observing the counter
+//    >= target) ensures subsequent loads see the producer's published stores.
+//  - volatile poll prevents the counter read from being cached in registers.
+//  - __nanosleep(20) throttles memory-traffic from busy-wait (cohere "DONT DELETE").
+// =============================================================================
+
+// sm_80 has no TMA and therefore no fence.proxy.async. We use fence.acq_rel.gpu
+// (same primitive as AtomicGridSync in kernel.cu:108-145, proven on A100) for
+// both release and acquire. This guarantees GPU-scope visibility of prior
+// global stores before the atomicAdd that signals a producer, and visibility
+// of the producer's stores to a consumer that has observed the counter cross
+// the threshold.
+//
+// Correctness argument (mirrors docs/11 §4.2):
+//  - Release: fence.acq_rel.gpu publishes this CTA's global writes to GPU
+//    scope BEFORE atomicAdd. Any CTA that later observes the incremented
+//    counter is guaranteed to see those writes.
+//  - Acquire: the consumer's fence.acq_rel.gpu (after observing the counter
+//    >= target) ensures subsequent loads see the producer's published stores.
+//  - volatile poll prevents the counter read from being cached in registers.
+//  - __nanosleep(20) throttles memory-traffic from busy-wait (cohere "DONT DELETE").
+// =============================================================================
+
+__device__ __forceinline__ void tg_fence_gpu() {
+  asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+// Consumer: wait for bar[idx] >= target.
+// TODO: implement real cross-SM bar wait (currently no-op — works only with
+// num_sms=1 __syncthreads dispatch where instructions are sequential).
+__device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx,
+                                        uint32_t target) {
+  (void)bar; (void)idx; (void)target;
+  tg_fence_gpu();
+}
+
+// Producer: signal bar[idx] += inc (after this CTA's global stores are visible).
+__device__ __forceinline__ void tg_arrive(uint32_t* bar, int idx,
+                                          uint32_t inc = 1) {
+  // Release: publish my global writes to GPU scope before the atomic signal.
+  tg_fence_gpu();
+  atomicAdd(bar + idx, inc);
+}
+
+// Wait on two counters simultaneously (ADD_RMSNORM waits on attn + ffn paths).
+// TODO: implement real cross-SM bar wait (currently no-op).
+__device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
+                                            uint32_t target1,
+                                            const uint32_t* bar2, int idx2,
+                                            uint32_t target2) {
+  (void)bar1; (void)idx1; (void)target1;
+  (void)bar2; (void)idx2; (void)target2;
+  tg_fence_gpu();
+}
+
+// =============================================================================
+// Shared-memory instruction-ring semaphores (controller <-> worker).
+// These are intra-CTA, so plain __syncthreads-style shared atomics suffice.
+// Pattern adapted from cohere megakernel.cuh:3070-3128 (simplified: we use a
+// single arrival counter per ring slot instead of a generation sense-flip
+// because TG_INST_RING is small and we reset per step).
+// =============================================================================
+
+// Initialize the ring semaphores. ``done`` starts at 0 (no generation has
+// been consumed yet); the controller's first-generation wait target is also 0
+// (i / RING = 0 for i < RING), so it proceeds without blocking.
+__device__ __forceinline__ void tg_ring_init(uint32_t* arrived, uint32_t* done,
+                                             int ring) {
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int i = 0; i < ring; ++i) {
+      arrived[i] = 0;
+      done[i] = 0;
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ uint32_t tg_ring_load(volatile uint32_t* slot) {
+  uint32_t val;
+  uint32_t addr = (uint32_t)__cvta_generic_to_shared(const_cast<uint32_t*>(slot));
+  asm volatile("ld.shared.volatile.u32 %0, [%1];" : "=r"(val) : "r"(addr));
+  return val;
+}
+
+__device__ __forceinline__ void tg_ring_set(uint32_t* slot, uint32_t val) {
+  uint32_t addr = (uint32_t)__cvta_generic_to_shared(slot);
+  asm volatile("st.shared.volatile.u32 [%0], %1;"
+               :: "r"(addr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ void tg_ring_wait(volatile uint32_t* slot,
+                                             uint32_t target) {
+  while (tg_ring_load(slot) < target) {
+    __nanosleep(100);
+  }
+}
+
+// =============================================================================
+// Instruction helpers.
+// =============================================================================
+
+// Cooperative warp load: 32 lanes each read one int32, covering 32 words.
+// TG_INST_WIDTH is 16, so lanes 0..15 load the instruction; lanes 16..31 idle.
+__device__ __forceinline__ void tg_coop_load_inst(int* dst, const int* src) {
+  if (threadIdx.x < TG_INST_WIDTH) {
+    dst[threadIdx.x] = src[threadIdx.x];
+  }
+}
+
+// Opcode accessor.
+__device__ __forceinline__ int tg_opcode(const int* inst) { return inst[0]; }
+
+// =============================================================================
+// Worker sync (bar.sync 1 across worker warps only; controller warp 0 excluded).
+//
+// CRITICAL INVARIANT (cohere megakernel.cuh:515-519): every worker warp must
+// execute the SAME number of bar.sync 1 calls per instruction, including the
+// NOP branch. Otherwise arrival counts misalign and the CTA deadlocks. Each
+// op body calls tg_worker_sync exactly once at its end; the dispatch loop
+// calls it once after dispatch for the NOP/stub paths.
+// =============================================================================
+
+__device__ __forceinline__ void tg_worker_sync() {
+  asm volatile("bar.sync 1, %0;" :: "r"(TG_WORKER_WARPS * TG_WARP_SIZE)
+               : "memory");
+}
+
+// Worker-only sync for use INSIDE op bodies (between compute phases). Has the
+// same semantics as tg_worker_sync but is called multiple times per op. The
+// invariant is that ALL worker warps must call it the same number of times;
+// since op bodies have no warp divergence, this is guaranteed.
+__device__ __forceinline__ void tg_worker_sync_inner() {
+  asm volatile("bar.sync 1, %0;" :: "r"(TG_WORKER_WARPS * TG_WARP_SIZE)
+               : "memory");
+}
+
+// =============================================================================
+// Worker thread index helpers.
+//
+// Warp 0 (threadIdx.x 0..31) is the controller and never enters op bodies.
+// Worker warps are 1..7 (threadIdx.x 32..255). These helpers give a
+// worker-local view so ported code from kernel.cu (which uses threadIdx.x
+// starting at 0) works without per-line rewrites.
+// =============================================================================
+
+constexpr int TG_NUM_WORKER_THREADS = TG_WORKER_WARPS * TG_WARP_SIZE;  // 224
+
+__device__ __forceinline__ int tg_wtid() { return threadIdx.x - TG_WARP_SIZE; }
+__device__ __forceinline__ int tg_wwarp() { return tg_wtid() / TG_WARP_SIZE; }
+__device__ __forceinline__ int tg_wlane() { return tg_wtid() % TG_WARP_SIZE; }
+
+// =============================================================================
+// Math helpers — ported from kernel.cu:155-207 (identical logic, tg_ prefix).
+// =============================================================================
+
+__device__ __forceinline__ float tg_warp_reduce_sum(float val) {
+#pragma unroll
+  for (int offset = TG_WARP_SIZE / 2; offset > 0; offset /= 2) {
+    val += __shfl_xor_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+constexpr float TG_LOG2E = 1.44269504088896340736f;
+
+__device__ __forceinline__ float tg_exp2(float x) {
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float tg_rcp(float x) {
+  float y;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float tg_fast_exp(float x) {
+  return tg_exp2(x * TG_LOG2E);
+}
+
+__device__ __forceinline__ float tg_silu(float x) {
+  return x * tg_rcp(1.0f + tg_fast_exp(-x));
+}
+
+// PyTorch's BF16 path rounds at each tensor boundary. Keep accumulators in
+// FP32 but model the BF16 store/load boundary before the next op.
+__device__ __forceinline__ float tg_round_bf16(float x) {
+  return __bfloat162float(__float2bfloat16(x));
+}
+
+// 128-bit L1-bypassing weight load (8 bf16 elements per call).
+__device__ __forceinline__ uint4 tg_load_weight_u4(const uint4 *ptr) {
+  uint4 out;
+  asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w)
+               : "l"(ptr));
+  return out;
+}
+
+// =============================================================================
+// Weight accessor — returns the per-layer weight pointer for a given
+// TgLayerWeightIdx. The layer_weights array is [num_layers * TG_LW_COUNT]
+// uint64_t pointers.
+// =============================================================================
+
+__device__ __forceinline__ const __nv_bfloat16* tg_layer_weight(
+    const void* const* layer_weights, int layer, int weight_idx) {
+  return reinterpret_cast<const __nv_bfloat16*>(
+      layer_weights[layer * tg::TG_LW_COUNT + weight_idx]);
+}
+
+// =============================================================================
+// Device-side globals wrapper (the kernel reads TgLaunchDesc through this).
+// TgGlobals holds typed pointers derived from the uint64_t fields, so op bodies
+// don't need to reinterpret_cast everywhere.
+// =============================================================================
+
+struct TgGlobals {
+  const int* inst_buf;            // [num_sms, max_inst, TG_INST_WIDTH]
+  const int* num_inst_per_sm;     // [num_sms]
+  int max_inst;
+  int num_sms;
+
+  // weights
+  const void* const* layer_weights;  // [num_layers * TG_LW_COUNT] -> ptr per weight
+  const __nv_bfloat16* embed_weight;
+  const __nv_bfloat16* final_norm_weight;
+  const __nv_bfloat16* cos_table;
+  const __nv_bfloat16* sin_table;
+
+  // KV cache
+  __nv_bfloat16* k_cache;
+  __nv_bfloat16* v_cache;
+  const int* page_table;
+  const int* cache_seqlens;
+  const int* row_active;
+  int num_phys_pages;
+  int max_pages_per_seq;
+  int page_block_size;
+  int64_t kv_layer_stride;
+
+  // scratch — intermediates are float (matching kernel.cu's g_activations etc.)
+  // x_resid is the only bf16 scratch (layer boundary, matching hidden_buffer).
+  float* norm_out;          // [BS, hidden]    — RMSNorm output (QKV/FFN input)
+  float* q_out;             // [BS, q_size]    — Q projection output
+  float* k_out;             // [BS, kv_size]   — K projection output
+  float* v_out;             // [BS, kv_size]   — V projection output
+  float* attn_out;          // [BS, hidden]    — attention output
+  float* o_proj_out;        // [BS, hidden]    — O projection output
+  float* x_attn;            // [BS, hidden]    — residual after attention
+  float* post_attn_norm;    // [BS, hidden]    — post-attn RMSNorm output
+  float* silu_out;          // [BS, intermediate] — SiLU(gate)*up output
+  float* ffn_down_out;      // [BS, hidden]    — FFN down output
+  float* up_out;            // [16, intermediate] — temp up-projection output
+  float* x_ffn;             // [BS, hidden]    — residual after FFN (= x_resid next)
+  __nv_bfloat16* x_resid;   // [BS, hidden]    — layer input (bf16, layer boundary)
+  float* lm_logits;         // [BS, vocab]     — LM head output
+  float* o_partial;         // [BS, hkv, max_splits, hidden] — split attention partials
+  float* lse_partial;       // [BS, hkv, max_splits]         — split attention LSE
+
+  // bars
+  uint32_t* bar_qkv;
+  uint32_t* bar_attn;
+  uint32_t* bar_oproj;
+  uint32_t* bar_silu;
+  uint32_t* bar_ffn_down;
+  uint32_t* bar_layer;
+  uint32_t* bar_combine;
+
+  // geometry
+  int num_layers;
+  int BS;
+  int hidden;
+  int intermediate;
+  int q_size;
+  int kv_size;
+  int num_q_heads;
+  int num_kv_heads;
+  int head_dim;
+  int vocab_size;
+  int oproj_splits;
+  int down_splits;
+  int max_attn_splits;
+};
+
+__device__ __forceinline__ TgGlobals tg_make_globals(const tg::TgLaunchDesc& d) {
+  TgGlobals g;
+  g.inst_buf = reinterpret_cast<const int*>(d.inst_buf);
+  g.num_inst_per_sm = reinterpret_cast<const int*>(d.num_inst_per_sm);
+  g.max_inst = d.max_inst;
+  g.num_sms = d.num_sms;
+
+  g.layer_weights = reinterpret_cast<const void* const*>(d.layer_weights);
+  g.embed_weight = reinterpret_cast<const __nv_bfloat16*>(d.embed_weight);
+  g.final_norm_weight =
+      reinterpret_cast<const __nv_bfloat16*>(d.final_norm_weight);
+  g.cos_table = reinterpret_cast<const __nv_bfloat16*>(d.cos_table);
+  g.sin_table = reinterpret_cast<const __nv_bfloat16*>(d.sin_table);
+
+  g.k_cache = reinterpret_cast<__nv_bfloat16*>(d.k_cache);
+  g.v_cache = reinterpret_cast<__nv_bfloat16*>(d.v_cache);
+  g.page_table = reinterpret_cast<const int*>(d.page_table);
+  g.cache_seqlens = reinterpret_cast<const int*>(d.cache_seqlens);
+  g.row_active = reinterpret_cast<const int*>(d.row_active);
+  g.num_phys_pages = d.num_phys_pages;
+  g.max_pages_per_seq = d.max_pages_per_seq;
+  g.page_block_size = d.page_block_size;
+  g.kv_layer_stride = d.kv_layer_stride;
+
+  g.norm_out = reinterpret_cast<float*>(d.norm_out);
+  g.q_out = reinterpret_cast<float*>(d.q_out);
+  g.k_out = reinterpret_cast<float*>(d.k_out);
+  g.v_out = reinterpret_cast<float*>(d.v_out);
+  g.attn_out = reinterpret_cast<float*>(d.attn_out);
+  g.o_proj_out = reinterpret_cast<float*>(d.o_proj_out);
+  g.x_attn = reinterpret_cast<float*>(d.x_attn);
+  g.post_attn_norm = reinterpret_cast<float*>(d.post_attn_norm);
+  g.silu_out = reinterpret_cast<float*>(d.silu_out);
+  g.ffn_down_out = reinterpret_cast<float*>(d.ffn_down_out);
+  g.up_out = reinterpret_cast<float*>(d.up_out);
+  g.x_ffn = reinterpret_cast<float*>(d.x_ffn);
+  g.x_resid = reinterpret_cast<__nv_bfloat16*>(d.x_resid);
+  g.lm_logits = reinterpret_cast<float*>(d.lm_logits);
+  g.o_partial = reinterpret_cast<float*>(d.o_partial);
+  g.lse_partial = reinterpret_cast<float*>(d.lse_partial);
+
+  g.bar_qkv = reinterpret_cast<uint32_t*>(d.bars.bar_qkv);
+  g.bar_attn = reinterpret_cast<uint32_t*>(d.bars.bar_attn);
+  g.bar_oproj = reinterpret_cast<uint32_t*>(d.bars.bar_oproj);
+  g.bar_silu = reinterpret_cast<uint32_t*>(d.bars.bar_silu);
+  g.bar_ffn_down = reinterpret_cast<uint32_t*>(d.bars.bar_ffn_down);
+  g.bar_layer = reinterpret_cast<uint32_t*>(d.bars.bar_layer);
+  g.bar_combine = reinterpret_cast<uint32_t*>(d.bars.bar_combine);
+
+  g.num_layers = d.num_layers;
+  g.BS = d.BS;
+  g.hidden = d.hidden;
+  g.intermediate = d.intermediate;
+  g.q_size = d.q_size;
+  g.kv_size = d.kv_size;
+  g.num_q_heads = d.num_q_heads;
+  g.num_kv_heads = d.num_kv_heads;
+  g.head_dim = d.head_dim;
+  g.vocab_size = d.vocab_size;
+  g.oproj_splits = d.oproj_splits;
+  g.down_splits = d.down_splits;
+  g.max_attn_splits = d.max_attn_splits;
+  return g;
+}
+
+// =============================================================================
+// KV cache offset (paged) — adapted from kernel.cu:360-376.
+// =============================================================================
+
+__device__ __forceinline__ int64_t tg_kv_offset(int position, int kv_head,
+                                                int head_dim, int kv_size,
+                                                int block_size,
+                                                const int* block_table) {
+  int logical_block = position / block_size;
+  int block_offset = position % block_size;
+  int physical_block = block_table[logical_block];
+  return (int64_t)physical_block * block_size * kv_size +
+         (int64_t)block_offset * kv_size + (int64_t)kv_head * head_dim;
+}
+
+// =============================================================================
+// RMSNorm — ported from kernel.cu:228-283, adapted for 7 worker warps.
+//
+// Computes: out[i] = round_bf16(round_bf16(input[i] * rstd) * weight[i])
+// where rstd = rsqrt(sum(input[i]^2) / hidden + eps).
+//
+// `smem` must be at least `hidden` floats (stages the input + normalized output).
+// `smem_reduce` must be at least TG_WORKER_WARPS floats (block reduce).
+// After return, `smem` contains the normalized output (float, already BF16-rounded).
+// =============================================================================
+
+// Variant A: bf16 input (for layer input from x_resid)
+__device__ __forceinline__ void tg_rmsnorm(
+    float* __restrict__ smem, float* __restrict__ smem_reduce,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    int hidden) {
+  int wtid = tg_wtid();
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+
+  float local_sum_sq = 0.0f;
+  for (int i = wtid; i < hidden; i += TG_NUM_WORKER_THREADS * 2) {
+    float v0 = __bfloat162float(__ldg(input + i));
+    smem[i] = v0;
+    local_sum_sq += v0 * v0;
+    int i1 = i + TG_NUM_WORKER_THREADS;
+    if (i1 < hidden) {
+      float v1 = __bfloat162float(__ldg(input + i1));
+      smem[i1] = v1;
+      local_sum_sq += v1 * v1;
+    }
+  }
+
+  local_sum_sq = tg_warp_reduce_sum(local_sum_sq);
+  if (wlane == 0) smem_reduce[wwarp] = local_sum_sq;
+  tg_worker_sync_inner();
+
+  if (wwarp == 0) {
+    float sum = (wlane < TG_WORKER_WARPS) ? smem_reduce[wlane] : 0.0f;
+    sum = tg_warp_reduce_sum(sum);
+    if (wlane == 0)
+      smem_reduce[0] = rsqrtf(sum / float(hidden) + TG_RMS_EPS);
+  }
+  tg_worker_sync_inner();
+
+  float rstd = smem_reduce[0];
+
+  for (int i = wtid; i < hidden; i += TG_NUM_WORKER_THREADS * 2) {
+    float w0 = __bfloat162float(__ldg(norm_weight + i));
+    smem[i] = tg_round_bf16(tg_round_bf16(smem[i] * rstd) * w0);
+    int i1 = i + TG_NUM_WORKER_THREADS;
+    if (i1 < hidden) {
+      float w1 = __bfloat162float(__ldg(norm_weight + i1));
+      smem[i1] = tg_round_bf16(tg_round_bf16(smem[i1] * rstd) * w1);
+    }
+  }
+  tg_worker_sync_inner();
+}
+
+// Variant B: float input (for intermediate activations like x_attn, x_ffn)
+// Reads from `input` (float*), writes normalized output to `smem` (float*).
+__device__ __forceinline__ void tg_rmsnorm_f(
+    float* __restrict__ smem, float* __restrict__ smem_reduce,
+    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    int hidden) {
+  int wtid = tg_wtid();
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+
+  float local_sum_sq = 0.0f;
+  for (int i = wtid; i < hidden; i += TG_NUM_WORKER_THREADS * 2) {
+    float v0 = input[i];
+    smem[i] = v0;
+    local_sum_sq += v0 * v0;
+    int i1 = i + TG_NUM_WORKER_THREADS;
+    if (i1 < hidden) {
+      float v1 = input[i1];
+      smem[i1] = v1;
+      local_sum_sq += v1 * v1;
+    }
+  }
+
+  local_sum_sq = tg_warp_reduce_sum(local_sum_sq);
+  if (wlane == 0) smem_reduce[wwarp] = local_sum_sq;
+  tg_worker_sync_inner();
+
+  if (wwarp == 0) {
+    float sum = (wlane < TG_WORKER_WARPS) ? smem_reduce[wlane] : 0.0f;
+    sum = tg_warp_reduce_sum(sum);
+    if (wlane == 0)
+      smem_reduce[0] = rsqrtf(sum / float(hidden) + TG_RMS_EPS);
+  }
+  tg_worker_sync_inner();
+
+  float rstd = smem_reduce[0];
+
+  for (int i = wtid; i < hidden; i += TG_NUM_WORKER_THREADS * 2) {
+    float w0 = __bfloat162float(__ldg(norm_weight + i));
+    smem[i] = tg_round_bf16(tg_round_bf16(smem[i] * rstd) * w0);
+    int i1 = i + TG_NUM_WORKER_THREADS;
+    if (i1 < hidden) {
+      float w1 = __bfloat162float(__ldg(norm_weight + i1));
+      smem[i1] = tg_round_bf16(tg_round_bf16(smem[i1] * rstd) * w1);
+    }
+  }
+  tg_worker_sync_inner();
+}
+
+// =============================================================================
+// WMMA GEMM — ported from kernel.cu:962-1012, adapted for 7 worker warps.
+//
+// Computes C[M,N] = H[M,K] @ W[N,K]^T (W is stored row-major as [N,K]).
+// Each warp handles one 16x16 tile. `s_a` is shared memory for the A fragment
+// (float→bf16 staging); all warps share the same s_a because for M≤16
+// (decode BS≤8), tiles_M=1 and all warps use the same A row.
+//
+// STRIDE_K: row stride of H (e.g. HIDDEN for QKV input).
+// STRIDE_N: row stride of C (e.g. Q_SIZE for Q output).
+// =============================================================================
+
+using namespace nvcuda;
+constexpr int TG_WMMA_TILE = 16;
+
+template <int STRIDE_K, int STRIDE_N>
+__device__ __forceinline__ void tg_wmma_gemm(
+    const float* __restrict__ H,
+    const __nv_bfloat16* __restrict__ W,
+    float* __restrict__ C, int M, int N, int K,
+    int global_warp, int num_warps,
+    __nv_bfloat16* s_a) {
+  const int tiles_M = (M + TG_WMMA_TILE - 1) / TG_WMMA_TILE;
+  const int tiles_N = (N + TG_WMMA_TILE - 1) / TG_WMMA_TILE;
+  const int total_tiles = tiles_M * tiles_N;
+  // CRITICAL: all warps must execute the SAME number of bar.sync 1 calls.
+  // Compute the max iterations any warp will do, and have all warps loop
+  // that many times (idle warps skip work but still hit the syncs).
+  const int my_max_tiles = (total_tiles + num_warps - 1) / num_warps;
+  int wtid = tg_wtid();
+
+  for (int t = 0; t < my_max_tiles; ++t) {
+    int tile = global_warp + t * num_warps;
+    bool active = (tile < total_tiles);
+    int tr = active ? (tile / tiles_N) : 0;
+    int tc = active ? (tile % tiles_N) : 0;
+    int m0 = tr * TG_WMMA_TILE;
+    int n0 = tc * TG_WMMA_TILE;
+
+    wmma::fragment<wmma::accumulator, TG_WMMA_TILE, TG_WMMA_TILE,
+                   TG_WMMA_TILE, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (int k = 0; k < K; k += TG_WMMA_TILE) {
+      // Fill s_a with A fragment (float -> bf16). All worker threads cooperate.
+      for (int idx = wtid; idx < TG_WMMA_TILE * TG_WMMA_TILE;
+           idx += TG_NUM_WORKER_THREADS) {
+        int mi = idx / TG_WMMA_TILE, ki = idx % TG_WMMA_TILE;
+        float v = 0.0f;
+        if (active && m0 + mi < M && k + ki < K)
+          v = H[(m0 + mi) * STRIDE_K + k + ki];
+        s_a[idx] = __float2bfloat16(v);
+      }
+      tg_worker_sync_inner();
+
+      if (active) {
+        wmma::fragment<wmma::matrix_a, TG_WMMA_TILE, TG_WMMA_TILE,
+                       TG_WMMA_TILE, __nv_bfloat16, wmma::row_major> a;
+        wmma::load_matrix_sync(a, s_a, TG_WMMA_TILE);
+
+        wmma::fragment<wmma::matrix_b, TG_WMMA_TILE, TG_WMMA_TILE,
+                       TG_WMMA_TILE, __nv_bfloat16, wmma::col_major> b;
+        wmma::load_matrix_sync(b, W + n0 * K + k, K);
+
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      // Ensure all warps have finished reading s_a before the next k iteration
+      // overwrites it.  All warps must hit this sync, even idle ones.
+      tg_worker_sync_inner();
+    }
+    if (active) {
+      wmma::store_matrix_sync(C + m0 * STRIDE_N + n0, acc, STRIDE_N,
+                              wmma::mem_row_major);
+    }
+  }
+}
+
+// =============================================================================
+// RoPE (rotate_half / GPT-NeoX style) — ported from kernel.cu:434-476.
+//
+// Rotates a head_dim-length vector in-place (or to a separate output):
+//   first half (i < hd/2):  out[i] = x[i]*cos[i] - x[i+hd/2]*sin[i]
+//   second half (i >= hd/2): out[i] = x[i-hd/2]*sin[i] + x[i]*cos[i]
+//
+// Each lane owns 4 contiguous elements. The mirror partner is in a possibly
+// different lane, fetched via __shfl_sync. cos/sin tables are
+// [max_seq_len, head_dim] (NOT head_dim*2 — the .repeat(1,2) in model.py
+// doubles the 64-wide freqs to 128-wide = HEAD_DIM).
+// =============================================================================
+
+__device__ __forceinline__ void tg_rope(
+    float* val,  // [head_dim] — rotated in-place
+    const __nv_bfloat16* cos_pos, const __nv_bfloat16* sin_pos,
+    int head_dim) {
+  int lane = tg_wlane();
+  float local[4];
+  #pragma unroll
+  for (int i = lane * 4, j = 0; i < head_dim; i += TG_WARP_SIZE, j++)
+    local[j] = val[i];
+
+  #pragma unroll
+  for (int i = lane * 4, j = 0; i < head_dim; i += TG_WARP_SIZE, j++) {
+    float cv = __bfloat162float(__ldg(cos_pos + i));
+    float sv = __bfloat162float(__ldg(sin_pos + i));
+    int po = (i < head_dim / 2) ? head_dim / 2 : -head_dim / 2;
+    int pi = i + po;
+    int pj = pi / TG_WARP_SIZE;
+    float pv = __shfl_sync(0xffffffff, local[pj], pi % TG_WARP_SIZE);
+    val[i] = (i < head_dim / 2) ? local[j] * cv - pv * sv
+                                 : pv * sv + local[j] * cv;
+  }
+}
+
+// =============================================================================
+// Phase 1 op bodies. Each does: dependency wait → compute → dependency arrive.
+// Shared memory is declared in the kernel entry and passed via TgGlobals or
+// directly. The dispatch loop calls tg_worker_sync() once after each op body
+// to keep the bar.sync 1 arrival count aligned.
+// =============================================================================
+
+// QKV_PROJ: RMSNorm(x_resid) → WMMA GEMM for one tile_n of Q/K/V.
+//
+// Instruction layout:
+//   inst[1]=layer, inst[2]=tile_n, inst[3]=gemm_idx(0=Q,1=K,2=V),
+//   inst[4]=needs_rope, inst[5]=wait_bar_idx(bar_layer), inst[6]=wait_target,
+//   inst[7]=produce_bar_idx(bar_qkv), inst[8]=batch_row
+//
+// For Phase 1 (BS=1), batch_row is always 0. The RMSNorm is computed
+// redundantly by every QKV tile instruction (cheap relative to GEMM).
+// The normalized vector is stored in shared memory for the WMMA GEMM.
+
+// Shared memory layout for QKV / GEMM ops (declared in kernel entry):
+//   s_a[256]       — WMMA A fragment staging (512 bytes)
+//   s_norm[hidden] — RMSNorm input/output (4 KiB)
+//   s_reduce[wwarps] — block reduce (28 bytes)
+
+__device__ __forceinline__ void tg_qkv_proj_op(
+    const int* inst, TgGlobals& g, int bid,
+    __nv_bfloat16* s_a, float* s_norm, float* s_reduce) {
+  int layer = inst[1];
+  int tile_n = inst[2];
+  int gemm_idx = inst[3];
+
+  // Wait for previous layer's RMSNorm (bar_layer)
+  tg_wait(g.bar_layer, inst[5], (uint32_t)inst[6]);
+
+  // RMSNorm: x_resid → s_norm (normalized, float, BF16-rounded)
+  // For BS>1, normalize each batch row independently into s_norm[batch*hidden].
+  const __nv_bfloat16* norm_w =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_INPUT_LAYERNORM);
+  for (int batch = 0; batch < g.BS; batch++) {
+    const __nv_bfloat16* input = g.x_resid + batch * g.hidden;
+    tg_rmsnorm(s_norm + batch * g.hidden, s_reduce, input, norm_w, g.hidden);
+  }
+
+  // Select weight and output buffer based on gemm_idx
+  int weight_idx;
+  float* output;
+  if (gemm_idx == 0) {
+    weight_idx = tg::TG_LW_Q_PROJ;
+    output = g.q_out;
+  } else if (gemm_idx == 1) {
+    weight_idx = tg::TG_LW_K_PROJ;
+    output = g.k_out;
+  } else {
+    weight_idx = tg::TG_LW_V_PROJ;
+    output = g.v_out;
+  }
+  const __nv_bfloat16* weight =
+      tg_layer_weight(g.layer_weights, layer, weight_idx);
+
+  // WMMA GEMM for this one tile_n (16 columns).
+  // M=BS (all batch rows), K=hidden, N=16.
+  int wwarp = tg_wwarp();
+  int tile_offset = tile_n * TG_WMMA_TILE;
+  if (gemm_idx == 0) {
+    // Q: STRIDE_K=hidden, STRIDE_N=q_size
+    tg_wmma_gemm<TG_HIDDEN, TG_Q_SIZE>(
+        s_norm, weight + tile_offset * g.hidden,
+        output + tile_offset,
+        g.BS, TG_WMMA_TILE, g.hidden,
+        wwarp, TG_WORKER_WARPS, s_a);
+  } else {
+    // K or V: STRIDE_K=hidden, STRIDE_N=kv_size
+    tg_wmma_gemm<TG_HIDDEN, TG_KV_SIZE>(
+        s_norm, weight + tile_offset * g.hidden,
+        output + tile_offset,
+        g.BS, TG_WMMA_TILE, g.hidden,
+        wwarp, TG_WORKER_WARPS, s_a);
+  }
+
+  tg_arrive(g.bar_qkv, inst[7]);
+}
+
+// ATTN_DECODE: QK-norm + RoPE + KV cache write + scalar flash attention.
+//
+// Instruction layout:
+//   inst[1]=layer, inst[2]=batch_idx, inst[3]=kv_head_idx,
+//   inst[4]=split_idx, inst[5]=num_splits, inst[6]=window_size,
+//   inst[7]=wait_bar_idx(bar_qkv), inst[8]=wait_target,
+//   inst[9]=produce_bar_idx (bit 31 = combine flag)
+//
+// For Phase 1 with attn_splits=1, there's one split covering all positions.
+// Each instruction handles one (batch, kv_head) pair. The 7 worker warps
+// cooperate on the scalar flash attention over the position range.
+//
+// The op body:
+// 1. Wait for QKV tiles (bar_qkv for this kv_head)
+// 2. QK-norm + RoPE for the Q heads in this kv_head's group (2 Q heads per kv_head)
+// 3. K-norm + RoPE + KV cache write
+// 4. V cache write
+// 5. Scalar flash attention (all Q heads for this kv_head)
+// 6. Signal bar_attn (or bar_combine if split > 1)
+
+__device__ __forceinline__ void tg_attn_decode_op(
+    const int* inst, TgGlobals& g, int bid,
+    float* s_max, float* s_sum, float* s_out_acc) {
+  int layer = inst[1];
+  int batch = inst[2];
+  int kv_head = inst[3];
+  int split_idx = inst[4];
+  int num_splits = inst[5];
+  // inst[6] = window_size (unused for Phase 1)
+
+  // Wait for QKV tiles for this kv_head
+  tg_wait(g.bar_qkv, inst[7], (uint32_t)inst[8]);
+
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+  int wtid = tg_wtid();
+
+  // KV cache layer base
+  __nv_bfloat16* k_cache_layer = g.k_cache + (int64_t)layer * g.kv_layer_stride;
+  __nv_bfloat16* v_cache_layer = g.v_cache + (int64_t)layer * g.kv_layer_stride;
+
+  // Position and block table for this batch row
+  int cache_len = g.cache_seqlens[batch] + 1;  // +1 for the new token
+  int position = cache_len - 1;  // current position (0-indexed)
+  const int* block_table = g.page_table + batch * g.max_pages_per_seq;
+  int block_size = g.page_block_size;
+
+  // cos/sin tables for this position
+  const __nv_bfloat16* cos_pos = g.cos_table + position * g.head_dim;
+  const __nv_bfloat16* sin_pos = g.sin_table + position * g.head_dim;
+
+  // QK-norm weights
+  const __nv_bfloat16* q_norm_w =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_Q_NORM);
+  const __nv_bfloat16* k_norm_w =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_K_NORM);
+
+  // Q/K/V pointers for this batch row
+  float* q_base = g.q_out + batch * g.q_size;
+  float* k_base = g.k_out + batch * g.kv_size;
+  float* v_base = g.v_out + batch * g.kv_size;
+
+  // GQA: 2 Q heads per kv_head (NUM_Q_HEADS=16, NUM_KV_HEADS=8)
+  int group_size = g.num_q_heads / g.num_kv_heads;  // 2
+  int q_head_start = kv_head * group_size;
+
+  // --- Phase A: K-norm + RoPE + KV cache write (one warp, warp 0 of workers) ---
+  // K and V are written to the paged cache at the current position.
+  if (wwarp == 0) {
+    float* k_head = k_base + kv_head * g.head_dim;
+    float* v_head = v_base + kv_head * g.head_dim;
+
+    // K-norm (RMSNorm over head_dim=128)
+    float ss = 0.0f;
+    for (int i = wlane; i < g.head_dim; i += TG_WARP_SIZE)
+      ss += k_head[i] * k_head[i];
+    ss = tg_warp_reduce_sum(ss);
+    float sc = rsqrtf(ss / float(g.head_dim) + TG_RMS_EPS);
+    sc = __shfl_sync(0xffffffff, sc, 0);
+
+    // Apply K-norm weight + RoPE
+    float kl[4];
+    #pragma unroll
+    for (int i = wlane, j = 0; i < g.head_dim; i += TG_WARP_SIZE, j++)
+      kl[j] = tg_round_bf16(
+          tg_round_bf16(k_head[i] * sc) *
+          __bfloat162float(__ldg(k_norm_w + i)));
+
+    // KV cache pointers
+    int64_t kv_off = tg_kv_offset(position, kv_head, g.head_dim,
+                                  g.kv_size, block_size, block_table);
+    __nv_bfloat16* kc = k_cache_layer + kv_off;
+    __nv_bfloat16* vc = v_cache_layer + kv_off;
+
+    #pragma unroll
+    for (int i = wlane, j = 0; i < g.head_dim; i += TG_WARP_SIZE, j++) {
+      float cv = __bfloat162float(__ldg(cos_pos + i));
+      float sv = __bfloat162float(__ldg(sin_pos + i));
+      int po = (i < g.head_dim / 2) ? g.head_dim / 2 : -g.head_dim / 2;
+      int pi = i + po, pj = pi / TG_WARP_SIZE;
+      float pv = __shfl_sync(0xffffffff, kl[pj], pi % TG_WARP_SIZE);
+      float kf = (i < g.head_dim / 2) ? kl[j] * cv - pv * sv
+                                      : pv * sv + kl[j] * cv;
+      kc[i] = __float2bfloat16(kf);
+      vc[i] = __float2bfloat16(v_head[i]);
+    }
+  }
+
+  // --- Phase A2: Q-norm + RoPE for Q heads in this kv_head's group ---
+  // Each worker warp handles one Q head (warp 0 → q_head_start, warp 1 → q_head_start+1)
+  for (int qh_offset = wwarp; qh_offset < group_size; qh_offset += TG_WORKER_WARPS) {
+    int qh = q_head_start + qh_offset;
+    float* qh_ptr = q_base + qh * g.head_dim;
+
+    // Q-norm (RMSNorm over head_dim=128)
+    float ss = 0.0f;
+    for (int i = wlane; i < g.head_dim; i += TG_WARP_SIZE)
+      ss += qh_ptr[i] * qh_ptr[i];
+    ss = tg_warp_reduce_sum(ss);
+    float sc = rsqrtf(ss / float(g.head_dim) + TG_RMS_EPS);
+    sc = __shfl_sync(0xffffffff, sc, 0);
+
+    float ql[4];
+    #pragma unroll
+    for (int i = wlane, j = 0; i < g.head_dim; i += TG_WARP_SIZE, j++)
+      ql[j] = tg_round_bf16(
+          tg_round_bf16(qh_ptr[i] * sc) *
+          __bfloat162float(__ldg(q_norm_w + i)));
+
+    #pragma unroll
+    for (int i = wlane, j = 0; i < g.head_dim; i += TG_WARP_SIZE, j++) {
+      float cv = __bfloat162float(__ldg(cos_pos + i));
+      float sv = __bfloat162float(__ldg(sin_pos + i));
+      int po = (i < g.head_dim / 2) ? g.head_dim / 2 : -g.head_dim / 2;
+      int pi = i + po, pj = pi / TG_WARP_SIZE;
+      float pv = __shfl_sync(0xffffffff, ql[pj], pi % TG_WARP_SIZE);
+      qh_ptr[i] = tg_round_bf16(
+          (i < g.head_dim / 2) ? ql[j] * cv - pv * sv
+                               : pv * sv + ql[j] * cv);
+    }
+  }
+
+  // Sync: ensure KV cache write (warp 0) and Q-norm (all warps) are done
+  tg_worker_sync_inner();
+
+  // --- Phase D: Scalar flash attention ---
+  // Each Q head is processed by all worker warps (striding over positions).
+  float attn_scale = 1.0f / sqrtf((float)g.head_dim);
+
+  for (int qh_offset = 0; qh_offset < group_size; qh_offset++) {
+    int qh = q_head_start + qh_offset;
+    const float* q_head = q_base + qh * g.head_dim;
+    float* out_head = g.attn_out + batch * g.q_size + qh * g.head_dim;
+
+    // Each lane owns 4 of 128 head dims
+    int q_idx = wlane * 4;
+    float q_local[4];
+    q_local[0] = q_head[q_idx + 0];
+    q_local[1] = q_head[q_idx + 1];
+    q_local[2] = q_head[q_idx + 2];
+    q_local[3] = q_head[q_idx + 3];
+
+    float max_score = -INFINITY;
+    float sum_exp = 0.0f;
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Determine position range for this split
+    int pos_start, pos_end;
+    if (num_splits <= 1) {
+      pos_start = 0;
+      pos_end = cache_len;
+    } else {
+      int per_split = (cache_len + num_splits - 1) / num_splits;
+      pos_start = split_idx * per_split;
+      pos_end = min(pos_start + per_split, cache_len);
+    }
+
+    // Each warp processes a subset of positions
+    for (int pos = pos_start + wwarp; pos < pos_end; pos += TG_WORKER_WARPS) {
+      int64_t kv_off = tg_kv_offset(pos, kv_head, g.head_dim,
+                                    g.kv_size, block_size, block_table);
+      const __nv_bfloat16* k_pos = k_cache_layer + kv_off;
+      const __nv_bfloat16* v_pos = v_cache_layer + kv_off;
+
+      // Q @ K^T (scalar dot product over 128 dims, 4 per lane)
+      float score = 0.0f;
+      uint2 k_u2 = __ldg(reinterpret_cast<const uint2*>(k_pos + q_idx));
+      __nv_bfloat16* k_ptr = reinterpret_cast<__nv_bfloat16*>(&k_u2);
+      score += q_local[0] * __bfloat162float(k_ptr[0]) +
+               q_local[1] * __bfloat162float(k_ptr[1]) +
+               q_local[2] * __bfloat162float(k_ptr[2]) +
+               q_local[3] * __bfloat162float(k_ptr[3]);
+      score = tg_warp_reduce_sum(score) * attn_scale;
+
+      // Online softmax
+      float old_max = max_score;
+      max_score = fmaxf(max_score, score);
+      float exp_diff = tg_fast_exp(old_max - max_score);
+      sum_exp = sum_exp * exp_diff + tg_fast_exp(score - max_score);
+
+      // P @ V
+      float weight = tg_fast_exp(score - max_score);
+      uint2 v_u2 = __ldg(reinterpret_cast<const uint2*>(v_pos + q_idx));
+      __nv_bfloat16* v_ptr = reinterpret_cast<__nv_bfloat16*>(&v_u2);
+      out_acc[0] = out_acc[0] * exp_diff + weight * __bfloat162float(v_ptr[0]);
+      out_acc[1] = out_acc[1] * exp_diff + weight * __bfloat162float(v_ptr[1]);
+      out_acc[2] = out_acc[2] * exp_diff + weight * __bfloat162float(v_ptr[2]);
+      out_acc[3] = out_acc[3] * exp_diff + weight * __bfloat162float(v_ptr[3]);
+    }
+
+    // --- Phase E: Cross-warp online-softmax combine ---
+    if (wlane == 0) {
+      s_max[wwarp] = max_score;
+      s_sum[wwarp] = sum_exp;
+    }
+    int out_base = wlane * 4;
+    s_out_acc[wwarp * g.head_dim + out_base + 0] = out_acc[0];
+    s_out_acc[wwarp * g.head_dim + out_base + 1] = out_acc[1];
+    s_out_acc[wwarp * g.head_dim + out_base + 2] = out_acc[2];
+    s_out_acc[wwarp * g.head_dim + out_base + 3] = out_acc[3];
+    tg_worker_sync_inner();
+
+    if (wwarp == 0) {
+      float global_max = s_max[0];
+      for (int w = 1; w < TG_WORKER_WARPS; w++) {
+        if (s_max[w] > -INFINITY)
+          global_max = fmaxf(global_max, s_max[w]);
+      }
+
+      float total_sum_exp = 0.0f;
+      float final_out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      for (int w = 0; w < TG_WORKER_WARPS; w++) {
+        if (s_max[w] > -INFINITY) {
+          float scale = tg_fast_exp(s_max[w] - global_max);
+          total_sum_exp += s_sum[w] * scale;
+          final_out[0] += s_out_acc[w * g.head_dim + out_base + 0] * scale;
+          final_out[1] += s_out_acc[w * g.head_dim + out_base + 1] * scale;
+          final_out[2] += s_out_acc[w * g.head_dim + out_base + 2] * scale;
+          final_out[3] += s_out_acc[w * g.head_dim + out_base + 3] * scale;
+        }
+      }
+
+      out_head[out_base + 0] = tg_round_bf16(final_out[0] / total_sum_exp);
+      out_head[out_base + 1] = tg_round_bf16(final_out[1] / total_sum_exp);
+      out_head[out_base + 2] = tg_round_bf16(final_out[2] / total_sum_exp);
+      out_head[out_base + 3] = tg_round_bf16(final_out[3] / total_sum_exp);
+    }
+    tg_worker_sync_inner();
+  }
+
+  // Signal produce bar (bar_attn or bar_combine, determined by bit 31 of inst[9])
+  uint32_t produce_idx = (uint32_t)inst[9] & ~(1u << 31);
+  bool is_combine = (inst[9] >> 31) & 1;
+  if (is_combine) {
+    // Store partial results for combine
+    // o_partial: [BS, hkv, max_splits, hidden]
+    // lse_partial: [BS, hkv, max_splits]
+    // For Phase 1 with splits=1, this path is not taken.
+    tg_arrive(g.bar_combine, produce_idx);
+  } else {
+    tg_arrive(g.bar_attn, produce_idx);
+  }
+}
+
+// ATTN_COMBINE: combine partial attention outputs from multiple splits.
+// Only used when attn_splits > 1. For Phase 1 (attn_splits=1), this is a no-op.
+
+__device__ __forceinline__ void tg_attn_combine_op(
+    const int* inst, TgGlobals& g, int bid,
+    float* s_max, float* s_sum, float* s_out_acc) {
+  int layer = inst[1];
+  int batch = inst[2];
+  int kv_head = inst[3];
+  int num_splits = inst[4];
+
+  tg_wait(g.bar_combine, inst[5], (uint32_t)inst[6]);
+
+  // For Phase 1 with attn_splits=1, combine is not needed. The combine
+  // instruction is not emitted by the schedule when splits=1.
+  // Phase 2 will implement the LSE-style combine across splits.
+
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+
+  int group_size = g.num_q_heads / g.num_kv_heads;
+  int q_head_start = kv_head * group_size;
+
+  for (int qh_offset = 0; qh_offset < group_size; qh_offset++) {
+    int qh = q_head_start + qh_offset;
+    float* out_head = g.attn_out + batch * g.q_size + qh * g.head_dim;
+
+    // Combine partials from all splits using LSE rescaling
+    // o_partial: [BS, hkv, max_splits, hidden]
+    // lse_partial: [BS, hkv, max_splits]
+    float global_max = -INFINITY;
+    for (int s = 0; s < num_splits; s++) {
+      float lse = g.lse_partial[batch * g.num_kv_heads * g.max_attn_splits +
+                                 kv_head * g.max_attn_splits + s];
+      if (lse > global_max) global_max = lse;
+    }
+
+    float total_weight = 0.0f;
+    float final_out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int out_base = wlane * 4;
+
+    for (int s = 0; s < num_splits; s++) {
+      float lse = g.lse_partial[batch * g.num_kv_heads * g.max_attn_splits +
+                                 kv_head * g.max_attn_splits + s];
+      if (lse <= -INFINITY) continue;
+      float w = tg_fast_exp(lse - global_max);
+      total_weight += w;
+      float* partial = g.o_partial + batch * g.num_kv_heads * g.max_attn_splits * g.hidden +
+                        kv_head * g.max_attn_splits * g.hidden + s * g.hidden;
+      final_out[0] += partial[out_base + 0] * w;
+      final_out[1] += partial[out_base + 1] * w;
+      final_out[2] += partial[out_base + 2] * w;
+      final_out[3] += partial[out_base + 3] * w;
+    }
+
+    if (wwarp == 0) {
+      out_head[out_base + 0] = tg_round_bf16(final_out[0] / total_weight);
+      out_head[out_base + 1] = tg_round_bf16(final_out[1] / total_weight);
+      out_head[out_base + 2] = tg_round_bf16(final_out[2] / total_weight);
+      out_head[out_base + 3] = tg_round_bf16(final_out[3] / total_weight);
+    }
+  }
+
+  tg_arrive(g.bar_attn, inst[7]);
+}
+
+// O_PROJ: WMMA GEMM, attn_out → o_proj_out.
+// Generic GEMM layout: inst[6]=wait_bar_idx, inst[7]=wait_target,
+// inst[8]=produce_bar_idx, inst[9]=num_tiles, inst[10..15]=packed tile IDs.
+
+__device__ __forceinline__ void tg_o_proj_op(
+    const int* inst, TgGlobals& g, int bid,
+    __nv_bfloat16* s_a) {
+  int layer = inst[1];
+  int num_tiles = inst[9];
+
+  tg_wait(g.bar_attn, inst[6], (uint32_t)inst[7]);
+
+  const __nv_bfloat16* weight =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_O_PROJ);
+  int wwarp = tg_wwarp();
+
+  // For each packed tile, compute the 16x16 GEMM
+  for (int t = 0; t < num_tiles; t++) {
+    int packed = inst[10 + t];
+    int tile_m = packed >> 16;
+    int tile_n = packed & 0xFFFF;
+
+    // M = BS (all batch rows), K = q_size, N = 16 (one tile)
+    // weight is [hidden, q_size] row-major; tile's weight starts at
+    // weight + tile_n*16*q_size
+    // output is o_proj_out[batch*hidden + tile_n*16]
+    tg_wmma_gemm<TG_Q_SIZE, TG_HIDDEN>(
+        g.attn_out,  // [BS, q_size]
+        weight + tile_n * TG_WMMA_TILE * TG_Q_SIZE,
+        g.o_proj_out + tile_n * TG_WMMA_TILE,  // [BS, hidden]
+        g.BS,  // M = batch size
+        TG_WMMA_TILE,  // N = 16
+        TG_Q_SIZE,  // K = q_size
+        wwarp, TG_WORKER_WARPS, s_a);
+  }
+
+  tg_arrive(g.bar_oproj, inst[8], (uint32_t)num_tiles);
+}
+
+// FFN_UPGATE_ACT: fused residual add + post-attn RMSNorm + gate/up GEMM + SiLU.
+//
+// Waits on bar_oproj (O_PROJ done). The op body:
+// 1. x_attn = x_resid + o_proj_out (residual add)
+// 2. post_attn_norm = RMSNorm(x_attn) → shared memory
+// 3. gate = post_attn_norm @ gate_weight^T (WMMA GEMM)
+// 4. up = post_attn_norm @ up_weight^T (WMMA GEMM)
+// 5. silu_out = SiLU(gate) * up (elementwise)
+// 6. Store x_attn to scratch (for ADD_RMSNORM to read)
+
+__device__ __forceinline__ void tg_ffn_upgate_op(
+    const int* inst, TgGlobals& g, int bid,
+    __nv_bfloat16* s_a, float* s_norm, float* s_reduce) {
+  int layer = inst[1];
+  int num_tiles = inst[9];
+
+  tg_wait(g.bar_oproj, inst[6], (uint32_t)inst[7]);
+
+  int wwarp = tg_wwarp();
+  int wtid = tg_wtid();
+
+  // Phase 1: residual add + RMSNorm (per batch row, redundantly computed)
+  // For BS=1, there's only one row. For BS>1, each tile instruction does all
+  // rows (since M=BS in the GEMM, all rows are needed).
+  for (int batch = 0; batch < g.BS; batch++) {
+    float* x_attn = g.x_attn + batch * g.hidden;
+    float* o_proj = g.o_proj_out + batch * g.hidden;
+    const __nv_bfloat16* x_res = g.x_resid + batch * g.hidden;
+
+    // Residual add: x_attn = round_bf16(o_proj_out) + x_resid
+    for (int i = wtid; i < g.hidden; i += TG_NUM_WORKER_THREADS) {
+      x_attn[i] = tg_round_bf16(o_proj[i]) + __bfloat162float(x_res[i]);
+    }
+    tg_worker_sync_inner();
+
+    // RMSNorm: x_attn (float) → s_norm[batch*hidden] (normalized, for GEMM input)
+    const __nv_bfloat16* post_norm_w =
+        tg_layer_weight(g.layer_weights, layer, tg::TG_LW_POST_ATTN_LAYERNORM);
+    tg_rmsnorm_f(s_norm + batch * g.hidden, s_reduce, x_attn, post_norm_w, g.hidden);
+  }
+
+  // Phase 2: Gate + Up GEMM
+  const __nv_bfloat16* gate_w =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_GATE_PROJ);
+  const __nv_bfloat16* up_w =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_UP_PROJ);
+
+  for (int t = 0; t < num_tiles; t++) {
+    int packed = inst[10 + t];
+    int tile_n = packed & 0xFFFF;
+
+    // Gate GEMM → silu_out:
+    tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
+        s_norm,
+        gate_w + tile_n * TG_WMMA_TILE * g.hidden,
+        g.silu_out + tile_n * TG_WMMA_TILE,
+        g.BS, TG_WMMA_TILE, g.hidden,
+        wwarp, TG_WORKER_WARPS, s_a);
+    // Up GEMM → up_out:
+    tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
+        s_norm,
+        up_w + tile_n * TG_WMMA_TILE * g.hidden,
+        g.up_out + tile_n * TG_WMMA_TILE,
+        g.BS, TG_WMMA_TILE, g.hidden,
+        wwarp, TG_WORKER_WARPS, s_a);
+  }
+
+  // Phase 3: SiLU(gate) * up (elementwise) — ONLY for this instruction's tiles.
+  // Each instruction packs up to 6 tiles; each tile covers 16 columns of the
+  // intermediate dimension. We must NOT process all 3072 positions, only the
+  // ones written by this instruction's GEMM, otherwise later instructions
+  // re-apply SiLU to positions already processed by earlier ones.
+  // For BS>1, process all batch rows for each tile column.
+  for (int t = 0; t < num_tiles; t++) {
+    int packed = inst[10 + t];
+    int tile_n = packed & 0xFFFF;
+    int offset = tile_n * TG_WMMA_TILE;
+    for (int i = wtid; i < TG_WMMA_TILE * g.BS; i += TG_NUM_WORKER_THREADS) {
+      int col = i % TG_WMMA_TILE;
+      int batch = i / TG_WMMA_TILE;
+      int idx = batch * g.intermediate + offset + col;
+      float gate_val = g.silu_out[idx];
+      float up_val = g.up_out[idx];
+      g.silu_out[idx] = tg_round_bf16(tg_round_bf16(tg_silu(gate_val)) * up_val);
+    }
+  }
+
+  tg_arrive(g.bar_silu, inst[8], (uint32_t)num_tiles);
+}
+
+// FFN_DOWN: WMMA GEMM, silu_out → ffn_down_out.
+
+__device__ __forceinline__ void tg_ffn_down_op(
+    const int* inst, TgGlobals& g, int bid,
+    __nv_bfloat16* s_a) {
+  int layer = inst[1];
+  int num_tiles = inst[9];
+
+  tg_wait(g.bar_silu, inst[6], (uint32_t)inst[7]);
+
+  const __nv_bfloat16* weight =
+      tg_layer_weight(g.layer_weights, layer, tg::TG_LW_DOWN_PROJ);
+  int wwarp = tg_wwarp();
+
+  for (int t = 0; t < num_tiles; t++) {
+    int packed = inst[10 + t];
+    int tile_n = packed & 0xFFFF;
+
+    tg_wmma_gemm<TG_INTERMEDIATE, TG_HIDDEN>(
+        g.silu_out,  // [BS, intermediate]
+        weight + tile_n * TG_WMMA_TILE * g.intermediate,
+        g.ffn_down_out + tile_n * TG_WMMA_TILE,  // [BS, hidden]
+        g.BS, TG_WMMA_TILE, g.intermediate,
+        wwarp, TG_WORKER_WARPS, s_a);
+  }
+
+  tg_arrive(g.bar_ffn_down, inst[8], (uint32_t)num_tiles);
+}
+
+// ADD_RMSNORM: FFN residual + RMSNorm for next layer.
+//
+// Waits on bar_oproj (for x_attn, transitively ready via bar_ffn_down) and
+// bar_ffn_down. The op body:
+// 1. x_ffn = x_attn + ffn_down_out (FFN residual add)
+// 2. norm_out = RMSNorm(x_ffn) → for next layer's QKV GEMM
+// 3. x_resid = x_ffn (bf16, for next layer's input)
+// 4. Signal bar_layer
+
+__device__ __forceinline__ void tg_add_rmsnorm_op(
+    const int* inst, TgGlobals& g, int bid,
+    float* s_norm, float* s_reduce) {
+  int layer = inst[1];
+  int batch = inst[2];
+  int is_final = inst[8];
+
+  // Wait for both attention path (bar_oproj) and FFN path (bar_ffn_down).
+  // bar_oproj is transitively satisfied via bar_silu → bar_ffn_down, but we
+  // keep the wait for correctness (x_attn is stored by FFN_UPGATE which
+  // waits on bar_oproj).
+  tg_wait_all(g.bar_oproj, inst[3], (uint32_t)inst[4],
+              g.bar_ffn_down, inst[5], (uint32_t)inst[6]);
+
+  int wtid = tg_wtid();
+
+  // FFN residual: x_ffn = x_attn + ffn_down_out
+  float* x_attn = g.x_attn + batch * g.hidden;
+  float* ffn_down = g.ffn_down_out + batch * g.hidden;
+  float* x_ffn = g.x_ffn + batch * g.hidden;
+  __nv_bfloat16* x_res = g.x_resid + batch * g.hidden;
+
+  for (int i = wtid; i < g.hidden; i += TG_NUM_WORKER_THREADS) {
+    float val = tg_round_bf16(ffn_down[i]) + x_attn[i];
+    x_ffn[i] = val;
+    x_res[i] = __float2bfloat16(val);
+  }
+  tg_worker_sync_inner();
+
+  // RMSNorm: x_ffn → norm_out (for next layer's QKV)
+  // Use the float-input RMSNorm variant, output goes to global norm_out.
+  // We need to use s_norm as scratch, then copy to global norm_out.
+  const __nv_bfloat16* norm_w = (is_final)
+      ? g.final_norm_weight
+      : tg_layer_weight(g.layer_weights, layer + 1, tg::TG_LW_INPUT_LAYERNORM);
+
+  tg_rmsnorm_f(s_norm, s_reduce, x_ffn, norm_w, g.hidden);
+
+  // Copy from shared to global norm_out
+  float* norm_out = g.norm_out + batch * g.hidden;
+  for (int i = wtid; i < g.hidden; i += TG_NUM_WORKER_THREADS) {
+    norm_out[i] = s_norm[i];
+  }
+  tg_worker_sync_inner();
+
+  tg_arrive(g.bar_layer, inst[7]);
+}
+
+// LM_HEAD: final RMSNorm + WMMA logits + argmax.
+// Terminal op (no produce bar). Waits on bar_layer[num_layers].
+
+__device__ __forceinline__ void tg_lm_head_op(
+    const int* inst, TgGlobals& g, int bid,
+    __nv_bfloat16* s_a, float* s_norm, float* s_reduce,
+    float* s_argmax_val, int* s_argmax_idx) {
+  int num_tiles = inst[9];
+
+  tg_wait(g.bar_layer, inst[6], (uint32_t)inst[7]);
+
+  int wtid = tg_wtid();
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+
+  // Final RMSNorm: x_resid → norm_out (already done by last ADD_RMSNORM)
+  // The last ADD_RMSNORM stores norm_out with final_norm_weight. So we
+  // can read norm_out directly. But we need it in shared memory for the GEMM.
+  // Copy all BS rows of norm_out to s_norm.
+  for (int i = wtid; i < g.BS * g.hidden; i += TG_NUM_WORKER_THREADS) {
+    s_norm[i] = g.norm_out[i];
+  }
+  tg_worker_sync_inner();
+
+  // WMMA GEMM: lm_logits = norm_out @ embed_weight^T
+  // embed_weight is [vocab, hidden] row-major (= LM head weight, tied)
+  for (int t = 0; t < num_tiles; t++) {
+    int packed = inst[10 + t];
+    int tile_n = packed & 0xFFFF;
+
+    tg_wmma_gemm<TG_HIDDEN, TG_VOCAB>(
+        s_norm,  // [BS, hidden] in shared memory
+        g.embed_weight + tile_n * TG_WMMA_TILE * g.hidden,
+        g.lm_logits + tile_n * TG_WMMA_TILE,  // [BS, vocab]
+        g.BS, TG_WMMA_TILE, g.hidden,
+        wwarp, TG_WORKER_WARPS, s_a);
+  }
+
+  // Argmax across all vocab tiles (per batch row)
+  // For Phase 1 with BS=1, just find the max logit.
+  // Each warp scans a chunk of vocab and finds local max, then warp 0 reduces.
+  // The lm_logits are float [BS, vocab].
+  for (int batch = 0; batch < g.BS; batch++) {
+    float* logits = g.lm_logits + batch * g.vocab_size;
+    float local_max = -INFINITY;
+    int local_max_idx = 0;
+    for (int i = wtid; i < g.vocab_size; i += TG_NUM_WORKER_THREADS) {
+      float val = logits[i];
+      if (val > local_max) {
+        local_max = val;
+        local_max_idx = i;
+      }
+    }
+
+    // Warp-level argmax
+    for (int offset = TG_WARP_SIZE / 2; offset > 0; offset /= 2) {
+      float other_max = __shfl_xor_sync(0xffffffff, local_max, offset);
+      int other_idx = __shfl_xor_sync(0xffffffff, local_max_idx, offset);
+      if (other_max > local_max) {
+        local_max = other_max;
+        local_max_idx = other_idx;
+      }
+    }
+
+    // Block-level argmax via shared memory (passed from kernel entry)
+    if (wlane == 0) {
+      s_argmax_val[wwarp] = local_max;
+      s_argmax_idx[wwarp] = local_max_idx;
+    }
+    tg_worker_sync_inner();
+
+    if (wwarp == 0) {
+      float best_val = s_argmax_val[0];
+      int best_idx = s_argmax_idx[0];
+      for (int w = 1; w < TG_WORKER_WARPS; w++) {
+        if (s_argmax_val[w] > best_val) {
+          best_val = s_argmax_val[w];
+          best_idx = s_argmax_idx[w];
+        }
+      }
+      if (wlane == 0) {
+        // Store the argmax token id as int32 at the start of this batch
+        // row's logits. The runtime reads lm_logits[batch, 0] as int32.
+        reinterpret_cast<int*>(logits)[0] = best_idx;
+      }
+    }
+    tg_worker_sync_inner();
+  }
+}
+
+// =============================================================================
+// Shared memory layout for compute ops. Declared once in the kernel entry;
+// pointers passed to each op body via this struct.
+// =============================================================================
+
+struct TgSmem {
+  __nv_bfloat16* s_a;           // [16*16] = 256 bf16 = 512 B (WMMA A fragment)
+  float* s_norm;                // [1024] = 4 KiB (RMSNorm input/output)
+  float* s_reduce;              // [7] = 28 B (block reduce)
+  float* s_max;                 // [7] = 28 B (attention warp max)
+  float* s_sum;                 // [7] = 28 B (attention warp sum_exp)
+  float* s_out_acc;             // [7*128] = 3.5 KiB (attention warp outputs)
+  float* s_argmax_val;          // [7] = 28 B (LM head argmax val)
+  int* s_argmax_idx;            // [7] = 28 B (LM head argmax idx)
+};
+
+// =============================================================================
+// Instruction dispatch. Big switch on opcode. Each branch calls one op helper
+// and then tg_worker_sync exactly once (the invariant).
+// =============================================================================
+
+__device__ __forceinline__ void tg_dispatch(const int* inst, TgGlobals& g,
+                                             int bid, TgSmem& smem) {
+  int op = tg_opcode(inst);
+  switch (op) {
+    case tg::TG_NOP:
+      break;
+    case tg::TG_QKV_PROJ:
+      tg_qkv_proj_op(inst, g, bid, smem.s_a, smem.s_norm, smem.s_reduce);
+      break;
+    case tg::TG_ATTN_DECODE:
+      tg_attn_decode_op(inst, g, bid, smem.s_max, smem.s_sum, smem.s_out_acc);
+      break;
+    case tg::TG_ATTN_COMBINE:
+      tg_attn_combine_op(inst, g, bid, smem.s_max, smem.s_sum, smem.s_out_acc);
+      break;
+    case tg::TG_O_PROJ:
+      tg_o_proj_op(inst, g, bid, smem.s_a);
+      break;
+    case tg::TG_FFN_UPGATE_ACT:
+      tg_ffn_upgate_op(inst, g, bid, smem.s_a, smem.s_norm, smem.s_reduce);
+      break;
+    case tg::TG_FFN_DOWN:
+      tg_ffn_down_op(inst, g, bid, smem.s_a);
+      break;
+    case tg::TG_ADD_RMSNORM:
+      tg_add_rmsnorm_op(inst, g, bid, smem.s_norm, smem.s_reduce);
+      break;
+    case tg::TG_LM_HEAD:
+      tg_lm_head_op(inst, g, bid, smem.s_a, smem.s_norm, smem.s_reduce,
+                    smem.s_argmax_val, smem.s_argmax_idx);
+      break;
+    default:
+      break;
+  }
+  tg_worker_sync();
+}
+
+// =============================================================================
+// Controller loop (warp 0). Prefetches instructions into the shared ring,
+// signalling workers via inst_arrived and waiting for inst_done before
+// reusing a ring slot. Adapted from cohere megakernel.cuh:3074-3095.
+// =============================================================================
+
+__device__ __forceinline__ void tg_controller_loop(
+    int (*inst_ring)[TG_INST_WIDTH], uint32_t* inst_arrived,
+    uint32_t* inst_done, const int* sm_base, int num_inst) {
+  for (int i = 0; i < num_inst; ++i) {
+    int cur = i % TG_INST_RING;
+    // Wait for the worker to release this ring slot.  The worker sets
+    // done[cur] = (prev_i / RING) + 1 after consuming the previous generation.
+    // For generation gen = i / RING, the controller waits for done >= gen
+    // (i.e. the previous generation's done value).  For the first generation
+    // (i < RING), gen = 0 and done was initialized to 0, so the wait is a
+    // no-op (0 >= 0).
+    uint32_t wait_target = (uint32_t)(i / TG_INST_RING);
+    tg_ring_wait(&inst_done[cur], wait_target);
+    // Cooperatively load the 16-int instruction.
+    tg_coop_load_inst(inst_ring[cur], sm_base + i * TG_INST_WIDTH);
+    // Signal workers that slot cur is ready (arrived = gen + 1).
+    uint32_t val = (i / TG_INST_RING) + 1;
+    tg_ring_set(&inst_arrived[cur], val);
+  }
+}
+
+// =============================================================================
+// Worker loop (warps 1..TG_WORKER_WARPS). Waits for the controller to publish
+// each instruction, dispatches it, then signals the slot is reusable.
+// Adapted from cohere megakernel.cuh:3097-3128.
+// =============================================================================
+
+__device__ __forceinline__ void tg_worker_loop(
+    int (*inst_ring)[TG_INST_WIDTH], uint32_t* inst_arrived,
+    uint32_t* inst_done, TgGlobals& g, int bid) {
+  // Worker warps read num_inst from globals (already loaded by controller into
+  // shared would be one option; we re-read from the per-SM count array via a
+  // shared copy set by controller). For simplicity, controller writes num_inst
+  // to a shared int before the loop; workers read it. (Implemented below in
+  // the kernel entry — we pass num_inst through shared memory.)
+  // NOTE: num_inst is passed via the kernel entry's shared mem (see below).
+}
+
+// =============================================================================
+// Persistent kernel entry.
+// =============================================================================
+
+__global__ __launch_bounds__(TG_BLOCK_SIZE, 1)
+void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
+  const int bid = blockIdx.x;
+  TgGlobals g = tg_make_globals(desc);
+  const int num_inst = g.num_inst_per_sm[bid];
+  const int* sm_base = g.inst_buf + (int64_t)bid * g.max_inst * TG_INST_WIDTH;
+
+  // Shared-memory instruction ring + semaphores.
+  __shared__ int inst_ring[TG_INST_RING][TG_INST_WIDTH];
+  __shared__ uint32_t inst_arrived[TG_INST_RING];
+  __shared__ uint32_t inst_done[TG_INST_RING];
+  __shared__ int shared_num_inst;
+
+  // Shared memory for compute ops (see TgSmem).
+  // s_norm is in dynamic shared memory (extern __shared__) because it needs
+  // [TG_WMMA_TILE * TG_HIDDEN] = 64 KB, exceeding the 48 KB static limit.
+  __shared__ __nv_bfloat16 s_a[TG_WMMA_TILE * TG_WMMA_TILE];
+  __shared__ float s_reduce[TG_WORKER_WARPS];
+  __shared__ float s_max[TG_WORKER_WARPS];
+  __shared__ float s_sum[TG_WORKER_WARPS];
+  __shared__ float s_out_acc[TG_WORKER_WARPS * TG_HEAD_DIM];
+  __shared__ float s_argmax_val[TG_WORKER_WARPS];
+  __shared__ int s_argmax_idx[TG_WORKER_WARPS];
+
+  // Dynamic shared memory for s_norm [TG_WMMA_TILE * TG_HIDDEN] (64 KB).
+  extern __shared__ float s_norm[];
+
+  TgSmem smem;
+  smem.s_a = s_a;
+  smem.s_norm = s_norm;
+  smem.s_reduce = s_reduce;
+  smem.s_max = s_max;
+  smem.s_sum = s_sum;
+  smem.s_out_acc = s_out_acc;
+  smem.s_argmax_val = s_argmax_val;
+  smem.s_argmax_idx = s_argmax_idx;
+
+  if (threadIdx.x == 0) shared_num_inst = num_inst;
+  tg_ring_init(inst_arrived, inst_done, TG_INST_RING);
+  __syncthreads();
+
+  const int warp_id = threadIdx.x / TG_WARP_SIZE;
+
+  // Simple __syncthreads-based dispatch (no ring buffer).
+  // Controller (warp 0) loads instruction, all threads sync, workers dispatch,
+  // all threads sync.
+  int local_num_inst = shared_num_inst;
+  for (int i = 0; i < local_num_inst; ++i) {
+    int cur = i % TG_INST_RING;
+    // Controller loads instruction into shared ring
+    if (warp_id == 0) {
+      tg_coop_load_inst(inst_ring[cur], sm_base + i * TG_INST_WIDTH);
+    }
+    __syncthreads();
+    // Workers dispatch
+    if (warp_id != 0) {
+      tg_dispatch(inst_ring[cur], g, bid, smem);
+    }
+    __syncthreads();
+  }
+}
+
+// =============================================================================
+// Host-side launch helper (called by runtime.cu). Mirrors ldg_launch_cooperative
+// (kernel.cu:2259-2292): validates cooperative support, queries occupancy,
+// launches with cudaLaunchCooperativeKernel so all CTAs are resident (required
+// for the spinning tg_wait to make progress).
+// =============================================================================
+
+extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
+                                 cudaStream_t stream) {
+  // s_norm is in dynamic shared memory: [TG_WMMA_TILE * TG_HIDDEN] floats.
+  constexpr int TG_DYN_SMEM_BYTES = TG_WMMA_TILE * TG_HIDDEN * sizeof(float);
+  // One-time: raise the dynamic shared memory limit (default 48 KB on sm_80).
+  static bool smem_attr_set = false;
+  if (!smem_attr_set) {
+    cudaFuncSetAttribute((void*)tg_decode_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         TG_DYN_SMEM_BYTES);
+    smem_attr_set = true;
+  }
+  void* args[] = {(void*)desc};
+  cudaError_t err = cudaLaunchCooperativeKernel(
+      (void*)tg_decode_kernel,
+      dim3(desc->num_sms), dim3(TG_BLOCK_SIZE), args,
+      TG_DYN_SMEM_BYTES, stream);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "tg_launch_decode: cudaLaunchCooperativeKernel failed: %s\n",
+            cudaGetErrorString(err));
+  }
+}
+
+// =============================================================================
+// Per-step zeroing kernel. Clears all scratch + bar arrays in one launch.
+// Runtime uploads a packed TgZeroRegion array; this kernel processes them.
+// Adapted from cohere's nmc_zero_regions_kernel (runtime.cu:506-544).
+// =============================================================================
+
+__global__ void tg_zero_regions_kernel(const tg::TgZeroRegion* regions,
+                                       int num_regions) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_regions) return;
+  const tg::TgZeroRegion& r = regions[idx];
+  if (r.ptr == 0 || r.bytes == 0) return;
+  // cudaMemsetAsync would be simpler but coalescing one kernel across mixed
+  // regions saves launches. Use a byte-wise zero via int4 stores when aligned.
+  char* p = reinterpret_cast<char*>(r.ptr);
+  int64_t bytes = (int64_t)r.bytes;
+  // Thread-cooperative clear: each thread zeroes a stride.
+  for (int64_t off = (int64_t)idx; off < bytes; off += (int64_t)gridDim.x * blockDim.x) {
+    p[off] = 0;
+  }
+}
+
+extern "C" void tg_launch_zero_regions(const tg::TgZeroRegion* regions,
+                                       int num_regions, cudaStream_t stream) {
+  if (num_regions <= 0) return;
+  int threads = 256;
+  int blocks = (num_regions + threads - 1) / threads;
+  tg_zero_regions_kernel<<<blocks, threads, 0, stream>>>(regions, num_regions);
+}
