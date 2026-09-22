@@ -595,6 +595,17 @@ run_taskgraph() {
     tests.test_taskgraph_multi_sm \
     tests.test_taskgraph_positions -v \
     2>&1 | tee results/taskgraph_kernel.log
+
+  # Step timing. Decode streams ~1.2 GB of weights per step regardless of
+  # batch, so GB/s is the number to watch; if it is far below HBM peak the
+  # cp.async pipeline is not covering the latency. Vary --context-len to
+  # expose the scalar attention cost.
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  PYTHONPATH=src python tools/bench_taskgraph.py \
+    --batch-size 1,2,4,8 --context-len 512 --num-sms "${TG_MULTI_SM:-108}" \
+    --json results/taskgraph_bench.json \
+    2>&1 | tee results/taskgraph_bench.log
 }
 
 case "$RUN_MODE" in

@@ -178,8 +178,10 @@ class TaskGraphSmokeTests(unittest.TestCase):
                      "lse_partial"]:
             t = s[key]
             regions.append((t.data_ptr(), t.numel() * t.element_size()))
-        # Pack as [num_regions, 2] int64
-        packed = torch.tensor(regions, dtype=torch.int64, device="cuda")
+        # Pack as [num_regions, 2] int64. Keep it on the HOST: the binding
+        # copies it to a cached device buffer, and a CUDA tensor here would
+        # force a synchronizing D2H copy inside every step.
+        packed = torch.tensor(regions, dtype=torch.int64)
         return packed
 
     def test_kernel_completes_without_hang(self):

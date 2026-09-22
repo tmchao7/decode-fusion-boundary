@@ -744,14 +744,20 @@ void tg_zero_regions_binding(torch::Tensor regions_packed,
   if (blocks_per_region < 1) blocks_per_region = 1;
 
   c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
-  tg::TgZeroRegion* d_regions = nullptr;
-  cudaMalloc(&d_regions, num_regions * sizeof(tg::TgZeroRegion));
+  // Cache the device staging buffer: cudaMalloc/cudaFree per step would
+  // implicitly synchronize the device and dominate a sub-millisecond step.
+  static tg::TgZeroRegion* d_regions = nullptr;
+  static int64_t d_regions_cap = 0;
+  if (num_regions > d_regions_cap) {
+    if (d_regions != nullptr) cudaFree(d_regions);
+    cudaMalloc(&d_regions, num_regions * sizeof(tg::TgZeroRegion));
+    d_regions_cap = num_regions;
+  }
   cudaMemcpyAsync(d_regions, regions.data(),
                    num_regions * sizeof(tg::TgZeroRegion),
                    cudaMemcpyHostToDevice, stream.stream());
   tg_launch_zero_regions(d_regions, (int)num_regions, (int)blocks_per_region,
                           stream.stream());
-  cudaFree(d_regions);
 }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
