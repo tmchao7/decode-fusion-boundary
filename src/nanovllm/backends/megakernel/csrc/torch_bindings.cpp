@@ -560,8 +560,8 @@ int64_t wmma_max_supported_batch() {
 
 #include "tg_abi.h"
 
-extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
-                                  cudaStream_t stream);
+extern "C" cudaError_t tg_launch_decode(const tg::TgLaunchDesc* desc,
+                                        cudaStream_t stream);
 extern "C" void tg_launch_zero_regions(const tg::TgZeroRegion* regions,
                                         int num_regions, int blocks_per_region,
                                         cudaStream_t stream);
@@ -709,9 +709,14 @@ void tg_decode_step(
   desc.max_attn_splits = (int32_t)max_attn_splits;
   desc.timing = 0;
 
-  // Launch on the current CUDA stream.
+  // Launch on the current CUDA stream. A failed cooperative launch (e.g. the
+  // grid does not fit co-resident) must raise, not silently leave the caller
+  // reading the previous step's lm_logits.
   c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
-  tg_launch_decode(&desc, stream.stream());
+  cudaError_t err = tg_launch_decode(&desc, stream.stream());
+  TORCH_CHECK(err == cudaSuccess,
+              "tg_launch_decode failed (num_sms=", num_sms, "): ",
+              cudaGetErrorString(err));
 }
 
 void tg_zero_regions_binding(torch::Tensor regions_packed,

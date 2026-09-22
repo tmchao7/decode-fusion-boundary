@@ -1655,16 +1655,25 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
 // for the spinning tg_wait to make progress).
 // =============================================================================
 
-extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
-                                 cudaStream_t stream) {
+// Returns cudaSuccess or the launch error. The binding turns a non-success
+// into a TORCH_CHECK: a silent failure here would leave the previous step's
+// tokens in lm_logits and look like a wrong answer.
+extern "C" cudaError_t tg_launch_decode(const tg::TgLaunchDesc* desc,
+                                        cudaStream_t stream) {
   // s_norm is in dynamic shared memory: [TG_WMMA_TILE * TG_HIDDEN] floats.
   constexpr int TG_DYN_SMEM_BYTES = TG_WMMA_TILE * TG_HIDDEN * sizeof(float);
   // One-time: raise the dynamic shared memory limit (default 48 KB on sm_80).
   static bool smem_attr_set = false;
   if (!smem_attr_set) {
-    cudaFuncSetAttribute((void*)tg_decode_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         TG_DYN_SMEM_BYTES);
+    cudaError_t attr_err = cudaFuncSetAttribute(
+        (void*)tg_decode_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        TG_DYN_SMEM_BYTES);
+    if (attr_err != cudaSuccess) {
+      fprintf(stderr, "tg_launch_decode: cudaFuncSetAttribute(%d bytes) failed: %s\n",
+              TG_DYN_SMEM_BYTES, cudaGetErrorString(attr_err));
+      return attr_err;
+    }
     smem_attr_set = true;
   }
   void* args[] = {(void*)desc};
@@ -1673,9 +1682,11 @@ extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
       dim3(desc->num_sms), dim3(TG_BLOCK_SIZE), args,
       TG_DYN_SMEM_BYTES, stream);
   if (err != cudaSuccess) {
-    fprintf(stderr, "tg_launch_decode: cudaLaunchCooperativeKernel failed: %s\n",
-            cudaGetErrorString(err));
+    fprintf(stderr, "tg_launch_decode: cudaLaunchCooperativeKernel(grid=%d, "
+            "block=%d) failed: %s\n",
+            desc->num_sms, TG_BLOCK_SIZE, cudaGetErrorString(err));
   }
+  return err;
 }
 
 // =============================================================================
