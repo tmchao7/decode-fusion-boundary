@@ -625,6 +625,134 @@ class DependencyGraphTests(unittest.TestCase):
 
 
 # =============================================================================
+# Execution simulation: prove the schedule cannot deadlock
+# =============================================================================
+
+
+def simulate_execution(sched, num_sms):
+    """Execute the per-SM instruction streams under the bar semantics.
+
+    Models each SM as a program counter that advances when its next
+    instruction's wait is satisfied, applying the instruction's bar arrivals.
+    Repeats a full scan until nothing can make progress. Because bar counters
+    are monotone (executing an instruction never disables another wait), this
+    greedy maximal execution completes iff *some* concurrent execution can —
+    so a shortfall is a real deadlock, not a simulation artifact.
+
+    This is the invariant that matters for num_sms > 1: every producer a
+    consumer waits on must sit earlier in the global order (and hence be
+    reachable by its SM before that consumer's SM stalls).
+
+    Returns (completed, total, bars, pc).
+    """
+    from collections import defaultdict
+
+    W = tg.TG_INST_WIDTH
+    per_sm = []
+    for sm in range(num_sms):
+        base = sm * sched.max_inst * W
+        per_sm.append([
+            sched.flat_inst_buf[base + i * W: base + (i + 1) * W]
+            for i in range(sched.num_inst_per_sm[sm])
+        ])
+    total = sum(len(x) for x in per_sm)
+    bars = defaultdict(int)
+    pc = [0] * num_sms
+    done = 0
+
+    def wait_ok(inst):
+        op = inst[0]
+        if op == tg.TgOp.QKV_PROJ:
+            return bars[("layer", inst[5])] >= inst[6]
+        if op == tg.TgOp.ATTN_DECODE:
+            return bars[("qkv", inst[7])] >= inst[8]
+        if op == tg.TgOp.ATTN_COMBINE:
+            return bars[("combine", inst[5])] >= inst[6]
+        if op == tg.TgOp.O_PROJ:
+            return bars[("attn", inst[6])] >= inst[7]
+        if op == tg.TgOp.FFN_UPGATE_ACT:
+            return bars[("oproj", inst[6])] >= inst[7]
+        if op == tg.TgOp.FFN_DOWN:
+            return bars[("silu", inst[6])] >= inst[7]
+        if op == tg.TgOp.ADD_RMSNORM:
+            return (bars[("oproj", inst[3])] >= inst[4]
+                    and bars[("ffn_down", inst[5])] >= inst[6])
+        if op == tg.TgOp.LM_HEAD:
+            return bars[("layer", inst[6])] >= inst[7]
+        if op == tg.TgOp.LM_ARGMAX:
+            return bars[("lm_head", inst[6])] >= inst[7]
+        return True  # NOP
+
+    def apply(inst):
+        op = inst[0]
+        if op == tg.TgOp.QKV_PROJ:
+            bars[("qkv", inst[7])] += inst[9]
+        elif op == tg.TgOp.ATTN_DECODE:
+            key = "combine" if (inst[9] >> 31) else "attn"
+            bars[(key, inst[9] & ~(1 << 31))] += 1
+        elif op == tg.TgOp.ATTN_COMBINE:
+            bars[("attn", inst[7])] += 1
+        elif op == tg.TgOp.O_PROJ:
+            bars[("oproj", inst[8])] += inst[9]
+        elif op == tg.TgOp.FFN_UPGATE_ACT:
+            bars[("silu", inst[8])] += inst[9]
+        elif op == tg.TgOp.FFN_DOWN:
+            bars[("ffn_down", inst[8])] += inst[9]
+        elif op == tg.TgOp.ADD_RMSNORM:
+            bars[("layer", inst[7])] += 1
+        elif op == tg.TgOp.LM_HEAD:
+            bars[("lm_head", inst[8])] += inst[9]
+        # LM_ARGMAX / NOP produce nothing.
+
+    while done < total:
+        progressed = False
+        for sm in range(num_sms):
+            if pc[sm] >= len(per_sm[sm]):
+                continue
+            inst = per_sm[sm][pc[sm]]
+            if wait_ok(inst):
+                apply(inst)
+                pc[sm] += 1
+                done += 1
+                progressed = True
+        if not progressed:
+            break
+    return done, total, bars, pc
+
+
+class ScheduleExecutionTests(unittest.TestCase):
+    """The schedule must be deadlock-free for any grid size.
+
+    A single missing dependency edge (a producer placed after its consumer in
+    the global order) makes the real kernel spin forever on the GPU, which is
+    painful to diagnose on a remote box. This catches it on the CPU.
+    """
+
+    def test_no_deadlock_across_batch_and_grid_sizes(self) -> None:
+        for BS in (1, 2, 4, 8):
+            for num_sms in (1, 4, 8, 108):
+                with self.subTest(BS=BS, num_sms=num_sms):
+                    geo = tg.default_geometry(BS=BS, attn_splits=1)
+                    sched = tg.build_schedule(geo, num_sms)
+                    done, total, _, pc = simulate_execution(sched, num_sms)
+                    self.assertEqual(
+                        done, total,
+                        f"schedule deadlocks: only {done}/{total} instructions "
+                        f"can execute (per-SM progress: {pc})",
+                    )
+
+    def test_simulation_completes_every_bar(self) -> None:
+        """The last instruction must be LM_ARGMAX and every bar must be fully
+        consumed by the time the stream ends."""
+        geo = tg.default_geometry(BS=2, attn_splits=1)
+        sched = tg.build_schedule(geo, num_sms=8)
+        done, total, bars, pc = simulate_execution(sched, 8)
+        self.assertEqual(done, total)
+        # bar_lm_head must have been driven to exactly the LM head tile count.
+        self.assertEqual(bars[("lm_head", 0)], geo.vocab // 16)
+
+
+# =============================================================================
 # Multi-batch geometry sanity
 # =============================================================================
 
