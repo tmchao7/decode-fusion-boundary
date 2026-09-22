@@ -279,29 +279,42 @@ struct TgBars {
 ### 4.2 cross-SM 原语（sm_80 适配版）
 
 cohere 的 `wait_cross_sm` / `arrive_cross_sm`（`megakernel.cuh:560-669`）用 `fence.proxy.async`
-（TMA proxy 可见性）。**sm_80 无 TMA，不需要 proxy fence**，只需 `__threadfence` + `atomicAdd`：
+（TMA proxy 可见性）。**sm_80 无 TMA，不需要 proxy fence**，用 `fence.acq_rel.gpu`
+（kernel.cu `AtomicGridSync` 在 A100 上验证过的原语）+ `atomicAdd`：
 
 ```cpp
-// 消费者：等 bar[idx] >= target
-__device__ __forceinline__ void tg_wait(uint32_t *bar, int idx, uint32_t target) {
-  volatile uint32_t *slot = (volatile uint32_t*)(bar + idx);
-  while (*slot < target) {
-    __nanosleep(20);   // 防内存流量过大（cohere 注释 "DONT DELETE"）
+// 消费者：等 bar[idx] >= target。只有 worker warp 0 轮询，其余 warp 在 worker barrier
+// 上阻塞（108 个 CTA × 224 线程全自旋会把 L2 计数器行打爆，拖慢生产者的 atomicAdd）。
+__device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx, uint32_t target) {
+  if (target == 0) { tg_fence_gpu(); return; }     // layer 0 无依赖
+  if (tg_wwarp() == 0) {
+    const volatile uint32_t* slot = bar + idx;
+    while (*slot < target) __nanosleep(20);        // "DONT DELETE"（cohere 注释）
+    tg_fence_gpu();                                // acquire
   }
-  __threadfence();     // acquire：看到计数器越界后，保证看到生产者的 global 写
+  tg_worker_sync_inner();                          // acquire 通过 barrier 传播到其余 warp
 }
 
-// 生产者：通知 bar[idx] += inc
-__device__ __forceinline__ void tg_arrive(uint32_t *bar, int idx, uint32_t inc = 1) {
-  __threadfence();     // release：先发布自己的 global 写，再 atomicAdd
-  atomicAdd(bar + idx, inc);
+// 生产者：通知 bar[idx] += inc。
+// 关键不变量：先 worker barrier（本 CTA 所有 global 写完成），再 fence，最后**单线程**
+// atomicAdd。若 224 个 worker 线程各 add 一次，到达数会被乘 224，消费者提前 224 条指令放行。
+__device__ __forceinline__ void tg_arrive(uint32_t* bar, int idx, uint32_t inc = 1) {
+  tg_worker_sync_inner();
+  tg_fence_gpu();                                  // release
+  if (threadIdx.x == TG_WARP_SIZE) atomicAdd(bar + idx, inc);
 }
 ```
 
-**正确性论证**：`__threadfence()` 在 sm_80 上保证"调用前的所有 global 写对**所有 SM**可见"
-（GPU scope，见 CUDA C++ Programming Guide §memory fence）。`atomicAdd` 自带 GPU scope
-排序。消费侧 `volatile` 轮询保证不缓存，过阈后 `__threadfence()` acquire 生产者写。
-这与当前 `kv_flag`/`attn_flag`（`kernel.cu:526-555, 674-726`）的机制等价，已验证可行。
+**正确性论证**：`fence.acq_rel.gpu` 提供 GPU scope 的 acquire/release；生产侧 fence 在
+worker barrier 之后执行，barrier 的 release/acquire 边把所有线程的写在因果序上排在
+fence 之前；消费侧 warp 0 的 acquire 再经 worker barrier 传播给其余 warp。这与
+`kernel.cu` 的 `AtomicGridSync`（`__syncthreads` → fence → 单线程 atomicAdd → 自旋 →
+`__syncthreads`）是同一模式，已在 A100 上验证。
+
+**到达计数**：非 GEMM op（ATTN/ADD_RMSNORM）每条指令 `inc=1`；GEMM op
+（QKV/O_PROJ/FFN_UPGATE/FFN_DOWN/LM_HEAD）每条指令 `inc=NUM_TILES`（打包了 N 个
+tile）。`WAIT_TARGET` 按总 tile 数计，`test_taskgraph_abi.py` 逐 slot 校验
+`produces == max(waits)`。
 
 **与 `AtomicGridSync`（`kernel.cu:108-145`）的区别**：
 - `AtomicGridSync` 是**全网格** barrier（所有 block 到齐才放行），强制层间串行。
@@ -310,16 +323,23 @@ __device__ __forceinline__ void tg_arrive(uint32_t *bar, int idx, uint32_t inc =
 
 ### 4.3 多 bar 同时等待
 
-`TG_ADD_RMSNORM` 要等 attn 和 ffn 两路，需要 `tg_wait_all`：
+`TG_ADD_RMSNORM` 要等 attn 和 ffn 两路，需要 `tg_wait_all`。两个计数器在**同一个循环**
+里轮询（而不是先后两次 `tg_wait`），这样两个依赖里更晚到的那个一到就放行；同样只有
+warp 0 轮询 + worker barrier 广播：
 
 ```cpp
 __device__ __forceinline__ void tg_wait_all(
-    uint32_t *bar1, int idx1, uint32_t target1,
-    uint32_t *bar2, int idx2, uint32_t target2) {
-  volatile uint32_t *s1 = (volatile uint32_t*)(bar1 + idx1);
-  volatile uint32_t *s2 = (volatile uint32_t*)(bar2 + idx2);
-  while (*s1 < target1 || *s2 < target2) { __nanosleep(20); }
-  __threadfence();
+    const uint32_t* bar1, int idx1, uint32_t target1,
+    const uint32_t* bar2, int idx2, uint32_t target2) {
+  const bool need1 = target1 > 0, need2 = target2 > 0;
+  if (!need1 && !need2) { tg_fence_gpu(); return; }
+  if (tg_wwarp() == 0) {
+    const volatile uint32_t* s1 = bar1 + idx1;
+    const volatile uint32_t* s2 = bar2 + idx2;
+    while ((need1 && *s1 < target1) || (need2 && *s2 < target2)) __nanosleep(20);
+    tg_fence_gpu();
+  }
+  tg_worker_sync_inner();
 }
 ```
 

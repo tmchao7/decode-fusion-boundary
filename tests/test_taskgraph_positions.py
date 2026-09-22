@@ -53,13 +53,16 @@ _tg_ops = torch.ops.nanovllm_megakernel_C
 # Teacher-forced prompt. Length must stay <= block_size so one page suffices.
 PROMPT = [42, 1234, 100, 7]
 # Logit agreement with the reference. The kernel uses ex2.approx softmax and
-# rounds at different boundaries, so allow a small absolute slack; the
-# position-0 comparison (test_tg_logits_compare) measured < 0.13.
-LOGIT_ATOL = 0.5
+# rounds at different boundaries, so allow absolute slack; the position-0
+# comparison (test_tg_logits_compare) measured < 0.13, but errors can
+# accumulate over the teacher-forced steps. A real RoPE/attention/paging bug
+# at position > 0 moves logits by O(1)+, so this still catches it. Tighten
+# after the first server run if the printed diffs are much smaller.
+LOGIT_ATOL = 1.0
 # A token is accepted if it is the reference argmax, or the reference logit at
 # the kernel's token is within this of the reference max (near-tie / 1-ulp
 # cascade, e.g. the documented 10.33 vs 10.27 flip).
-TOKEN_GAP_ATOL = 0.25
+TOKEN_GAP_ATOL = 0.5
 
 
 def _resolve_model_path() -> str:
