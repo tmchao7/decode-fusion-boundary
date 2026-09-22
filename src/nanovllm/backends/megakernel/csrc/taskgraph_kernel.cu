@@ -105,9 +105,11 @@ __device__ __forceinline__ void tg_fence_gpu() {
   asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 
-// Defined in the worker-sync section below; forward-declared because tg_arrive
-// (which must publish all worker warps' stores) uses it.
+// Defined in the worker-sync / thread-index sections below; forward-declared
+// because tg_wait/tg_arrive use them. tg_arrive must publish all worker warps'
+// stores (barrier) and tg_wait picks the single polling warp (tg_wwarp).
 __device__ __forceinline__ void tg_worker_sync_inner();
+__device__ __forceinline__ int tg_wwarp();
 
 // Consumer: wait for bar[idx] >= target, then acquire.
 //

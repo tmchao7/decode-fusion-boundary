@@ -167,9 +167,12 @@ def pytorch_causal_reference(layer_weights, embed_weight, final_norm_weight,
         gate = x_normed2 @ gate_w.T
         up = x_normed2 @ up_w.T
         silu_out = rb(rb(torch.sigmoid(gate) * gate) * up)
-        x_resid = rb(rb(silu_out @ down_w.T) + x_attn)
+        # The kernel stores BOTH the unrounded sum (x_ffn, used for the final
+        # norm) and its bf16 rounding (x_resid, the next layer's input).
+        x_ffn = rb(silu_out @ down_w.T) + x_attn
+        x_resid = rb(x_ffn)
 
-    x_final = rmsnorm(x_resid, final_norm_weight.to(f32))
+    x_final = rmsnorm(x_ffn, final_norm_weight.to(f32))
     return x_final @ embed_weight.to(f32).T        # [T, vocab]
 
 
