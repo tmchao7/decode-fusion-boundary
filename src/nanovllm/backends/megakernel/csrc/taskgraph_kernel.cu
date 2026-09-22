@@ -1194,7 +1194,7 @@ __device__ __forceinline__ void tg_attn_decode_op(
 __device__ __forceinline__ void tg_attn_combine_op(
     const int* inst, TgGlobals& g, int bid,
     float* s_max, float* s_sum, float* s_out_acc) {
-  int layer = inst[1];
+  // inst[1] (layer) is unused until the partials are actually written.
   int batch = inst[2];
   int kv_head = inst[3];
   int num_splits = inst[4];
