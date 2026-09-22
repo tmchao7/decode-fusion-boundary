@@ -150,6 +150,7 @@ def main():
     s["bar_ffn_down"] = torch.zeros(d.bar_ffn_down, **u32)
     s["bar_layer"] = torch.zeros(d.bar_layer, **u32)
     s["bar_combine"] = torch.zeros(max(d.bar_combine, 1), **u32)
+    s["bar_lm_head"] = torch.zeros(d.bar_lm_head, **u32)
 
     s["page_table"] = torch.zeros(BS, 64, dtype=torch.int32, device="cuda")
     s["cache_seqlens"] = torch.zeros(BS, dtype=torch.int32, device="cuda")
@@ -190,7 +191,7 @@ def main():
         s["o_partial"], s["lse_partial"],
         s["bar_qkv"], s["bar_attn"], s["bar_oproj"],
         s["bar_silu"], s["bar_ffn_down"], s["bar_layer"],
-        s["bar_combine"],
+        s["bar_combine"], s["bar_lm_head"],
         NUM_LAYERS, BS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
         Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
         HEAD_DIM, 151936, 1, 1, 1,

@@ -64,7 +64,7 @@ wave 的空闲 SM 被 backfill。
 | GEMM 原语 | TMA load + wgmma + TMA store | WMMA `m16n16k16` + `cp.async`/`__ldg` load + `store_matrix_sync` |
 | cross-SM 信号 | `fence.proxy.async`（TMA proxy）+ `__threadfence` + `atomicAdd` | **`__threadfence` + `atomicAdd`**（无 TMA，不需要 proxy fence） |
 | warp 角色 | 4 role（producer/storer/consumer×1-2/idle），TMA 专用 warp | **简化为 2 role**：compute warp（做 WMMA + global load + store）+ aux warp（做 RMSNorm/attention/argmax 等标量）。sm_80 无 TMA，不需要 producer/storer 分离 |
-| task 图 | 14 bar（含 MoE） | **7 bar**：`bar_qkv, bar_attn, bar_oproj, bar_silu, bar_ffn_down, bar_layer, bar_combine`（dense） |
+| task 图 | 14 bar（含 MoE） | **8 bar**：`bar_qkv, bar_attn, bar_oproj, bar_silu, bar_ffn_down, bar_layer, bar_combine, bar_lm_head`（dense） |
 | 动态 claimer | attn drain + MoE drain | 先做**静态** attention split（Qwen3-0.6B context ≤ 2048，split 数可静态算）；动态 drain 留作后续 |
 | JIT | little_jit 按 batch size 编译 .so | **先不做 JIT**：用 `build.py` 的 torch cpp_extension 一次编译，靠 runtime 配置（batch/context bucket）切 `inst_buf`。若寄存器压力需要按 batch 特化再引入 JIT |
 | 连续 batching | C++ `DecodeService` 线程 + Python scheduler pause/park/resume | **同构移植**：新增 `runtime.cu` 的 `DecodeService` + `session.py`，复用 nano-vLLM 的 `Scheduler`/`Sequence`/`block_manager` 做 prefill 与 block 生命周期 |
@@ -135,7 +135,7 @@ struct TgInstruction {
 
 ### 3.2 Opcode 枚举（`TgOp`）
 
-dense 模型只需要 9 种（砍掉 cohere 的 8 个 MoE/Router opcode）：
+dense 模型只需要 10 种（砍掉 cohere 的 8 个 MoE/Router opcode）：
 
 | opcode | 值 | 含义 | 执行函数 |
 |---|---:|---|---|
@@ -147,7 +147,13 @@ dense 模型只需要 9 种（砍掉 cohere 的 8 个 MoE/Router opcode）：
 | `TG_FFN_UPGATE_ACT` | 5 | fused gate+up GEMM tile + SiLU | `tg_ffn_upgate_op` |
 | `TG_FFN_DOWN` | 6 | down projection GEMM tile | `tg_ffn_down_op` |
 | `TG_ADD_RMSNORM` | 7 | 残差加 + RMSNorm（层汇合点） | `tg_add_rmsnorm_op` |
-| `TG_LM_HEAD` | 8 | LM head GEMM tile + 局部 argmax | `tg_lm_head_op` |
+| `TG_LM_HEAD` | 8 | LM head GEMM tile（produce `bar_lm_head`） | `tg_lm_head_op` |
+| `TG_LM_ARGMAX` | 9 | 全 vocab tile 就绪后的 per-batch argmax（终结 op） | `tg_lm_argmax_op` |
+
+> `TG_LM_ARGMAX` 是从 `TG_LM_HEAD` 拆出来的终结指令：`num_sms>1` 时各 SM 只写自己的
+> vocab tile，若在每个 tile 指令里就地 argmax 会读到别的 SM 还没写的 logits。拆出来后
+> `TG_LM_HEAD` 每个 tile 指令 `arrive(bar_lm_head, inc=NUM_TILES)`，`TG_LM_ARGMAX` 等
+> `bar_lm_head[0] >= vocab/lm_head_bn` 再做 argmax，跨 SM 正确。
 
 > 注：`RMSNORM` 不单独列 opcode——QKV 前的 input-layernorm 融进 `TG_QKV_PROJ`，
 > O_PROJ 前的 post-attn-layernorm融进 `TG_O_PROJ`，层末的 final-norm 融进
@@ -258,6 +264,7 @@ struct TgBars {
   uint32_t *bar_ffn_down;  // [layers]                        — FFN_DOWN→ADD_RMSNORM(ffn路)
   uint32_t *bar_layer;     // [layers + 1]                      — ADD_RMSNORM→下一层 QKV / LM_HEAD
   uint32_t *bar_combine;   // [layers * BS * Hkv]             — ATTN_DECODE→ATTN_COMBINE（split>1）
+  uint32_t *bar_lm_head;   // [1]                             — LM_HEAD tiles→LM_ARGMAX
 };
 ```
 
@@ -450,7 +457,8 @@ wave 5: FFN_DOWN        (若干 tile, produce bar_ffn_down)
 wave 6: ADD_RMSNORM     (BS 个, per-row, produce bar_layer)
 ```
 
-最后一层多一个 `wave 7: LM_HEAD`（若干 vocab tile + 融合 argmax）。
+最后一层多一个 `wave 7: LM_HEAD`（若干 vocab tile，produce `bar_lm_head`），
+再接一条终结的 `TG_LM_ARGMAX`（等 `bar_lm_head` 到齐后做 per-batch argmax）。
 
 ### 6.3 依赖 index 公式（与 §4.1 bar 维度对应）
 
@@ -470,6 +478,8 @@ FFN_DOWN produce: bar_ffn_down[L]
 ADD_RMSNORM wait: bar_oproj[L] (target=oproj_tiles) + bar_ffn_down[L] (target=down_tiles)
 ADD_RMSNORM produce: bar_layer[L+1]（始终 L+1；最后一层 L_last produce bar_layer[num_layers] 给 LM_HEAD）
 LM_HEAD wait:   bar_layer[num_layers]（= L_last + 1）, target = batch
+LM_HEAD produce:bar_lm_head[0], inc = NUM_TILES
+LM_ARGMAX wait: bar_lm_head[0], target = vocab / lm_head_bn
 ```
 
 ### 6.4 placement：round-robin + 依赖亲和

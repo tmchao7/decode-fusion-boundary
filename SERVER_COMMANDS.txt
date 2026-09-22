@@ -17,6 +17,7 @@ set -euo pipefail
 #   RUN_MODE=roofline bash SERVER_COMMANDS.txt       # device lower-bound probe + bandwidth
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
+#   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM kernel tests
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
 # Overridable: REPO, NANOVLLM_MODEL_PATH (or MODEL), PREFERRED_GPUS,
@@ -570,6 +571,29 @@ run_sanitize() {
   return "$sanitizer_status"
 }
 
+run_taskgraph() {
+  mkdir -p results
+  require_model
+  build_extension
+  verify_extension_import
+
+  # Source-invariant ABI/schedule checks (no GPU needed).
+  PYTHONPATH=src python -m unittest tests.test_taskgraph_abi -v \
+    2>&1 | tee results/taskgraph_abi.log
+
+  # Kernel tests. test_taskgraph_multi_sm is the one that actually spreads
+  # instructions across CTAs and exercises the cross-SM tg_wait; the smoke and
+  # BS=2 tests run num_sms=1 (sequential) and only cover numerics.
+  # TG_MULTI_SM=108 uses the full A100 grid.
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  PYTHONPATH=src python -m unittest \
+    tests.test_taskgraph_smoke \
+    tests.test_taskgraph_bs2 \
+    tests.test_taskgraph_multi_sm -v \
+    2>&1 | tee results/taskgraph_kernel.log
+}
+
 case "$RUN_MODE" in
   model)
     run_model_download
@@ -610,6 +634,10 @@ case "$RUN_MODE" in
     select_gpu
     run_sanitize
     ;;
+  taskgraph)
+    select_gpu
+    run_taskgraph
+    ;;
   all)
     select_gpu
     verify_environment
@@ -618,7 +646,7 @@ case "$RUN_MODE" in
     ;;
   *)
     echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
-    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, or all." >&2
+    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, taskgraph, or all." >&2
     exit 2
     ;;
 esac

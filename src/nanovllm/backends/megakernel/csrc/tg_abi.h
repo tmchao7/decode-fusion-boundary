@@ -5,8 +5,7 @@
 //
 // Shared by:
 //   - csrc/taskgraph_kernel.cu      (device kernel, NVCC)
-//   - csrc/taskgraph_runtime.cu     (C++ DecodeService host runtime, NVCC)
-//   - csrc/taskgraph_bindings.cpp   (pybind bindings, plain C++ compiler)
+//   - csrc/torch_bindings.cpp       (pybind bindings + launch helpers)
 //   - schedule.py                   (Python schedule builder, via bindings)
 //
 // MUST COMPILE WITHOUT NVCC / CUDA headers: taskgraph_bindings.cpp includes
@@ -44,6 +43,7 @@ enum TgOp : int32_t {
   TG_FFN_DOWN         = 6,
   TG_ADD_RMSNORM      = 7,
   TG_LM_HEAD          = 8,
+  TG_LM_ARGMAX        = 9,  // terminal per-batch argmax over the LM head logits
 };
 
 // Instruction as a flat int array. Field offsets are opcode-specific; the
@@ -64,8 +64,9 @@ struct TgBars {
   uint64_t bar_oproj;     // [layers]
   uint64_t bar_silu;      // [layers * down_splits]
   uint64_t bar_ffn_down;  // [layers]
-  uint64_t bar_layer;     // [layers]
+  uint64_t bar_layer;     // [layers + 1]
   uint64_t bar_combine;   // [layers * BS * hkv]   (split>1 only; 0 otherwise)
+  uint64_t bar_lm_head;   // [1]  LM_HEAD tiles -> LM_ARGMAX (cross-SM)
 };
 
 // ---------------------------------------------------------------------------
@@ -119,21 +120,31 @@ struct TgLaunchDesc {
   int64_t kv_layer_stride;    // elements per layer in k/v cache (int64 for 80GB safety; matches kernel.cu)
 
   // --- scratch (device, zeroed per step) -----------------------------------
-  uint64_t norm_out;          // bf16 [BS, hidden]
-  uint64_t q_out;             // bf16 [BS, q_size]
-  uint64_t k_out;             // bf16 [BS, kv_size]  (post-RoPE, pre-KV-write)
-  uint64_t v_out;             // bf16 [BS, kv_size]
-  uint64_t attn_out;          // bf16 [BS, hidden]   (post attention, pre O_PROJ)
-  uint64_t o_proj_out;        // bf16 [BS, hidden]   (post O_PROJ, pre residual)
-  uint64_t x_attn;            // bf16 [BS, hidden]   (residual after attention)
-  uint64_t post_attn_norm;    // bf16 [BS, hidden]
-  uint64_t silu_out;          // bf16 [BS, intermediate]
-  uint64_t ffn_down_out;      // bf16 [BS, hidden]
-  uint64_t up_out;            // float [16, intermediate] — temp up-projection (WMMA stride=intermediate)
-  uint64_t x_ffn;             // bf16 [BS, hidden]   (residual after FFN)
-  uint64_t x_resid;           // bf16 [BS, hidden]   (layer input / next layer input)
-  uint64_t lm_logits;         // float [BS, vocab]   (LM head output, pre-argmax)
-  // split-K attention partials (when attn split > 1)
+  //
+  // WMMA_PAD CONTRACT: every buffer written by a WMMA GEMM must have at least
+  // TG_WMMA_TILE (16) rows. wmma::store_matrix_sync always stores a full 16x16
+  // tile, so with BS < 16 it writes rows BS..15 as zeros. The row stride must
+  // equal the column count documented here (the kernel hardcodes it as a
+  // template parameter). torch_bindings.cpp enforces this in tg_decode_step.
+  //
+  // Values are float unless marked bf16; the kernel rounds at the same tensor
+  // boundaries kernel.cu does.
+  uint64_t norm_out;          // float [BS, hidden]         (RMSNorm output)
+  uint64_t q_out;             // float [16, q_size]         (WMMA out)
+  uint64_t k_out;             // float [16, kv_size]        (WMMA out, pre-RoPE/KV-write)
+  uint64_t v_out;             // float [16, kv_size]        (WMMA out)
+  uint64_t attn_out;          // float [BS, q_size]         (post attention, pre O_PROJ)
+  uint64_t o_proj_out;        // float [16, hidden]         (WMMA out, pre residual)
+  uint64_t x_attn;            // float [BS, hidden]         (residual after attention)
+  uint64_t post_attn_norm;    // float [BS, hidden]         (reserved; FFN folds the norm)
+  uint64_t silu_out;          // float [16, intermediate]   (WMMA out + SiLU)
+  uint64_t ffn_down_out;      // float [16, hidden]         (WMMA out)
+  uint64_t up_out;            // float [16, intermediate]   (WMMA out, temp up-proj)
+  uint64_t x_ffn;             // float [BS, hidden]         (residual after FFN)
+  uint64_t x_resid;           // bf16  [BS, hidden]         (layer input / next layer input)
+  uint64_t lm_logits;         // float [16, vocab]          (WMMA out, pre-argmax)
+  // split-K attention partials (when attn split > 1; NOT implemented yet —
+  // tg_attn_decode_op does not write them, so keep attn_splits == 1)
   uint64_t o_partial;         // float [BS, hkv, max_splits, hidden]
   uint64_t lse_partial;       // float [BS, hkv, max_splits]
 

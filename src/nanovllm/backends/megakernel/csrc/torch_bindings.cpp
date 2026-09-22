@@ -1,5 +1,7 @@
 #include <Python.h>
+#include <algorithm>
 #include <cstdlib>
+#include <vector>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
@@ -561,10 +563,39 @@ int64_t wmma_max_supported_batch() {
 extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
                                   cudaStream_t stream);
 extern "C" void tg_launch_zero_regions(const tg::TgZeroRegion* regions,
-                                        int num_regions, cudaStream_t stream);
+                                        int num_regions, int blocks_per_region,
+                                        cudaStream_t stream);
 
 static uint64_t tensor_ptr(const torch::Tensor& t) {
   return reinterpret_cast<uint64_t>(t.data_ptr());
+}
+
+// ---------------------------------------------------------------------------
+// Scratch-buffer layout guards.
+//
+// The kernel hardcodes each GEMM's row stride as a template parameter and
+// wmma::store_matrix_sync always stores a full 16x16 tile, so every WMMA
+// output buffer must have at least 16 rows even when BS < 16. A buffer that
+// matches the old "[BS, cols]" documentation would be silently overrun.
+// ---------------------------------------------------------------------------
+constexpr int64_t TG_WMMA_PAD_ROWS = 16;
+
+static void tg_require_wmma_buffer(const torch::Tensor& t, int64_t rows,
+                                   int64_t cols, const char* name) {
+  TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(t.dim() == 2 && t.size(0) >= rows && t.size(1) == cols,
+              name, " must be [>= ", rows, ", ", cols,
+              "] because wmma::store_matrix_sync writes a full 16-row tile; got ",
+              t.sizes());
+}
+
+static void tg_require_scratch(const torch::Tensor& t, int64_t rows,
+                               int64_t cols, const char* name) {
+  TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(t.dim() == 2 && t.size(0) >= rows && t.size(1) == cols,
+              name, " must be [>= ", rows, ", ", cols, "]; got ", t.sizes());
 }
 
 void tg_decode_step(
@@ -589,12 +620,30 @@ void tg_decode_step(
     // bars
     torch::Tensor bar_qkv, torch::Tensor bar_attn, torch::Tensor bar_oproj,
     torch::Tensor bar_silu, torch::Tensor bar_ffn_down, torch::Tensor bar_layer,
-    torch::Tensor bar_combine,
+    torch::Tensor bar_combine, torch::Tensor bar_lm_head,
     // geometry
     int64_t num_layers, int64_t BS, int64_t hidden, int64_t intermediate,
     int64_t q_size, int64_t kv_size, int64_t num_q_heads,
     int64_t num_kv_heads, int64_t head_dim, int64_t vocab_size,
     int64_t oproj_splits, int64_t down_splits, int64_t max_attn_splits) {
+  // Layout guards: WMMA outputs need 16 rows; elementwise scratch needs BS.
+  tg_require_wmma_buffer(q_out, TG_WMMA_PAD_ROWS, q_size, "q_out");
+  tg_require_wmma_buffer(k_out, TG_WMMA_PAD_ROWS, kv_size, "k_out");
+  tg_require_wmma_buffer(v_out, TG_WMMA_PAD_ROWS, kv_size, "v_out");
+  tg_require_wmma_buffer(o_proj_out, TG_WMMA_PAD_ROWS, hidden, "o_proj_out");
+  tg_require_wmma_buffer(silu_out, TG_WMMA_PAD_ROWS, intermediate, "silu_out");
+  tg_require_wmma_buffer(ffn_down_out, TG_WMMA_PAD_ROWS, hidden, "ffn_down_out");
+  tg_require_wmma_buffer(up_out, TG_WMMA_PAD_ROWS, intermediate, "up_out");
+  tg_require_wmma_buffer(lm_logits, TG_WMMA_PAD_ROWS, vocab_size, "lm_logits");
+  tg_require_scratch(norm_out, BS, hidden, "norm_out");
+  tg_require_scratch(attn_out, BS, q_size, "attn_out");
+  tg_require_scratch(x_attn, BS, hidden, "x_attn");
+  tg_require_scratch(x_ffn, BS, hidden, "x_ffn");
+  tg_require_scratch(x_resid, BS, hidden, "x_resid");
+  tg_require_scratch(post_attn_norm, BS, hidden, "post_attn_norm");
+  TORCH_CHECK(bar_lm_head.is_cuda() && bar_lm_head.numel() >= 1,
+              "bar_lm_head must be a CUDA tensor with at least one element");
+
   // Build TgLaunchDesc on the stack.
   tg::TgLaunchDesc desc{};
 
@@ -643,6 +692,7 @@ void tg_decode_step(
   desc.bars.bar_ffn_down = tensor_ptr(bar_ffn_down);
   desc.bars.bar_layer = tensor_ptr(bar_layer);
   desc.bars.bar_combine = tensor_ptr(bar_combine);
+  desc.bars.bar_lm_head = tensor_ptr(bar_lm_head);
 
   desc.num_layers = (int32_t)num_layers;
   desc.BS = (int32_t)BS;
@@ -668,22 +718,34 @@ void tg_zero_regions_binding(torch::Tensor regions_packed,
                               int64_t num_regions) {
   if (num_regions <= 0) return;
   // regions_packed is [num_regions, 2] int64: each row is (ptr, bytes).
-  const int64_t* raw = regions_packed.data_ptr<int64_t>();
-  // Copy to a small host/device buffer. For Phase 1, use a heap alloc + H2D.
-  // (Phase 2 will use a pre-allocated device buffer.)
+  // It is typically a CUDA tensor (the tests build it with device="cuda"), so
+  // read it through a CPU copy: dereferencing data_ptr() directly on the host
+  // segfaults on a device address.
+  auto host = regions_packed.detach().to(torch::kCPU).contiguous();
+  TORCH_CHECK(host.scalar_type() == torch::kInt64 && host.numel() >= num_regions * 2,
+              "regions_packed must be an int64 tensor with >= 2*num_regions elements");
+  const int64_t* raw = host.data_ptr<int64_t>();
   std::vector<tg::TgZeroRegion> regions(num_regions);
+  uint64_t max_bytes = 0;
   for (int64_t i = 0; i < num_regions; i++) {
     regions[i].ptr = (uint64_t)raw[i * 2 + 0];
     regions[i].bytes = (uint64_t)raw[i * 2 + 1];
+    max_bytes = std::max(max_bytes, regions[i].bytes);
   }
+  // Intra-region parallelism: grid = (blocks_per_region, num_regions).
+  const int64_t threads = 256;
+  int64_t blocks_per_region = (int64_t)((max_bytes + threads - 1) / threads);
+  if (blocks_per_region > 256) blocks_per_region = 256;
+  if (blocks_per_region < 1) blocks_per_region = 1;
+
   c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
-  // Upload to device (small, <1KB typically).
-  tg::TgZeroRegion* d_regions;
+  tg::TgZeroRegion* d_regions = nullptr;
   cudaMalloc(&d_regions, num_regions * sizeof(tg::TgZeroRegion));
   cudaMemcpyAsync(d_regions, regions.data(),
                    num_regions * sizeof(tg::TgZeroRegion),
                    cudaMemcpyHostToDevice, stream.stream());
-  tg_launch_zero_regions(d_regions, (int)num_regions, stream.stream());
+  tg_launch_zero_regions(d_regions, (int)num_regions, (int)blocks_per_region,
+                          stream.stream());
   cudaFree(d_regions);
 }
 
@@ -804,7 +866,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       // bars
       "Tensor bar_qkv, Tensor bar_attn, Tensor bar_oproj, "
       "Tensor bar_silu, Tensor bar_ffn_down, Tensor bar_layer, "
-      "Tensor bar_combine, "
+      "Tensor bar_combine, Tensor bar_lm_head, "
       // geometry
       "int num_layers, int BS, int hidden, int intermediate, "
       "int q_size, int kv_size, int num_q_heads, int num_kv_heads, "

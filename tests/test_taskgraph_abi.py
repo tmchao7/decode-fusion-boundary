@@ -72,7 +72,7 @@ class AbiSyncTests(unittest.TestCase):
         # Every opcode in TgOp must appear in the header with the same value.
         for name in ("NOP", "QKV_PROJ", "ATTN_DECODE", "ATTN_COMBINE",
                      "O_PROJ", "FFN_UPGATE_ACT", "FFN_DOWN", "ADD_RMSNORM",
-                     "LM_HEAD"):
+                     "LM_HEAD", "LM_ARGMAX"):
             full = f"TG_{name}"
             self.assertIn(full, declared, f"{full} missing from tg_abi.h enum")
             self.assertEqual(
@@ -134,10 +134,10 @@ class AbiSyncTests(unittest.TestCase):
                     "will silently write to the wrong offset.",
                 )
 
-    def test_bars_struct_has_seven_arrays(self) -> None:
+    def test_bars_struct_has_eight_arrays(self) -> None:
         header = read(TG_ABI_H)
         for bar in ("bar_qkv", "bar_attn", "bar_oproj", "bar_silu",
-                    "bar_ffn_down", "bar_layer", "bar_combine"):
+                    "bar_ffn_down", "bar_layer", "bar_combine", "bar_lm_head"):
             with self.subTest(bar=bar):
                 self.assertIn(f"uint64_t {bar};", header)
 
@@ -396,6 +396,7 @@ class ScheduleStructureTests(unittest.TestCase):
         self.assertEqual(d.bar_ffn_down, 28)
         self.assertEqual(d.bar_layer, 29)   # num_layers + 1 (LM_HEAD slot)
         self.assertEqual(d.bar_combine, 0)     # attn_splits=1
+        self.assertEqual(d.bar_lm_head, 1)     # single LM_HEAD -> LM_ARGMAX slot
 
     def test_nop_padding_fills_short_sms(self) -> None:
         # SMs with fewer instructions are NOP-padded to max_inst. Every NOP
@@ -444,7 +445,7 @@ class DependencyGraphTests(unittest.TestCase):
             "bar_qkv": d.bar_qkv, "bar_attn": d.bar_attn,
             "bar_oproj": d.bar_oproj, "bar_silu": d.bar_silu,
             "bar_ffn_down": d.bar_ffn_down, "bar_layer": d.bar_layer,
-            "bar_combine": d.bar_combine,
+            "bar_combine": d.bar_combine, "bar_lm_head": d.bar_lm_head,
         }[name]
 
     def test_all_bar_indices_in_range(self) -> None:
@@ -457,6 +458,7 @@ class DependencyGraphTests(unittest.TestCase):
           - generic GEMM (O_PROJ/FFN_UPGATE/FFN_DOWN/LM_HEAD):
                           wait@6, target@7, produce@8, num_tiles@9
           - ADD_RMSNORM:   wait_oproj@3/target@4, wait_ffn@5/target@6, produce@7
+          - LM_ARGMAX:     wait@6 (bar_lm_head), target@7
         """
         for inst in self._iter_instructions():
             op = inst[0]
@@ -489,6 +491,9 @@ class DependencyGraphTests(unittest.TestCase):
                     self.assertLess(inst[7], self._bar_len("bar_layer"))
                 elif op == tg.TgOp.LM_HEAD:
                     self.assertLess(inst[6], self._bar_len("bar_layer"))
+                    self.assertLess(inst[8], self._bar_len("bar_lm_head"))
+                elif op == tg.TgOp.LM_ARGMAX:
+                    self.assertLess(inst[6], self._bar_len("bar_lm_head"))
                 # NOP: no bar refs
 
     def test_every_produced_bar_slot_is_waited_upon(self) -> None:
@@ -557,8 +562,14 @@ class DependencyGraphTests(unittest.TestCase):
                 _wait_max(("bar_ffn_down", inst[5]), inst[6])
                 produces[("bar_layer", inst[7])] += 1
             elif op == tg.TgOp.LM_HEAD:
-                # GEMM, terminal: wait@6 (bar_layer), target@7, no produce
+                # GEMM: wait@6 (bar_layer), target@7, produce@8 (bar_lm_head),
+                # inc=NUM_TILES@9. The argmax is a separate terminal op so it
+                # can wait for every tile across SMs.
                 _wait_max(("bar_layer", inst[6]), inst[7])
+                produces[("bar_lm_head", inst[8])] += inst[9]
+            elif op == tg.TgOp.LM_ARGMAX:
+                # terminal: wait@6 (bar_lm_head), target@7, no produce
+                _wait_max(("bar_lm_head", inst[6]), inst[7])
 
         # bar_layer[0] has no producer (no layer -1); layer 0's inputs wait
         # with target=0, so max demand is 0. produces is 0 (absent). Both

@@ -36,6 +36,7 @@ class TgOp:
     FFN_DOWN = 6
     ADD_RMSNORM = 7
     LM_HEAD = 8
+    LM_ARGMAX = 9
 
 
 # =============================================================================
@@ -57,8 +58,9 @@ class TgBarDims:
     bar_oproj: int     # layers
     bar_silu: int      # layers * down_splits
     bar_ffn_down: int  # layers
-    bar_layer: int     # layers
+    bar_layer: int     # layers + 1
     bar_combine: int   # layers * BS * hkv (0 when split==1 always)
+    bar_lm_head: int   # 1 (LM_HEAD tiles -> LM_ARGMAX)
 
     @classmethod
     def for_geometry(
@@ -90,6 +92,7 @@ class TgBarDims:
             bar_ffn_down=num_layers,
             bar_layer=num_layers + 1,
             bar_combine=num_layers * BS * hkv if attn_splits > 1 else 0,
+            bar_lm_head=1,
         )
 
 
@@ -306,7 +309,13 @@ def make_lm_head(
     wait_target: int,
     extra_tiles: list[tuple[int, int]] | None = None,
 ) -> list[int]:
-    """TG_LM_HEAD. No produce bar (terminal op). Uses make_gemm with produce=0."""
+    """TG_LM_HEAD tile. Waits on bar_layer, produces bar_lm_head[0].
+
+    The per-batch argmax is a separate terminal TG_LM_ARGMAX instruction so it
+    can wait for every LM_HEAD tile on every SM (cross-SM) before scanning the
+    logits. Doing the argmax inside each tile instruction races when
+    num_sms > 1: a tile's scan would read tiles other SMs have not written.
+    """
     return make_gemm(
         TgOp.LM_HEAD,
         layer=layer,
@@ -319,6 +328,18 @@ def make_lm_head(
         produce_bar_idx=0,
         extra_tiles=extra_tiles,
     )
+
+
+def make_lm_argmax(
+    wait_bar_idx: int,
+    wait_target: int,
+) -> list[int]:
+    """TG_LM_ARGMAX. Terminal per-batch argmax; no produce bar.
+
+    Layout: inst[6]=wait_bar_idx (bar_lm_head), inst[7]=wait_target
+    (= total LM_HEAD tiles = vocab / lm_head_bn).
+    """
+    return _inst(TgOp.LM_ARGMAX, 0, 0, 0, 0, 0, wait_bar_idx, wait_target)
 
 
 # =============================================================================
@@ -556,7 +577,15 @@ def build_attn_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
 
 
 def build_attn_combine_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
-    """Wave 2: ATTN_COMBINE (only when attn_splits > 1)."""
+    """Wave 2: ATTN_COMBINE (only when attn_splits > 1).
+
+    NOT EXECUTABLE YET: ``tg_attn_decode_op`` does not write ``o_partial`` /
+    ``lse_partial`` (it only arrives ``bar_combine``), so a combine instruction
+    would read uninitialised partials. The schedule is still built for
+    ``attn_splits > 1`` so the ABI/bar-dimension tests can cover it; do not
+    launch a kernel built with ``attn_splits > 1`` until the partial stores are
+    implemented.
+    """
     if geo.attn_splits <= 1:
         return []
     out: list[list[int]] = []
@@ -695,15 +724,20 @@ def build_add_rmsnorm_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
 
 
 def build_lm_head_wave(geo: TgGeometry) -> list[list[int]]:
-    """Wave 7 (last layer only): LM_HEAD. N = vocab = 151936 -> 9496 tiles.
+    """Wave 7 (last layer only): LM_HEAD tiles + the terminal LM_ARGMAX.
 
-    Waits on ``bar_layer[num_layers]`` (produced by the final layer's
-    ADD_RMSNORM) with target = BS (all rows' final rmsnorm)."""
+    N = vocab = 151936 -> 9496 tiles. The tiles wait on
+    ``bar_layer[num_layers]`` (produced by the final layer's ADD_RMSNORM) with
+    target = BS (all rows' final rmsnorm), and produce ``bar_lm_head[0]`` with
+    inc = tile count. The trailing LM_ARGMAX waits for every tile on every SM,
+    then scans each row's logits and stores the token id.
+    """
     wait_idx = TgBarIndex.layer(geo.num_layers)  # == num_layers (the +1 slot)
     wait_target = geo.BS  # all rows' final rmsnorm
     out: list[list[int]] = []
     bn = geo.tiling.lm_head_bn
-    for tile_n in range(geo.vocab // bn):
+    num_tiles = geo.vocab // bn
+    for tile_n in range(num_tiles):
         out.append(
             make_lm_head(
                 layer=geo.num_layers - 1,
@@ -713,6 +747,8 @@ def build_lm_head_wave(geo: TgGeometry) -> list[list[int]]:
                 wait_target=wait_target,
             )
         )
+    # Terminal argmax: waits for all LM_HEAD tiles (cross-SM) before scanning.
+    out.append(make_lm_argmax(wait_bar_idx=0, wait_target=num_tiles))
     return out
 
 

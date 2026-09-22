@@ -144,7 +144,8 @@ class TaskGraphSmokeTests(unittest.TestCase):
         s["bar_silu"] = torch.zeros(d.bar_silu, **u32)
         s["bar_ffn_down"] = torch.zeros(d.bar_ffn_down, **u32)
         s["bar_layer"] = torch.zeros(d.bar_layer, **u32)
-        s["bar_combine"] = torch.zeros(max(d.bar_combine, 1), **u32)  # min size 1
+        s["bar_combine"] = torch.zeros(max(d.bar_combine, 1), **u32)
+        s["bar_lm_head"] = torch.zeros(d.bar_lm_head, **u32)  # min size 1
 
         # Paging
         s["page_table"] = torch.zeros(BS, 64, dtype=torch.int32, device="cuda")
@@ -170,7 +171,7 @@ class TaskGraphSmokeTests(unittest.TestCase):
         d = self.sched.bar_dims
         regions = []
         for key in ["bar_qkv", "bar_attn", "bar_oproj", "bar_silu",
-                     "bar_ffn_down", "bar_layer", "bar_combine",
+                     "bar_ffn_down", "bar_layer", "bar_combine", "bar_lm_head",
                      "norm_out", "q_out", "k_out", "v_out", "attn_out",
                      "o_proj_out", "x_attn", "post_attn_norm", "silu_out",
                      "ffn_down_out", "up_out", "x_ffn", "lm_logits", "o_partial",
@@ -239,7 +240,7 @@ class TaskGraphSmokeTests(unittest.TestCase):
             # bars
             s["bar_qkv"], s["bar_attn"], s["bar_oproj"],
             s["bar_silu"], s["bar_ffn_down"], s["bar_layer"],
-            s["bar_combine"],
+            s["bar_combine"], s["bar_lm_head"],
             # geometry
             NUM_LAYERS, BS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
             Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
@@ -303,7 +304,7 @@ class TaskGraphSmokeTests(unittest.TestCase):
             s["o_partial"], s["lse_partial"],
             s["bar_qkv"], s["bar_attn"], s["bar_oproj"],
             s["bar_silu"], s["bar_ffn_down"], s["bar_layer"],
-            s["bar_combine"],
+            s["bar_combine"], s["bar_lm_head"],
             NUM_LAYERS, BS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
             Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
             HEAD_DIM, 151936, 1, 1, 1,
@@ -316,6 +317,32 @@ class TaskGraphSmokeTests(unittest.TestCase):
         max_logit = logits.max().item()
         self.assertNotEqual(max_logit, 0.0, "lm_logits are all zero — kernel did no compute")
         print(f"\nMax logit: {max_logit:.4f}, argmax: {logits.argmax().item()}")
+
+    def test_zero_regions_clears_scratch_and_bars(self):
+        """tg_zero_regions must zero every region, from a CUDA-packed input.
+
+        Regression test for two bugs: the binding dereferenced a device
+        data_ptr on the host (segfault), and the kernel used the region index
+        as the starting byte offset (only a sparse fraction was cleared).
+        """
+        BS = 1
+        s = self._alloc_scratch(BS)
+        skip = {"inst_buf", "num_inst_per_sm", "page_table",
+                "cache_seqlens", "row_active"}
+        for k, v in s.items():
+            if k in skip:
+                continue
+            v.fill_(1)
+
+        regions = self._zero_regions(s)
+        _tg_ops.tg_zero_regions(regions, regions.shape[0])
+        torch.cuda.synchronize()
+
+        for k, v in s.items():
+            if k in skip:
+                continue
+            self.assertEqual(int(v.max().item()), 0,
+                             f"{k} was not fully zeroed by tg_zero_regions")
 
 
 if __name__ == "__main__":

@@ -120,6 +120,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
         s["bar_ffn_down"] = torch.zeros(d.bar_ffn_down, **u32)
         s["bar_layer"] = torch.zeros(d.bar_layer, **u32)
         s["bar_combine"] = torch.zeros(max(d.bar_combine, 1), **u32)
+        s["bar_lm_head"] = torch.zeros(d.bar_lm_head, **u32)
 
         s["page_table"] = torch.zeros(BS, 64, dtype=torch.int32, device="cuda")
         s["cache_seqlens"] = torch.zeros(BS, dtype=torch.int32, device="cuda")
@@ -134,16 +135,10 @@ class TaskGraphBS2Tests(unittest.TestCase):
 
         return s
 
-    def test_bs2_two_tokens(self):
-        """Run BS=2 with two different tokens and verify both outputs."""
-        BS = 2
+    def _run(self, token_ids):
+        """Run one decode step for ``token_ids`` and return the sampled tokens."""
+        BS = len(token_ids)
         s = self._alloc_scratch(BS)
-
-        # Two different input tokens that produce DIFFERENT outputs
-        # (most tokens at pos=0 produce 14582, but token 1234 → 38297)
-        token_ids = [42, 1234]
-
-        # Set up inputs for both batch rows
         for b, tid in enumerate(token_ids):
             s["x_resid"][b] = self.embed_weight[tid]
             s["cache_seqlens"][b] = 0  # first token, no previous KV
@@ -167,41 +162,58 @@ class TaskGraphBS2Tests(unittest.TestCase):
             s["o_partial"], s["lse_partial"],
             s["bar_qkv"], s["bar_attn"], s["bar_oproj"],
             s["bar_silu"], s["bar_ffn_down"], s["bar_layer"],
-            s["bar_combine"],
+            s["bar_combine"], s["bar_lm_head"],
             NUM_LAYERS, BS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
             Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
             HEAD_DIM, VOCAB, 1, 1, 1,
         )
-
         torch.cuda.synchronize()
+        # The argmax token is stored as int32 at lm_logits[batch, 0].
+        return [s["lm_logits"][b, 0].view(torch.int32).item() for b in range(BS)]
 
-        # Read output tokens (stored as int32 at lm_logits[batch, 0])
-        out_tokens = []
-        for b in range(BS):
-            tok = s["lm_logits"][b, 0].view(torch.int32).item()
-            out_tokens.append(tok)
+    def test_bs2_two_tokens(self):
+        """Run BS=2 with two different tokens and verify both outputs exactly."""
+        token_ids = [42, 1234]
+        out_tokens = self._run(token_ids)
 
-        print(f"\nBS=2 results:")
+        print("\nBS=2 results:")
         for b, (inp, out) in enumerate(zip(token_ids, out_tokens)):
-            print(f"  Batch {b}: input={inp} → output={out}")
+            print(f"  Batch {b}: input={inp} -> output={out}")
 
-        # Verify both are valid tokens
         for b, tok in enumerate(out_tokens):
             self.assertIsInstance(tok, int, f"Batch {b}: token is not int")
             self.assertGreaterEqual(tok, 0, f"Batch {b}: token negative")
             self.assertLess(tok, VOCAB, f"Batch {b}: token out of vocab range")
 
-        # The BS=1 test produces token 14582 for input 42.
-        # Token 1234 produces token 38297 (verified via PyTorch reference).
-        # With BS=2, each batch row should produce its own correct token.
-        self.assertNotEqual(out_tokens[0], 0, "Batch 0 produced token 0")
-        self.assertNotEqual(out_tokens[1], 0, "Batch 1 produced token 0")
-        # Both should be valid known tokens (14582 for input 42, 38297 for 1234)
-        # Allow some numerical flexibility — just check they're different from
-        # each other, proving the kernel handles batch rows independently.
-        self.assertNotEqual(out_tokens[0], out_tokens[1],
-                            "Both batch rows produced the same token — "
-                            "batch rows are not independent")
+        # Exact tokens verified against the PyTorch reference (test_tg_logits_compare).
+        # Override with TG_BS2_EXPECTED="a,b" if the model/checkpoint changes.
+        expected = [
+            int(x) for x in os.environ.get("TG_BS2_EXPECTED", "14582,38297").split(",")
+        ]
+        self.assertEqual(
+            out_tokens, expected,
+            f"BS=2 tokens {out_tokens} != expected {expected}; if the checkpoint "
+            f"changed, recompute via test_tg_logits_compare and set TG_BS2_EXPECTED",
+        )
+        self.assertNotEqual(
+            out_tokens[0], out_tokens[1],
+            "Both batch rows produced the same token — rows are not independent",
+        )
+
+    def test_bs2_matches_independent_bs1_runs(self):
+        """Each BS=2 row must equal the same token decoded alone at BS=1.
+
+        This is self-contained (no hardcoded reference): it directly detects the
+        class of bugs where one row's activations leak into another's.
+        """
+        token_ids = [42, 1234]
+        bs1 = [self._run([tid])[0] for tid in token_ids]
+        bs2 = self._run(token_ids)
+        print(f"\nBS=1 tokens: {bs1}  |  BS=2 tokens: {bs2}")
+        self.assertEqual(
+            bs2, bs1,
+            "BS=2 rows disagree with independent BS=1 runs — batch rows leak",
+        )
 
     def test_bs2_logits_nonzero(self):
         """Verify both batch rows have non-zero logits."""
@@ -232,7 +244,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
             s["o_partial"], s["lse_partial"],
             s["bar_qkv"], s["bar_attn"], s["bar_oproj"],
             s["bar_silu"], s["bar_ffn_down"], s["bar_layer"],
-            s["bar_combine"],
+            s["bar_combine"], s["bar_lm_head"],
             NUM_LAYERS, BS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
             Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
             HEAD_DIM, VOCAB, 1, 1, 1,

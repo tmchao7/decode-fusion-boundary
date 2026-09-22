@@ -105,12 +105,23 @@ __device__ __forceinline__ void tg_fence_gpu() {
   asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 
-// Consumer: wait for bar[idx] >= target.
-// TODO: implement real cross-SM bar wait (currently no-op — works only with
-// num_sms=1 __syncthreads dispatch where instructions are sequential).
+// Consumer: wait for bar[idx] >= target, then acquire.
+//
+// The poll must be a volatile load so the compiler does not hoist it out of the
+// loop (a cached register read would spin forever). Once the counter crosses
+// the threshold, fence.acq_rel.gpu orders the producer's published stores
+// before our subsequent loads. ``target == 0`` means "no dependency" (used by
+// layer 0, whose input is the embedding, not a previous RMSNorm).
 __device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx,
                                         uint32_t target) {
-  (void)bar; (void)idx; (void)target;
+  if (target == 0) {
+    tg_fence_gpu();
+    return;
+  }
+  const volatile uint32_t* p = bar + idx;
+  while (*p < target) {
+    __nanosleep(20);
+  }
   tg_fence_gpu();
 }
 
@@ -123,13 +134,23 @@ __device__ __forceinline__ void tg_arrive(uint32_t* bar, int idx,
 }
 
 // Wait on two counters simultaneously (ADD_RMSNORM waits on attn + ffn paths).
-// TODO: implement real cross-SM bar wait (currently no-op).
+// Polling both in one loop lets the consumer wake as soon as the LAST of the
+// two dependencies lands, instead of serializing the two waits.
 __device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
                                             uint32_t target1,
                                             const uint32_t* bar2, int idx2,
                                             uint32_t target2) {
-  (void)bar1; (void)idx1; (void)target1;
-  (void)bar2; (void)idx2; (void)target2;
+  const bool need1 = target1 > 0;
+  const bool need2 = target2 > 0;
+  if (!need1 && !need2) {
+    tg_fence_gpu();
+    return;
+  }
+  const volatile uint32_t* p1 = bar1 + idx1;
+  const volatile uint32_t* p2 = bar2 + idx2;
+  while ((need1 && *p1 < target1) || (need2 && *p2 < target2)) {
+    __nanosleep(20);
+  }
   tg_fence_gpu();
 }
 
@@ -348,6 +369,7 @@ struct TgGlobals {
   uint32_t* bar_ffn_down;
   uint32_t* bar_layer;
   uint32_t* bar_combine;
+  uint32_t* bar_lm_head;
 
   // geometry
   int num_layers;
@@ -413,6 +435,7 @@ __device__ __forceinline__ TgGlobals tg_make_globals(const tg::TgLaunchDesc& d) 
   g.bar_ffn_down = reinterpret_cast<uint32_t*>(d.bars.bar_ffn_down);
   g.bar_layer = reinterpret_cast<uint32_t*>(d.bars.bar_layer);
   g.bar_combine = reinterpret_cast<uint32_t*>(d.bars.bar_combine);
+  g.bar_lm_head = reinterpret_cast<uint32_t*>(d.bars.bar_lm_head);
 
   g.num_layers = d.num_layers;
   g.BS = d.BS;
@@ -1295,25 +1318,25 @@ __device__ __forceinline__ void tg_add_rmsnorm_op(
   tg_arrive(g.bar_layer, inst[7]);
 }
 
-// LM_HEAD: final RMSNorm + WMMA logits + argmax.
-// Terminal op (no produce bar). Waits on bar_layer[num_layers].
+// LM_HEAD: WMMA logits for a pack of vocab tiles. Waits on bar_layer[num_layers]
+// and produces bar_lm_head[0] with inc = NUM_TILES.
+//
+// The argmax is NOT done here: with num_sms > 1 another SM may not have written
+// its vocab tiles yet, so a per-instruction scan would read stale logits. The
+// terminal TG_LM_ARGMAX instruction waits for every tile via bar_lm_head.
 
 __device__ __forceinline__ void tg_lm_head_op(
     const int* inst, TgGlobals& g, int bid,
-    __nv_bfloat16* s_a, float* s_norm, float* s_reduce,
-    float* s_argmax_val, int* s_argmax_idx) {
+    __nv_bfloat16* s_a, float* s_norm) {
   int num_tiles = inst[9];
 
   tg_wait(g.bar_layer, inst[6], (uint32_t)inst[7]);
 
   int wtid = tg_wtid();
   int wwarp = tg_wwarp();
-  int wlane = tg_wlane();
 
-  // Final RMSNorm: x_resid → norm_out (already done by last ADD_RMSNORM)
-  // The last ADD_RMSNORM stores norm_out with final_norm_weight. So we
-  // can read norm_out directly. But we need it in shared memory for the GEMM.
-  // Copy all BS rows of norm_out to s_norm.
+  // The last ADD_RMSNORM already stored the final RMSNorm into norm_out.
+  // Copy all BS rows into shared memory for the WMMA A fragment.
   for (int i = wtid; i < g.BS * g.hidden; i += TG_NUM_WORKER_THREADS) {
     s_norm[i] = g.norm_out[i];
   }
@@ -1333,10 +1356,23 @@ __device__ __forceinline__ void tg_lm_head_op(
         wwarp, TG_WORKER_WARPS, s_a);
   }
 
-  // Argmax across all vocab tiles (per batch row)
-  // For Phase 1 with BS=1, just find the max logit.
-  // Each warp scans a chunk of vocab and finds local max, then warp 0 reduces.
-  // The lm_logits are float [BS, vocab].
+  tg_arrive(g.bar_lm_head, inst[8], (uint32_t)num_tiles);
+}
+
+// LM_ARGMAX: terminal per-batch argmax over the fully-written logits.
+//
+// Waits on bar_lm_head[inst[6]] >= inst[7] (== total LM_HEAD tiles), so every
+// SM's tiles are visible. Then each worker warp scans a slice of the vocab and
+// warp 0 reduces to the token id, stored as int32 at lm_logits[batch, 0].
+__device__ __forceinline__ void tg_lm_argmax_op(
+    const int* inst, TgGlobals& g, int bid,
+    float* s_argmax_val, int* s_argmax_idx) {
+  tg_wait(g.bar_lm_head, inst[6], (uint32_t)inst[7]);
+
+  int wtid = tg_wtid();
+  int wwarp = tg_wwarp();
+  int wlane = tg_wlane();
+
   for (int batch = 0; batch < g.BS; batch++) {
     float* logits = g.lm_logits + batch * g.vocab_size;
     float local_max = -INFINITY;
@@ -1434,8 +1470,10 @@ __device__ __forceinline__ void tg_dispatch(const int* inst, TgGlobals& g,
       tg_add_rmsnorm_op(inst, g, bid, smem.s_norm, smem.s_reduce);
       break;
     case tg::TG_LM_HEAD:
-      tg_lm_head_op(inst, g, bid, smem.s_a, smem.s_norm, smem.s_reduce,
-                    smem.s_argmax_val, smem.s_argmax_idx);
+      tg_lm_head_op(inst, g, bid, smem.s_a, smem.s_norm);
+      break;
+    case tg::TG_LM_ARGMAX:
+      tg_lm_argmax_op(inst, g, bid, smem.s_argmax_val, smem.s_argmax_idx);
       break;
     default:
       break;
@@ -1447,6 +1485,12 @@ __device__ __forceinline__ void tg_dispatch(const int* inst, TgGlobals& g,
 // Controller loop (warp 0). Prefetches instructions into the shared ring,
 // signalling workers via inst_arrived and waiting for inst_done before
 // reusing a ring slot. Adapted from cohere megakernel.cuh:3074-3095.
+//
+// NOTE: UNUSED SCAFFOLDING. The kernel entry currently dispatches with a plain
+// __syncthreads() loop (correctness-first; see tg_decode_kernel), so
+// tg_controller_loop / tg_worker_loop / the tg_ring_* semaphores are never
+// called. They are kept for the planned ring-buffer dispatch; delete or wire
+// them up when that lands.
 // =============================================================================
 
 __device__ __forceinline__ void tg_controller_loop(
@@ -1589,26 +1633,32 @@ extern "C" void tg_launch_decode(const tg::TgLaunchDesc* desc,
 // Adapted from cohere's nmc_zero_regions_kernel (runtime.cu:506-544).
 // =============================================================================
 
+// One region per blockIdx.y; blockIdx.x * blockDim.x + threadIdx.x threads
+// cooperatively clear that region with a grid-stride loop starting at offset 0.
+// (The previous version used the *region index* as the starting byte offset and
+// a grid-wide stride, so it only cleared a sparse 1/(gridDim.x*blockDim.x)
+// fraction of each region.)
 __global__ void tg_zero_regions_kernel(const tg::TgZeroRegion* regions,
                                        int num_regions) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= num_regions) return;
-  const tg::TgZeroRegion& r = regions[idx];
+  const int region = blockIdx.y;
+  if (region >= num_regions) return;
+  const tg::TgZeroRegion& r = regions[region];
   if (r.ptr == 0 || r.bytes == 0) return;
-  // cudaMemsetAsync would be simpler but coalescing one kernel across mixed
-  // regions saves launches. Use a byte-wise zero via int4 stores when aligned.
   char* p = reinterpret_cast<char*>(r.ptr);
-  int64_t bytes = (int64_t)r.bytes;
-  // Thread-cooperative clear: each thread zeroes a stride.
-  for (int64_t off = (int64_t)idx; off < bytes; off += (int64_t)gridDim.x * blockDim.x) {
+  const int64_t bytes = (int64_t)r.bytes;
+  const int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+  for (int64_t off = tid; off < bytes; off += stride) {
     p[off] = 0;
   }
 }
 
 extern "C" void tg_launch_zero_regions(const tg::TgZeroRegion* regions,
-                                       int num_regions, cudaStream_t stream) {
+                                       int num_regions, int blocks_per_region,
+                                       cudaStream_t stream) {
   if (num_regions <= 0) return;
-  int threads = 256;
-  int blocks = (num_regions + threads - 1) / threads;
-  tg_zero_regions_kernel<<<blocks, threads, 0, stream>>>(regions, num_regions);
+  if (blocks_per_region < 1) blocks_per_region = 1;
+  const int threads = 256;
+  dim3 grid(blocks_per_region, num_regions);
+  tg_zero_regions_kernel<<<grid, threads, 0, stream>>>(regions, num_regions);
 }
