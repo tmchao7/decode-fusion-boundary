@@ -50,8 +50,13 @@ GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS  # 2
 VOCAB = 151936
 _tg_ops = torch.ops.nanovllm_megakernel_C
 
-# Teacher-forced prompt. Length must stay <= block_size so one page suffices.
-PROMPT = [42, 1234, 100, 7]
+# Teacher-forced prompt. Length must stay <= num_cache_blocks * block_size.
+# It deliberately crosses a block boundary (block_size=16) so the paged KV
+# logical->physical mapping is exercised, not just block 0.
+PROMPT = [
+    42, 1234, 100, 7, 999, 555, 31337, 2, 888, 17,
+    4096, 63, 123, 77, 2024, 5, 1, 9999, 314, 271,
+]
 # Logit agreement with the reference. The kernel uses ex2.approx softmax and
 # rounds at different boundaries, so allow absolute slack; the position-0
 # comparison (test_tg_logits_compare) measured < 0.13, but errors can
@@ -261,7 +266,10 @@ class TaskGraphPositionTests(unittest.TestCase):
 
         s["x_resid"][0] = self.embed_weight[token_id]
         s["cache_seqlens"][0] = position
+        # Logical block 0 -> physical 0, logical block 1 -> physical 1 (the
+        # prompt crosses block_size=16).
         s["page_table"][0, 0] = 0
+        s["page_table"][0, 1] = 1
         s["row_active"][0] = 1
 
         _tg_ops.tg_decode_step(
