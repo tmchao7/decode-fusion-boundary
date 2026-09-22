@@ -39,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=parse_batches, default=[1])
     parser.add_argument("--context-len", type=int, default=512)
-    parser.add_argument("--num-sms", type=int, default=108)
+    parser.add_argument("--num-sms", type=int, default=0,
+                        help="grid size; 0 = the device's SM count")
     parser.add_argument("--num-steps", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--block-size", type=int, default=16)
@@ -49,6 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     import json
 
     import torch
+
+    if args.num_sms <= 0:
+        args.num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     from nanovllm.backends.megakernel.build import get_extension
     get_extension()

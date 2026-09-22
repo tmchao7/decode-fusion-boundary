@@ -603,7 +603,7 @@ run_taskgraph() {
   QWEN3_MODEL_PATH="$MODEL" \
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   PYTHONPATH=src python tools/bench_taskgraph.py \
-    --batch-size 1,2,4,8 --context-len 512 --num-sms "${TG_MULTI_SM:-108}" \
+    --batch-size 1,2,4,8 --context-len 512 \
     --json results/taskgraph_bench.json \
     2>&1 | tee results/taskgraph_bench.log
 }
