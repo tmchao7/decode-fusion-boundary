@@ -1029,7 +1029,14 @@ __device__ __forceinline__ void tg_attn_decode_op(
 
   // --- Phase A: K-norm + RoPE + KV cache write (one warp, warp 0 of workers) ---
   // K and V are written to the paged cache at the current position.
-  if (wwarp == 0) {
+  //
+  // Inactive rows must NOT write: a continuous-batching runtime frees the
+  // pages of finished sequences and hands them to a new sequence, so a stale
+  // row writing "its" old pages would corrupt the new owner. Everything else
+  // the row computes is harmless (row-private scratch; its output is ignored),
+  // and all bars still arrive so the wait targets stay valid.
+  const bool row_on = (g.row_active[batch] != 0);
+  if (wwarp == 0 && row_on) {
     float* k_head = k_base + kv_head * g.head_dim;
     float* v_head = v_base + kv_head * g.head_dim;
 

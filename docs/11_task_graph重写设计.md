@@ -723,6 +723,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 | `tg_zero_regions` | ✅ | 回归测试 + 静态检查 |
 | bar 自旋超时 trap | ✅ 编译 | nvcc |
 | cooperative launch 失败抛异常 | ✅ | 代码路径 |
+| `row_active`：inactive 行不写 KV cache | ✅ 编译 | nvcc；BS=2 测试（inactive 行的页保持哨兵值、active 行不受影响） |
 | 多 position / 跨 KV block / 自回归 greedy | ✅ 测试已写 | 待真机（对拍 causal PyTorch 参考） |
 
 ### 10.2 与设计稿的偏差
@@ -749,7 +750,8 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
   ATTN_COMBINE 按 `exp(lse - max_lse)` 重标定并归一化）。有对拍参考的测试 + 死锁模拟覆盖。
   注：attention 已按 SM×warp 并行，短/中 context 不缺这个 split。
 - `oproj_splits / down_splits > 1`：`build_schedule` 直接 `NotImplementedError`。
-- 连续批处理：`row_active` 未使用；缺 `runtime.cu`/session；`backend.py` 未接 taskgraph。
+- 连续批处理：kernel 侧已支持 `row_active`（inactive 行不写 KV，避免复用页被污染；
+  其余计算照跑、bar 照到达）；但缺 `runtime.cu`/scheduler/session，`backend.py` 未接 taskgraph。
 - sampling：只有 greedy argmax，无 temperature/top-p。
 
 ### 10.4 服务器实测待填

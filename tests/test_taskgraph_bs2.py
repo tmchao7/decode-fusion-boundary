@@ -135,7 +135,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
 
         return s
 
-    def _run(self, token_ids):
+    def _run(self, token_ids, row_active=None):
         """Run one decode step for ``token_ids`` and return the sampled tokens."""
         BS = len(token_ids)
         s = self._alloc_scratch(BS)
@@ -143,7 +143,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
             s["x_resid"][b] = self.embed_weight[tid]
             s["cache_seqlens"][b] = 0  # first token, no previous KV
             s["page_table"][b, 0] = b  # each row uses a different physical page
-            s["row_active"][b] = 1
+            s["row_active"][b] = 1 if row_active is None else int(row_active[b])
 
         _tg_ops.tg_decode_step(
             s["inst_buf"], s["num_inst_per_sm"],
@@ -199,6 +199,30 @@ class TaskGraphBS2Tests(unittest.TestCase):
             out_tokens[0], out_tokens[1],
             "Both batch rows produced the same token — rows are not independent",
         )
+
+    def test_inactive_row_leaves_its_kv_pages_untouched(self):
+        """A row with row_active == 0 must not write its KV pages.
+
+        A continuous-batching runtime frees the pages of finished sequences and
+        hands them to a new sequence, so a stale row writing "its" old pages
+        would corrupt the new owner. The active row must be unaffected.
+        """
+        # Row 0 alone, active: the reference output.
+        ref = self._run([42])[0]
+
+        # BS=2, row 1 inactive, its physical page (1) filled with a sentinel.
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        self.k_cache[:, 1] = 7.0
+        self.v_cache[:, 1] = 7.0
+        out = self._run([42, 1234], row_active=[1, 0])
+
+        self.assertEqual(out[0], ref,
+                         "the active row changed when its neighbour went inactive")
+        self.assertTrue(bool((self.k_cache[:, 1] == 7.0).all()),
+                        "inactive row wrote its K page")
+        self.assertTrue(bool((self.v_cache[:, 1] == 7.0).all()),
+                        "inactive row wrote its V page")
 
     def test_bs2_matches_independent_bs1_runs(self):
         """Each BS=2 row must equal the same token decoded alone at BS=1.
