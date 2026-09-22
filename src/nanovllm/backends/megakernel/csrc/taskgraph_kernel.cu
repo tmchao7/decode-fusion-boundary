@@ -618,6 +618,62 @@ __device__ __forceinline__ void tg_rmsnorm_f(
 }
 
 // =============================================================================
+// cp.async weight pipeline (sm_80 has no TMA).
+//
+// The GEMM is weight-bandwidth bound: per step the model streams ~1.2 GB of
+// weights, and the LM head alone is 311 MB. A synchronous
+// wmma::load_matrix_sync(b, W + ..., K) stalls the warp for the full global
+// latency every K step, so the SM can only keep a handful of loads in flight
+// (~550 GB/s measured headroom). We stage the B tile through shared memory
+// with cp.async and keep TG_B_STAGES copies in flight per warp.
+//
+// cohere does the same with TMA + `mbarrier.arrive.expect_tx`; on sm_80 the
+// equivalent is `cp.async.cg` + `cp.async.commit_group` /
+// `cp.async.wait_group`. `.cg` bypasses L1 (the weights have no reuse).
+// =============================================================================
+
+using namespace nvcuda;
+constexpr int TG_WMMA_TILE = 16;
+// In-flight weight stages per warp. TG_B_STAGES-1 real loads stay outstanding
+// after each wait, so with 6 active warps the SM keeps ~(STAGES-1)*6*512 B in
+// flight; 4 stages ~= 9 KB, roughly the HBM latency-bandwidth product per SM.
+constexpr int TG_B_STAGES = 4;
+
+// Per-warp B staging. File-scope __shared__ so the op bodies do not have to
+// thread another pointer through their signatures.
+__shared__ __align__(16)
+    __nv_bfloat16 tg_s_b[TG_WORKER_WARPS][TG_B_STAGES][TG_WMMA_TILE * TG_WMMA_TILE];
+
+__device__ __forceinline__ void tg_cp_async_16(__nv_bfloat16* s_dst,
+                                               const void* g_src) {
+  uint32_t saddr = (uint32_t)__cvta_generic_to_shared(s_dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+               :: "r"(saddr), "l"(g_src));
+}
+
+__device__ __forceinline__ void tg_cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+// Wait until at most PENDING async groups are outstanding.
+template <int PENDING>
+__device__ __forceinline__ void tg_cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(PENDING) : "memory");
+}
+
+// Stage W[n0..n0+15, k..k+15] (row-major, row stride K) into s_dst as a
+// row-major [16][16] tile. Each lane moves one 16-byte chunk (16 bf16 = 32 B
+// per row = 2 chunks; 16 rows * 2 = 32 lanes).
+__device__ __forceinline__ void tg_cp_async_b_tile(
+    __nv_bfloat16* s_dst, const __nv_bfloat16* W_base, int K, int k) {
+  int lane = tg_wlane();
+  int r = lane >> 1;   // row 0..15
+  int h = lane & 1;    // 16-byte half of the row
+  tg_cp_async_16(s_dst + r * TG_WMMA_TILE + h * 8,
+                 W_base + r * K + k + h * 8);
+}
+
+// =============================================================================
 // WMMA GEMM — ported from kernel.cu:962-1012, adapted for 7 worker warps.
 //
 // Computes C[M,N] = H[M,K] @ W[N,K]^T (W is stored row-major as [N,K]).
@@ -625,12 +681,13 @@ __device__ __forceinline__ void tg_rmsnorm_f(
 // (float→bf16 staging); all warps share the same s_a because for M≤16
 // (decode BS≤8), tiles_M=1 and all warps use the same A row.
 //
+// The B fragment is staged through tg_s_b with a TG_B_STAGES-deep cp.async
+// pipeline so the weight load of K step ks+TG_B_STAGES-1 overlaps the A
+// staging and mma of step ks.
+//
 // STRIDE_K: row stride of H (e.g. HIDDEN for QKV input).
 // STRIDE_N: row stride of C (e.g. Q_SIZE for Q output).
 // =============================================================================
-
-using namespace nvcuda;
-constexpr int TG_WMMA_TILE = 16;
 
 template <int STRIDE_K, int STRIDE_N>
 __device__ __forceinline__ void tg_wmma_gemm(
@@ -646,7 +703,9 @@ __device__ __forceinline__ void tg_wmma_gemm(
   // Compute the max iterations any warp will do, and have all warps loop
   // that many times (idle warps skip work but still hit the syncs).
   const int my_max_tiles = (total_tiles + num_warps - 1) / num_warps;
+  const int num_k = K / TG_WMMA_TILE;
   int wtid = tg_wtid();
+  __nv_bfloat16* s_b = &tg_s_b[global_warp][0][0];
 
   for (int t = 0; t < my_max_tiles; ++t) {
     int tile = global_warp + t * num_warps;
@@ -655,13 +714,38 @@ __device__ __forceinline__ void tg_wmma_gemm(
     int tc = active ? (tile % tiles_N) : 0;
     int m0 = tr * TG_WMMA_TILE;
     int n0 = tc * TG_WMMA_TILE;
+    const __nv_bfloat16* w_base = W + n0 * K;
 
     wmma::fragment<wmma::accumulator, TG_WMMA_TILE, TG_WMMA_TILE,
                    TG_WMMA_TILE, float> acc;
     wmma::fill_fragment(acc, 0.0f);
 
-    for (int k = 0; k < K; k += TG_WMMA_TILE) {
-      // Fill s_a with A fragment (float -> bf16). All worker threads cooperate.
+    // Prologue: fill the pipeline with the first TG_B_STAGES-1 K steps. An
+    // empty commit_group is still a group, which keeps the group accounting
+    // uniform for short K (and for idle warps).
+    #pragma unroll
+    for (int s = 0; s < TG_B_STAGES - 1; ++s) {
+      if (active && s < num_k)
+        tg_cp_async_b_tile(s_b + s * (TG_WMMA_TILE * TG_WMMA_TILE), w_base, K,
+                           s * TG_WMMA_TILE);
+      tg_cp_async_commit();
+    }
+
+    for (int ks = 0; ks < num_k; ++ks) {
+      // Issue one stage ahead. Always commit so exactly TG_B_STAGES groups
+      // are outstanding at the wait (wait<STAGES-1> then completes stage ks).
+      const int ahead = ks + TG_B_STAGES - 1;
+      if (active && ahead < num_k)
+        tg_cp_async_b_tile(
+            s_b + (ahead % TG_B_STAGES) * (TG_WMMA_TILE * TG_WMMA_TILE),
+            w_base, K, ahead * TG_WMMA_TILE);
+      tg_cp_async_commit();
+      tg_cp_async_wait<TG_B_STAGES - 1>();
+      __syncwarp();  // make this warp's cp.async writes visible to its lanes
+
+      // Fill s_a with the A fragment (float -> bf16). All worker threads
+      // cooperate; the barrier below publishes it to every warp.
+      const int k = ks * TG_WMMA_TILE;
       for (int idx = wtid; idx < TG_WMMA_TILE * TG_WMMA_TILE;
            idx += TG_NUM_WORKER_THREADS) {
         int mi = idx / TG_WMMA_TILE, ki = idx % TG_WMMA_TILE;
@@ -677,16 +761,24 @@ __device__ __forceinline__ void tg_wmma_gemm(
                        TG_WMMA_TILE, __nv_bfloat16, wmma::row_major> a;
         wmma::load_matrix_sync(a, s_a, TG_WMMA_TILE);
 
+        // The staged tile is row-major [16][16] = W[n0+r, k+c], so the B
+        // fragment b(r,c) = W[n0+c, k+r] is its transpose: load col_major.
         wmma::fragment<wmma::matrix_b, TG_WMMA_TILE, TG_WMMA_TILE,
                        TG_WMMA_TILE, __nv_bfloat16, wmma::col_major> b;
-        wmma::load_matrix_sync(b, W + n0 * K + k, K);
+        wmma::load_matrix_sync(
+            b, s_b + (ks % TG_B_STAGES) * (TG_WMMA_TILE * TG_WMMA_TILE),
+            TG_WMMA_TILE);
 
         wmma::mma_sync(acc, a, b, acc);
       }
-      // Ensure all warps have finished reading s_a before the next k iteration
-      // overwrites it.  All warps must hit this sync, even idle ones.
+      // Ensure all warps have finished reading s_a (and their B stage) before
+      // the next k iteration overwrites either. All warps must hit this sync,
+      // even idle ones.
       tg_worker_sync_inner();
     }
+    // Drain the trailing (empty) commit groups so the next tile's pipeline
+    // starts from a known group count.
+    tg_cp_async_wait<0>();
     if (active) {
       wmma::store_matrix_sync(C + m0 * STRIDE_N + n0, acc, STRIDE_N,
                               wmma::mem_row_major);
