@@ -847,9 +847,17 @@ class TgSchedule:
 def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
     """Build the full per-SM instruction stream for one decode step.
 
-    Assembles 28 layers × 7 waves + LM_HEAD, places them round-robin, and
-    serializes. Pure function of (geo, num_sms) — no GPU state, fully testable.
+    Assembles 28 layers × 7 waves + LM_HEAD + LM_ARGMAX, places them
+    round-robin, and serializes. Pure function of (geo, num_sms) — no GPU
+    state, fully testable.
     """
+    if geo.tiling.oproj_splits != 1 or geo.tiling.down_splits != 1:
+        raise NotImplementedError(
+            "oproj_splits / down_splits > 1 are not implemented: the kernel "
+            "GEMMs always run the full K/N, and build_ffn_upgate_wave would "
+            "emit every tile once per split (duplicated work + double bar "
+            "arrivals). Keep both at 1 until split-K accumulation lands."
+        )
     waves: list[list[list[int]]] = []
     for layer in range(geo.num_layers):
         waves.extend(build_layer_waves(geo, layer))

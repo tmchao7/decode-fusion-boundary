@@ -105,6 +105,10 @@ __device__ __forceinline__ void tg_fence_gpu() {
   asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 
+// Defined in the worker-sync section below; forward-declared because tg_arrive
+// (which must publish all worker warps' stores) uses it.
+__device__ __forceinline__ void tg_worker_sync_inner();
+
 // Consumer: wait for bar[idx] >= target, then acquire.
 //
 // The poll must be a volatile load so the compiler does not hoist it out of the
@@ -126,11 +130,31 @@ __device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx,
 }
 
 // Producer: signal bar[idx] += inc (after this CTA's global stores are visible).
+//
+// Two invariants, both load-bearing:
+//  1. All worker warps must have finished their global stores before the
+//     counter is bumped, so consumers that observe the bump see the data.
+//     The worker barrier below provides that ordering.
+//  2. Exactly ONE thread per CTA may bump the counter. The schedule's wait
+//     targets count one arrival per instruction (see the ABI test's
+//     produce/wait accounting), so a per-thread atomicAdd would multiply every
+//     arrival by TG_NUM_WORKER_THREADS (224) and release every consumer 224x
+//     early. This was invisible while tg_wait was a no-op and is fatal for
+//     num_sms > 1.
+//
+// Mirrors cohere megakernel.cuh (worker_sync, then lane-0 arrive_cross_sm) and
+// kernel.cu's AtomicGridSync (barrier, then a one-thread fence + atomicAdd).
 __device__ __forceinline__ void tg_arrive(uint32_t* bar, int idx,
                                           uint32_t inc = 1) {
-  // Release: publish my global writes to GPU scope before the atomic signal.
+  tg_worker_sync_inner();
+  // Release: publish this CTA's global writes to GPU scope before the signal.
+  // The fence is per-thread, but it runs after the worker barrier, so the
+  // other threads' stores are ordered before it via the barrier's release/
+  // acquire edges (same argument as kernel.cu's AtomicGridSync comment).
   tg_fence_gpu();
-  atomicAdd(bar + idx, inc);
+  if (threadIdx.x == TG_WARP_SIZE) {
+    atomicAdd(bar + idx, inc);
+  }
 }
 
 // Wait on two counters simultaneously (ADD_RMSNORM waits on attn + ffn paths).
@@ -662,10 +686,18 @@ __device__ __forceinline__ void tg_wmma_gemm(
 //   first half (i < hd/2):  out[i] = x[i]*cos[i] - x[i+hd/2]*sin[i]
 //   second half (i >= hd/2): out[i] = x[i-hd/2]*sin[i] + x[i]*cos[i]
 //
-// Each lane owns 4 contiguous elements. The mirror partner is in a possibly
-// different lane, fetched via __shfl_sync. cos/sin tables are
-// [max_seq_len, head_dim] (NOT head_dim*2 — the .repeat(1,2) in model.py
-// doubles the 64-wide freqs to 128-wide = HEAD_DIM).
+// Each lane owns the elements i = lane + j*WARP_SIZE (4 of them for head_dim
+// 128), i.e. strided, NOT contiguous. With that layout the mirror partner
+// (i +/- head_dim/2) lives in lane (pi % 32) at index pi/32, which is exactly
+// what the __shfl_sync below fetches. This must match kernel.cu's RoPE and the
+// inlined copy in tg_attn_decode_op; an earlier revision used a lane*4 layout
+// here and silently wrote only the 32 multiples of 4.
+//
+// cos/sin tables are [max_seq_len, head_dim] (NOT head_dim*2 — the
+// .repeat(1,2) in model.py doubles the 64-wide freqs to 128-wide = HEAD_DIM).
+//
+// NOTE: currently unused — tg_attn_decode_op inlines its own copy. Kept
+// correct so it is safe to call if the two are ever unified.
 // =============================================================================
 
 __device__ __forceinline__ void tg_rope(
@@ -675,11 +707,11 @@ __device__ __forceinline__ void tg_rope(
   int lane = tg_wlane();
   float local[4];
   #pragma unroll
-  for (int i = lane * 4, j = 0; i < head_dim; i += TG_WARP_SIZE, j++)
+  for (int i = lane, j = 0; i < head_dim; i += TG_WARP_SIZE, j++)
     local[j] = val[i];
 
   #pragma unroll
-  for (int i = lane * 4, j = 0; i < head_dim; i += TG_WARP_SIZE, j++) {
+  for (int i = lane, j = 0; i < head_dim; i += TG_WARP_SIZE, j++) {
     float cv = __bfloat162float(__ldg(cos_pos + i));
     float sv = __bfloat162float(__ldg(sin_pos + i));
     int po = (i < head_dim / 2) ? head_dim / 2 : -head_dim / 2;
