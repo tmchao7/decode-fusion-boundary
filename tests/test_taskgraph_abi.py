@@ -496,6 +496,23 @@ class DependencyGraphTests(unittest.TestCase):
                     self.assertLess(inst[6], self._bar_len("bar_lm_head"))
                 # NOP: no bar refs
 
+    def test_packed_gemm_tiles_are_consecutive(self) -> None:
+        """A packed GEMM group becomes ONE kernel GEMM call with
+        ``N = num_tiles * 16`` based at the first tile's ``tile_n``. The group's
+        ``tile_n`` values must therefore be consecutive; a gap would make that
+        single call cover the wrong weight/output range."""
+        for inst in self._iter_instructions():
+            op = inst[0]
+            if op not in (tg.TgOp.O_PROJ, tg.TgOp.FFN_UPGATE_ACT,
+                          tg.TgOp.FFN_DOWN, tg.TgOp.LM_HEAD):
+                continue
+            num_tiles = inst[9]
+            tile_ns = [inst[10 + t] & 0xFFFF for t in range(num_tiles)]
+            self.assertEqual(
+                tile_ns, list(range(tile_ns[0], tile_ns[0] + num_tiles)),
+                f"packed tile_n not consecutive for opcode {op}: {tile_ns}",
+            )
+
     def test_every_produced_bar_slot_is_waited_upon(self) -> None:
         """For each bar slot, total arrivals produced must equal the max
         wait_target demanded by any consumer. Deadlock if produces < max_target;

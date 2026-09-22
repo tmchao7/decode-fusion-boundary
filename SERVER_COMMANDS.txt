@@ -581,16 +581,19 @@ run_taskgraph() {
   PYTHONPATH=src python -m unittest tests.test_taskgraph_abi -v \
     2>&1 | tee results/taskgraph_abi.log
 
-  # Kernel tests. test_taskgraph_multi_sm is the one that actually spreads
-  # instructions across CTAs and exercises the cross-SM tg_wait; the smoke and
-  # BS=2 tests run num_sms=1 (sequential) and only cover numerics.
+  # Kernel tests. test_taskgraph_multi_sm and the *_multi_sm variant of
+  # test_taskgraph_positions are the only ones that spread instructions across
+  # CTAs and exercise the cross-SM tg_wait; smoke/bs2 run num_sms=1.
+  # test_taskgraph_positions is the only multi-position (cache_len > 1) test —
+  # it covers RoPE at non-zero positions, the online softmax and paged KV.
   # TG_MULTI_SM=108 uses the full A100 grid.
   QWEN3_MODEL_PATH="$MODEL" \
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   PYTHONPATH=src python -m unittest \
     tests.test_taskgraph_smoke \
     tests.test_taskgraph_bs2 \
-    tests.test_taskgraph_multi_sm -v \
+    tests.test_taskgraph_multi_sm \
+    tests.test_taskgraph_positions -v \
     2>&1 | tee results/taskgraph_kernel.log
 }
 

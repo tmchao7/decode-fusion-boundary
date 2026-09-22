@@ -116,17 +116,26 @@ __device__ __forceinline__ void tg_worker_sync_inner();
 // the threshold, fence.acq_rel.gpu orders the producer's published stores
 // before our subsequent loads. ``target == 0`` means "no dependency" (used by
 // layer 0, whose input is the embedding, not a previous RMSNorm).
+//
+// Only worker warp 0 polls; the other 6 block on the worker barrier. With 108
+// resident CTAs, having all 224 threads spin would put ~24k threads on a
+// handful of L2 counter lines and throttle the producers' atomicAdds. The
+// acquire is published to the other warps by the barrier's release/acquire
+// edges (warp 0's acquire happens-before its barrier arrival).
 __device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx,
                                         uint32_t target) {
   if (target == 0) {
     tg_fence_gpu();
     return;
   }
-  const volatile uint32_t* p = bar + idx;
-  while (*p < target) {
-    __nanosleep(20);
+  if (tg_wwarp() == 0) {
+    const volatile uint32_t* p = bar + idx;
+    while (*p < target) {
+      __nanosleep(20);
+    }
+    tg_fence_gpu();
   }
-  tg_fence_gpu();
+  tg_worker_sync_inner();
 }
 
 // Producer: signal bar[idx] += inc (after this CTA's global stores are visible).
@@ -159,7 +168,8 @@ __device__ __forceinline__ void tg_arrive(uint32_t* bar, int idx,
 
 // Wait on two counters simultaneously (ADD_RMSNORM waits on attn + ffn paths).
 // Polling both in one loop lets the consumer wake as soon as the LAST of the
-// two dependencies lands, instead of serializing the two waits.
+// two dependencies lands, instead of serializing the two waits. Same
+// warp-0-polls + worker-barrier scheme as tg_wait.
 __device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
                                             uint32_t target1,
                                             const uint32_t* bar2, int idx2,
@@ -170,12 +180,15 @@ __device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
     tg_fence_gpu();
     return;
   }
-  const volatile uint32_t* p1 = bar1 + idx1;
-  const volatile uint32_t* p2 = bar2 + idx2;
-  while ((need1 && *p1 < target1) || (need2 && *p2 < target2)) {
-    __nanosleep(20);
+  if (tg_wwarp() == 0) {
+    const volatile uint32_t* p1 = bar1 + idx1;
+    const volatile uint32_t* p2 = bar2 + idx2;
+    while ((need1 && *p1 < target1) || (need2 && *p2 < target2)) {
+      __nanosleep(20);
+    }
+    tg_fence_gpu();
   }
-  tg_fence_gpu();
+  tg_worker_sync_inner();
 }
 
 // =============================================================================
@@ -1151,25 +1164,19 @@ __device__ __forceinline__ void tg_o_proj_op(
       tg_layer_weight(g.layer_weights, layer, tg::TG_LW_O_PROJ);
   int wwarp = tg_wwarp();
 
-  // For each packed tile, compute the 16x16 GEMM
-  for (int t = 0; t < num_tiles; t++) {
-    int packed = inst[10 + t];
-    int tile_m = packed >> 16;
-    int tile_n = packed & 0xFFFF;
-
-    // M = BS (all batch rows), K = q_size, N = 16 (one tile)
-    // weight is [hidden, q_size] row-major; tile's weight starts at
-    // weight + tile_n*16*q_size
-    // output is o_proj_out[batch*hidden + tile_n*16]
-    tg_wmma_gemm<TG_Q_SIZE, TG_HIDDEN>(
-        g.attn_out,  // [BS, q_size]
-        weight + tile_n * TG_WMMA_TILE * TG_Q_SIZE,
-        g.o_proj_out + tile_n * TG_WMMA_TILE,  // [BS, hidden]
-        g.BS,  // M = batch size
-        TG_WMMA_TILE,  // N = 16
-        TG_Q_SIZE,  // K = q_size
-        wwarp, TG_WORKER_WARPS, s_a);
-  }
+  // ONE GEMM call covering all packed tiles (they are contiguous tile_n; the
+  // packer enforces this). Passing N = num_tiles*16 makes tg_wmma_gemm split
+  // the N tiles across all worker warps. Looping one 16-wide GEMM per tile
+  // would serialize them on warp 0 and leave the other 6 warps idle.
+  const int tile_n0 = inst[10] & 0xFFFF;
+  tg_wmma_gemm<TG_Q_SIZE, TG_HIDDEN>(
+      g.attn_out,  // [BS, q_size]
+      weight + tile_n0 * TG_WMMA_TILE * TG_Q_SIZE,
+      g.o_proj_out + tile_n0 * TG_WMMA_TILE,  // [BS, hidden]
+      g.BS,  // M = batch size
+      num_tiles * TG_WMMA_TILE,  // N = 16 per packed tile
+      TG_Q_SIZE,  // K = q_size
+      wwarp, TG_WORKER_WARPS, s_a);
 
   tg_arrive(g.bar_oproj, inst[8], (uint32_t)num_tiles);
 }
@@ -1198,6 +1205,15 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
   // Phase 1: residual add + RMSNorm (per batch row, redundantly computed)
   // For BS=1, there's only one row. For BS>1, each tile instruction does all
   // rows (since M=BS in the GEMM, all rows are needed).
+  //
+  // Every tile instruction re-derives x_attn from o_proj_out + x_resid and
+  // writes the same values to g.x_attn, so with num_sms > 1 concurrent CTAs
+  // write identical values to the same addresses. That is intentional and
+  // safe (32-bit aligned stores; every instruction writes before its own
+  // RMSNorm reads, and ADD_RMSNORM reads only after bar_ffn_down). It will
+  // still be reported by compute-sanitizer racecheck; a cleaner split would
+  // hoist this into a per-layer POST_ATTN_NORM instruction producing its own
+  // bar (the ABI already reserves post_attn_norm for that).
   for (int batch = 0; batch < g.BS; batch++) {
     float* x_attn = g.x_attn + batch * g.hidden;
     float* o_proj = g.o_proj_out + batch * g.hidden;
@@ -1221,25 +1237,24 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
   const __nv_bfloat16* up_w =
       tg_layer_weight(g.layer_weights, layer, tg::TG_LW_UP_PROJ);
 
-  for (int t = 0; t < num_tiles; t++) {
-    int packed = inst[10 + t];
-    int tile_n = packed & 0xFFFF;
-
-    // Gate GEMM → silu_out:
-    tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
-        s_norm,
-        gate_w + tile_n * TG_WMMA_TILE * g.hidden,
-        g.silu_out + tile_n * TG_WMMA_TILE,
-        g.BS, TG_WMMA_TILE, g.hidden,
-        wwarp, TG_WORKER_WARPS, s_a);
-    // Up GEMM → up_out:
-    tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
-        s_norm,
-        up_w + tile_n * TG_WMMA_TILE * g.hidden,
-        g.up_out + tile_n * TG_WMMA_TILE,
-        g.BS, TG_WMMA_TILE, g.hidden,
-        wwarp, TG_WORKER_WARPS, s_a);
-  }
+  // One GEMM per operand covering all packed (contiguous) tiles, so the N
+  // tiles are split across the worker warps instead of serialized on warp 0.
+  const int tile_n0 = inst[10] & 0xFFFF;
+  const int n_total = num_tiles * TG_WMMA_TILE;
+  // Gate GEMM → silu_out:
+  tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
+      s_norm,
+      gate_w + tile_n0 * TG_WMMA_TILE * g.hidden,
+      g.silu_out + tile_n0 * TG_WMMA_TILE,
+      g.BS, n_total, g.hidden,
+      wwarp, TG_WORKER_WARPS, s_a);
+  // Up GEMM → up_out:
+  tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
+      s_norm,
+      up_w + tile_n0 * TG_WMMA_TILE * g.hidden,
+      g.up_out + tile_n0 * TG_WMMA_TILE,
+      g.BS, n_total, g.hidden,
+      wwarp, TG_WORKER_WARPS, s_a);
 
   // Phase 3: SiLU(gate) * up (elementwise) — ONLY for this instruction's tiles.
   // Each instruction packs up to 6 tiles; each tile covers 16 columns of the
@@ -1278,17 +1293,14 @@ __device__ __forceinline__ void tg_ffn_down_op(
       tg_layer_weight(g.layer_weights, layer, tg::TG_LW_DOWN_PROJ);
   int wwarp = tg_wwarp();
 
-  for (int t = 0; t < num_tiles; t++) {
-    int packed = inst[10 + t];
-    int tile_n = packed & 0xFFFF;
-
-    tg_wmma_gemm<TG_INTERMEDIATE, TG_HIDDEN>(
-        g.silu_out,  // [BS, intermediate]
-        weight + tile_n * TG_WMMA_TILE * g.intermediate,
-        g.ffn_down_out + tile_n * TG_WMMA_TILE,  // [BS, hidden]
-        g.BS, TG_WMMA_TILE, g.intermediate,
-        wwarp, TG_WORKER_WARPS, s_a);
-  }
+  // One GEMM for all packed (contiguous) tiles; warps split the N tiles.
+  const int tile_n0 = inst[10] & 0xFFFF;
+  tg_wmma_gemm<TG_INTERMEDIATE, TG_HIDDEN>(
+      g.silu_out,  // [BS, intermediate]
+      weight + tile_n0 * TG_WMMA_TILE * g.intermediate,
+      g.ffn_down_out + tile_n0 * TG_WMMA_TILE,  // [BS, hidden]
+      g.BS, num_tiles * TG_WMMA_TILE, g.intermediate,
+      wwarp, TG_WORKER_WARPS, s_a);
 
   tg_arrive(g.bar_ffn_down, inst[8], (uint32_t)num_tiles);
 }
@@ -1375,18 +1387,16 @@ __device__ __forceinline__ void tg_lm_head_op(
   tg_worker_sync_inner();
 
   // WMMA GEMM: lm_logits = norm_out @ embed_weight^T
-  // embed_weight is [vocab, hidden] row-major (= LM head weight, tied)
-  for (int t = 0; t < num_tiles; t++) {
-    int packed = inst[10 + t];
-    int tile_n = packed & 0xFFFF;
-
-    tg_wmma_gemm<TG_HIDDEN, TG_VOCAB>(
-        s_norm,  // [BS, hidden] in shared memory
-        g.embed_weight + tile_n * TG_WMMA_TILE * g.hidden,
-        g.lm_logits + tile_n * TG_WMMA_TILE,  // [BS, vocab]
-        g.BS, TG_WMMA_TILE, g.hidden,
-        wwarp, TG_WORKER_WARPS, s_a);
-  }
+  // embed_weight is [vocab, hidden] row-major (= LM head weight, tied).
+  // One GEMM for all packed (contiguous) tiles; warps split the N tiles. This
+  // is the largest GEMM of the step (vocab x hidden), so the fan-out matters.
+  const int tile_n0 = inst[10] & 0xFFFF;
+  tg_wmma_gemm<TG_HIDDEN, TG_VOCAB>(
+      s_norm,  // [BS, hidden] in shared memory
+      g.embed_weight + tile_n0 * TG_WMMA_TILE * g.hidden,
+      g.lm_logits + tile_n0 * TG_WMMA_TILE,  // [BS, vocab]
+      g.BS, num_tiles * TG_WMMA_TILE, g.hidden,
+      wwarp, TG_WORKER_WARPS, s_a);
 
   tg_arrive(g.bar_lm_head, inst[8], (uint32_t)num_tiles);
 }

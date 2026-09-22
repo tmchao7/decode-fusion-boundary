@@ -411,9 +411,15 @@ def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[li
 
     This is a simple greedy pack: it groups runs of instructions that share
     everything except (tile_m, tile_n) and emits one instruction per group with
-    the tiles in ``TILE_IDS``. The kernel's worker loop fans the packed tiles
-    out across its warps. Packing cuts inst_buf size by up to 6x without
+    the tiles in ``TILE_IDS``. Packing cuts inst_buf size by up to 6x without
     changing the dependency graph.
+
+    The kernel turns each group into ONE GEMM call with
+    ``N = num_tiles * TG_WMMA_TILE`` based at the first tile's ``tile_n``, so
+    the packed tiles MUST be consecutive in ``tile_n``. That lets
+    ``tg_wmma_gemm`` split the N tiles across the worker warps instead of
+    serializing them on warp 0. The grouping loop below therefore breaks the
+    run on a non-consecutive ``tile_n``.
 
     Only applies to the generic GEMM opcodes (O_PROJ / FFN_UPGATE_ACT /
     FFN_DOWN / LM_HEAD); QKV/ATTN/ADD_RMSNORM have opcode-specific layouts
@@ -441,6 +447,11 @@ def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[li
                 break
             nxt_key = (nxt[1], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8])
             if nxt_key != key:
+                break
+            # The kernel derives N = num_tiles*16 from the first tile_n, so the
+            # group must stay consecutive in tile_n (inst[3]). A gap would make
+            # that one GEMM cover the wrong weight/output range.
+            if nxt[3] != group[-1][1] + 1:
                 break
             group.append((nxt[2], nxt[3]))
             j += 1
