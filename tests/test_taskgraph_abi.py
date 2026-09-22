@@ -307,6 +307,17 @@ class InstructionEncodingTests(unittest.TestCase):
         self.assertEqual(inst[6], 1)       # WAIT_TARGET
         self.assertEqual(inst[7], 27)      # PRODUCE_BAR_IDX
         self.assertEqual(inst[8], 2)       # BATCH_ROW
+        self.assertEqual(inst[9], 1)       # NUM_TILES
+        self.assertEqual(inst[10], 5)      # first tile_n of the pack
+
+    def test_qkv_proj_packs_extra_tiles(self) -> None:
+        inst = tg.make_qkv_proj(
+            layer=0, tile_n=6, gemm_idx=0, needs_rope=True,
+            wait_bar_idx=0, wait_target=0, produce_bar_idx=0, batch_row=0,
+            extra_tiles=[7, 8, 9],
+        )
+        self.assertEqual(inst[9], 4)       # NUM_TILES = 1 primary + 3 extra
+        self.assertEqual(inst[10:14], [6, 7, 8, 9])
 
     def test_gemm_packs_extra_tiles_into_tile_ids(self) -> None:
         inst = tg.make_gemm(
@@ -503,11 +514,17 @@ class DependencyGraphTests(unittest.TestCase):
         single call cover the wrong weight/output range."""
         for inst in self._iter_instructions():
             op = inst[0]
-            if op not in (tg.TgOp.O_PROJ, tg.TgOp.FFN_UPGATE_ACT,
-                          tg.TgOp.FFN_DOWN, tg.TgOp.LM_HEAD):
+            if op == tg.TgOp.QKV_PROJ:
+                # QKV packs tile_n directly at data[10..15] (no tile_m).
+                num_tiles = inst[9]
+                tile_ns = [inst[10 + t] for t in range(num_tiles)]
+            elif op in (tg.TgOp.O_PROJ, tg.TgOp.FFN_UPGATE_ACT,
+                        tg.TgOp.FFN_DOWN, tg.TgOp.LM_HEAD):
+                # Generic GEMM packs (tile_m << 16) | tile_n.
+                num_tiles = inst[9]
+                tile_ns = [inst[10 + t] & 0xFFFF for t in range(num_tiles)]
+            else:
                 continue
-            num_tiles = inst[9]
-            tile_ns = [inst[10 + t] & 0xFFFF for t in range(num_tiles)]
             self.assertEqual(
                 tile_ns, list(range(tile_ns[0], tile_ns[0] + num_tiles)),
                 f"packed tile_n not consecutive for opcode {op}: {tile_ns}",
@@ -519,11 +536,12 @@ class DependencyGraphTests(unittest.TestCase):
         waste if >.
 
         Arrival counting (the key invariant, see docs/11 §4):
-          - Non-GEMM ops (QKV/ATTN/ADD_RMSNORM): each instruction arrives
-            inc=1, so produces += 1 per instruction.
-          - GEMM ops (O_PROJ/FFN_UPGATE/FFN_DOWN): each instruction arrives
-            inc=NUM_TILES (inst[9]), so a packed instruction carrying 6 tiles
-            does atomicAdd(bar, 6). produces += inst[9].
+          - Non-GEMM ops (ATTN/ADD_RMSNORM): each instruction arrives inc=1,
+            so produces += 1 per instruction.
+          - GEMM ops (QKV_PROJ/O_PROJ/FFN_UPGATE/FFN_DOWN/LM_HEAD): each
+            instruction arrives inc=NUM_TILES (inst[9]), so a packed
+            instruction carrying 6 tiles does atomicAdd(bar, 6).
+            produces += inst[9].
 
         Threshold semantics (the key subtlety): ``tg_wait`` polls until the bar
         counter >= target. Multiple consumers may wait on the same slot with
@@ -545,8 +563,8 @@ class DependencyGraphTests(unittest.TestCase):
         for inst in self._iter_instructions():
             op = inst[0]
             if op == tg.TgOp.QKV_PROJ:
-                # non-GEMM: inc=1
-                produces[("bar_qkv", inst[7])] += 1
+                # GEMM: inc=NUM_TILES@9 (the op now packs consecutive tile_n)
+                produces[("bar_qkv", inst[7])] += inst[9]
                 _wait_max(("bar_layer", inst[5]), inst[6])
             elif op == tg.TgOp.ATTN_DECODE:
                 _wait_max(("bar_qkv", inst[7]), inst[8])

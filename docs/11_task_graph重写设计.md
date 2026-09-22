@@ -189,10 +189,15 @@ data[5]  = WAIT_BAR_IDX    // bar_layer[L]（等上一层 rmsnorm）
 data[6]  = WAIT_TARGET     // batch（每行 rmsnorm arrive 一次）
 data[7]  = PRODUCE_BAR_IDX // bar_qkv[L*Hkv + kvh]（按 kv_head 切，K/V 的 produce 对应 kv_head）
 data[8]  = BATCH_ROW       // 本 tile 服务的 batch 行（attention 要按行找 KV）
-data[9..15] = 保留
+data[9]  = NUM_TILES       // 本指令打包的 tile 数（同 gemm_idx / produce 才可合并）
+data[10..15] = TILE_N 列表 // 连续 tile_n（最多 6 个）；kernel 用 N=NUM_TILES*16 一次 GEMM 扇出到各 warp
 ```
 
 > Q/K/V 三次 GEMM 的 N 维 tile 分开编指令（cohere 也是每 GemmIdx 一条）。
+> 同一次 GEMM 内连续的 tile_n 会打包成一条指令（`schedule.py:_pack_qkv`），
+> `tg_qkv_proj_op` 只发一次 `tg_wmma_gemm`（N=NUM_TILES*16），把 N tile 分给 7 个
+> worker warp；produce 用 `inc=NUM_TILES`，attention 的 `WAIT_TARGET` 仍按总 tile 数计。
+> 不同 kv_head（produce slot 不同）不会合并。
 
 **`TG_ATTN_DECODE`**：
 

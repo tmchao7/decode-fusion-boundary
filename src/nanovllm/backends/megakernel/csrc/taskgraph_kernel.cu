@@ -745,16 +745,21 @@ __device__ __forceinline__ void tg_rope(
 // to keep the bar.sync 1 arrival count aligned.
 // =============================================================================
 
-// QKV_PROJ: RMSNorm(x_resid) → WMMA GEMM for one tile_n of Q/K/V.
+// QKV_PROJ: RMSNorm(x_resid) → WMMA GEMM for a pack of Q/K/V N tiles.
 //
 // Instruction layout:
-//   inst[1]=layer, inst[2]=tile_n, inst[3]=gemm_idx(0=Q,1=K,2=V),
+//   inst[1]=layer, inst[2]=tile_n(primary), inst[3]=gemm_idx(0=Q,1=K,2=V),
 //   inst[4]=needs_rope, inst[5]=wait_bar_idx(bar_layer), inst[6]=wait_target,
-//   inst[7]=produce_bar_idx(bar_qkv), inst[8]=batch_row
+//   inst[7]=produce_bar_idx(bar_qkv), inst[8]=batch_row,
+//   inst[9]=num_tiles, inst[10..15]=consecutive tile_n list
 //
-// For Phase 1 (BS=1), batch_row is always 0. The RMSNorm is computed
-// redundantly by every QKV tile instruction (cheap relative to GEMM).
-// The normalized vector is stored in shared memory for the WMMA GEMM.
+// batch_row is always 0 (the op covers all BS rows). The RMSNorm is computed
+// once per instruction (redundantly across instructions, but cheap next to the
+// GEMM) and stored in shared memory for the WMMA A fragment.
+//
+// All packed tiles share (gemm_idx, produce_bar_idx), so they use the same
+// weight and signal the same bar_qkv slot with inc = num_tiles. The attention
+// consumer's target counts the total tile arrivals, so the sum is unchanged.
 
 // Shared memory layout for QKV / GEMM ops (declared in kernel entry):
 //   s_a[256]       — WMMA A fragment staging (512 bytes)
@@ -765,8 +770,8 @@ __device__ __forceinline__ void tg_qkv_proj_op(
     const int* inst, TgGlobals& g, int bid,
     __nv_bfloat16* s_a, float* s_norm, float* s_reduce) {
   int layer = inst[1];
-  int tile_n = inst[2];
   int gemm_idx = inst[3];
+  int num_tiles = inst[9];
 
   // Wait for previous layer's RMSNorm (bar_layer)
   tg_wait(g.bar_layer, inst[5], (uint32_t)inst[6]);
@@ -796,27 +801,29 @@ __device__ __forceinline__ void tg_qkv_proj_op(
   const __nv_bfloat16* weight =
       tg_layer_weight(g.layer_weights, layer, weight_idx);
 
-  // WMMA GEMM for this one tile_n (16 columns).
-  // M=BS (all batch rows), K=hidden, N=16.
+  // ONE GEMM covering all packed (consecutive) tile_n: N = num_tiles*16, so
+  // tg_wmma_gemm splits the N tiles across the worker warps. M=BS, K=hidden.
   int wwarp = tg_wwarp();
-  int tile_offset = tile_n * TG_WMMA_TILE;
+  const int tile_n0 = inst[10];
+  const int tile_offset = tile_n0 * TG_WMMA_TILE;
+  const int n_total = num_tiles * TG_WMMA_TILE;
   if (gemm_idx == 0) {
     // Q: STRIDE_K=hidden, STRIDE_N=q_size
     tg_wmma_gemm<TG_HIDDEN, TG_Q_SIZE>(
         s_norm, weight + tile_offset * g.hidden,
         output + tile_offset,
-        g.BS, TG_WMMA_TILE, g.hidden,
+        g.BS, n_total, g.hidden,
         wwarp, TG_WORKER_WARPS, s_a);
   } else {
     // K or V: STRIDE_K=hidden, STRIDE_N=kv_size
     tg_wmma_gemm<TG_HIDDEN, TG_KV_SIZE>(
         s_norm, weight + tile_offset * g.hidden,
         output + tile_offset,
-        g.BS, TG_WMMA_TILE, g.hidden,
+        g.BS, n_total, g.hidden,
         wwarp, TG_WORKER_WARPS, s_a);
   }
 
-  tg_arrive(g.bar_qkv, inst[7]);
+  tg_arrive(g.bar_qkv, inst[7], (uint32_t)num_tiles);
 }
 
 // ATTN_DECODE: QK-norm + RoPE + KV cache write + scalar flash attention.

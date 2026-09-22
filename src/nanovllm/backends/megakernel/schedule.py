@@ -166,13 +166,24 @@ def make_qkv_proj(
     wait_target: int,
     produce_bar_idx: int,
     batch_row: int,
+    extra_tiles: list[int] | None = None,
 ) -> list[int]:
     """TG_QKV_PROJ. See docs/11 §3.3.
 
     ``gemm_idx``: 0=Q, 1=K, 2=V. ``needs_rope``: True for Q and K (RoPE + KV
     cache write); False for V (V is written to KV cache without RoPE). The
     schedule builder decides per gemm_idx.
+
+    ``extra_tiles`` packs additional consecutive ``tile_n`` into the same
+    instruction (data[9]=count, data[10..15]=tile_n list, mirroring the generic
+    GEMM layout). The kernel then issues ONE GEMM with N = count*16 so the
+    tiles are split across the worker warps. All packed tiles must share the
+    same (gemm_idx, produce_bar_idx) so they write the same weight and signal
+    the same bar slot.
     """
+    tiles = [tile_n] + list(extra_tiles or [])
+    if len(tiles) > 6:
+        raise ValueError(f"too many QKV tiles per instruction: {len(tiles)} > 6")
     return _inst(
         TgOp.QKV_PROJ,
         layer,
@@ -183,6 +194,8 @@ def make_qkv_proj(
         wait_target,
         produce_bar_idx,
         batch_row,
+        len(tiles),
+        *tiles,
     )
 
 
@@ -421,9 +434,9 @@ def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[li
     serializing them on warp 0. The grouping loop below therefore breaks the
     run on a non-consecutive ``tile_n``.
 
-    Only applies to the generic GEMM opcodes (O_PROJ / FFN_UPGATE_ACT /
-    FFN_DOWN / LM_HEAD); QKV/ATTN/ADD_RMSNORM have opcode-specific layouts
-    without a TILE_IDS field.
+    Applies to the generic GEMM opcodes (O_PROJ / FFN_UPGATE_ACT / FFN_DOWN /
+    LM_HEAD). TG_QKV_PROJ is packed by :func:`_pack_qkv` (its own field layout);
+    ATTN/ADD_RMSNORM/LM_ARGMAX are not packed.
     """
     if not instructions:
         return []
@@ -472,6 +485,49 @@ def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[li
                     extra_tiles=group[1:],
                 )
             )
+        i = j
+    return out
+
+
+def _pack_qkv(instructions: list[list[int]], max_per_inst: int = 6) -> list[list[int]]:
+    """Pack consecutive TG_QKV_PROJ tiles that share everything but tile_n.
+
+    QKV has its own field layout (no TILE_IDS), so it needs its own packer. The
+    group key includes ``gemm_idx`` (Q/K/V use different weights) and
+    ``produce_bar_idx`` (tiles of different kv_heads must not be merged). The
+    kernel derives N = count*16 from the first tile_n, so the group must stay
+    consecutive in tile_n.
+    """
+    if not instructions:
+        return []
+    out: list[list[int]] = []
+    i = 0
+    while i < len(instructions):
+        inst = instructions[i]
+        # (layer, gemm_idx, needs_rope, wait_idx, wait_target, produce, batch)
+        key = (inst[1], inst[3], inst[4], inst[5], inst[6], inst[7], inst[8])
+        group = [inst[2]]  # tile_n
+        j = i + 1
+        while j < len(instructions) and len(group) < max_per_inst:
+            nxt = instructions[j]
+            nxt_key = (nxt[1], nxt[3], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8])
+            if nxt_key != key or nxt[2] != group[-1] + 1:
+                break
+            group.append(nxt[2])
+            j += 1
+        out.append(
+            make_qkv_proj(
+                layer=inst[1],
+                tile_n=group[0],
+                gemm_idx=inst[3],
+                needs_rope=bool(inst[4]),
+                wait_bar_idx=inst[5],
+                wait_target=inst[6],
+                produce_bar_idx=inst[7],
+                batch_row=inst[8],
+                extra_tiles=group[1:],
+            )
+        )
         i = j
     return out
 
@@ -776,7 +832,7 @@ def build_layer_waves(geo: TgGeometry, layer: int) -> list[list[list[int]]]:
     are not packed.
     """
     return [
-        build_qkv_wave(geo, layer),
+        _pack_qkv(build_qkv_wave(geo, layer)),
         build_attn_wave(geo, layer),
         build_attn_combine_wave(geo, layer),
         _pack_tiles(build_o_proj_wave(geo, layer)),
