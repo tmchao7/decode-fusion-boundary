@@ -987,6 +987,9 @@ __device__ __forceinline__ void tg_attn_decode_op(
   int split_idx = inst[4];
   int num_splits = inst[5];
   // inst[6] = window_size (unused for Phase 1)
+  // bit 31 of inst[9]: this split publishes o_partial/lse_partial for
+  // ATTN_COMBINE instead of writing attn_out directly.
+  const bool is_combine = ((inst[9] >> 31) & 1) != 0;
 
   // Wait for QKV tiles for this kv_head
   tg_wait(g.bar_qkv, inst[7], (uint32_t)inst[8]);
@@ -1201,22 +1204,42 @@ __device__ __forceinline__ void tg_attn_decode_op(
         }
       }
 
-      out_head[out_base + 0] = tg_round_bf16(final_out[0] / total_sum_exp);
-      out_head[out_base + 1] = tg_round_bf16(final_out[1] / total_sum_exp);
-      out_head[out_base + 2] = tg_round_bf16(final_out[2] / total_sum_exp);
-      out_head[out_base + 3] = tg_round_bf16(final_out[3] / total_sum_exp);
+      if (is_combine) {
+        // Publish this split's UNNORMALIZED partial and its LSE for
+        // ATTN_COMBINE. o_partial is [BS, hkv, max_splits, hidden]; the q
+        // heads of one kv_head occupy the first group_size*head_dim floats.
+        // ATTN_COMBINE then computes
+        //   out = sum_s exp(lse_s - M) * o_s / sum_s exp(lse_s - M)
+        // which equals the full softmax because
+        //   exp(lse_s - M) * o_s = sum_{pos in s} exp(score - M) * v.
+        float* partial =
+            g.o_partial +
+            ((batch * g.num_kv_heads + kv_head) * g.max_attn_splits +
+             split_idx) * g.hidden +
+            qh_offset * g.head_dim;
+        partial[out_base + 0] = final_out[0];
+        partial[out_base + 1] = final_out[1];
+        partial[out_base + 2] = final_out[2];
+        partial[out_base + 3] = final_out[3];
+        if (wlane == 0) {
+          // Empty split -> global_max = -inf, total_sum_exp = 0 -> lse = -inf,
+          // which ATTN_COMBINE skips.
+          g.lse_partial[(batch * g.num_kv_heads + kv_head) * g.max_attn_splits +
+                        split_idx] = global_max + logf(total_sum_exp);
+        }
+      } else {
+        out_head[out_base + 0] = tg_round_bf16(final_out[0] / total_sum_exp);
+        out_head[out_base + 1] = tg_round_bf16(final_out[1] / total_sum_exp);
+        out_head[out_base + 2] = tg_round_bf16(final_out[2] / total_sum_exp);
+        out_head[out_base + 3] = tg_round_bf16(final_out[3] / total_sum_exp);
+      }
     }
     tg_worker_sync_inner();
   }
 
   // Signal produce bar (bar_attn or bar_combine, determined by bit 31 of inst[9])
   uint32_t produce_idx = (uint32_t)inst[9] & ~(1u << 31);
-  bool is_combine = (inst[9] >> 31) & 1;
   if (is_combine) {
-    // Store partial results for combine
-    // o_partial: [BS, hkv, max_splits, hidden]
-    // lse_partial: [BS, hkv, max_splits]
-    // For Phase 1 with splits=1, this path is not taken.
     tg_arrive(g.bar_combine, produce_idx);
   } else {
     tg_arrive(g.bar_attn, produce_idx);
@@ -1224,7 +1247,10 @@ __device__ __forceinline__ void tg_attn_decode_op(
 }
 
 // ATTN_COMBINE: combine partial attention outputs from multiple splits.
-// Only used when attn_splits > 1. For Phase 1 (attn_splits=1), this is a no-op.
+// Only emitted when attn_splits > 1. Each ATTN_DECODE split published its
+// unnormalized output o_s and lse_s = m_s + log Z_s; this op computes
+// out = sum_s exp(lse_s - M) * o_s / sum_s exp(lse_s - M) with M = max lse_s,
+// which equals the full softmax over all positions.
 
 __device__ __forceinline__ void tg_attn_combine_op(
     const int* inst, TgGlobals& g, int bid,
@@ -1270,8 +1296,11 @@ __device__ __forceinline__ void tg_attn_combine_op(
       if (lse <= -INFINITY) continue;
       float w = tg_fast_exp(lse - global_max);
       total_weight += w;
+      // The q heads of this kv_head are packed at the start of the split's
+      // g.hidden floats, so offset by qh_offset (GQA: group_size heads).
       float* partial = g.o_partial + batch * g.num_kv_heads * g.max_attn_splits * g.hidden +
-                        kv_head * g.max_attn_splits * g.hidden + s * g.hidden;
+                        kv_head * g.max_attn_splits * g.hidden + s * g.hidden +
+                        qh_offset * g.head_dim;
       final_out[0] += partial[out_base + 0] * w;
       final_out[1] += partial[out_base + 1] * w;
       final_out[2] += partial[out_base + 2] * w;

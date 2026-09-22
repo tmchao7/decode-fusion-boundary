@@ -743,17 +743,19 @@ class ScheduleExecutionTests(unittest.TestCase):
     """
 
     def test_no_deadlock_across_batch_and_grid_sizes(self) -> None:
-        for BS in (1, 2, 4, 8):
-            for num_sms in (1, 4, 8, 108):
-                with self.subTest(BS=BS, num_sms=num_sms):
-                    geo = tg.default_geometry(BS=BS, attn_splits=1)
-                    sched = tg.build_schedule(geo, num_sms)
-                    done, total, _, pc = simulate_execution(sched, num_sms)
-                    self.assertEqual(
-                        done, total,
-                        f"schedule deadlocks: only {done}/{total} instructions "
-                        f"can execute (per-SM progress: {pc})",
-                    )
+        for attn_splits in (1, 2):
+            for BS in (1, 2, 4, 8):
+                for num_sms in (1, 4, 8, 108):
+                    with self.subTest(attn_splits=attn_splits, BS=BS,
+                                      num_sms=num_sms):
+                        geo = tg.default_geometry(BS=BS, attn_splits=attn_splits)
+                        sched = tg.build_schedule(geo, num_sms)
+                        done, total, _, pc = simulate_execution(sched, num_sms)
+                        self.assertEqual(
+                            done, total,
+                            f"schedule deadlocks: only {done}/{total} "
+                            f"instructions can execute (per-SM progress: {pc})",
+                        )
 
     def test_simulation_completes_every_bar(self) -> None:
         """The last instruction must be LM_ARGMAX and every bar must be fully

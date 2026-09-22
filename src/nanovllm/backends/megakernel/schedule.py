@@ -646,12 +646,11 @@ def build_attn_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
 def build_attn_combine_wave(geo: TgGeometry, layer: int) -> list[list[int]]:
     """Wave 2: ATTN_COMBINE (only when attn_splits > 1).
 
-    NOT EXECUTABLE YET: ``tg_attn_decode_op`` does not write ``o_partial`` /
-    ``lse_partial`` (it only arrives ``bar_combine``), so a combine instruction
-    would read uninitialised partials. The schedule is still built for
-    ``attn_splits > 1`` so the ABI/bar-dimension tests can cover it; do not
-    launch a kernel built with ``attn_splits > 1`` until the partial stores are
-    implemented.
+    ATTN_DECODE publishes unnormalized per-split partials + LSE, and one
+    combine per (batch, kv_head) rescales and normalizes them back into
+    attn_out for O_PROJ. Validated against the causal reference by
+    tests/test_taskgraph_positions.py::test_attn_splits_matches_causal_reference
+    and deadlock-checked for attn_splits=2 by the execution simulator.
     """
     if geo.attn_splits <= 1:
         return []

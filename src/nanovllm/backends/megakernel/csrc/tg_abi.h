@@ -143,10 +143,12 @@ struct TgLaunchDesc {
   uint64_t x_ffn;             // float [BS, hidden]         (residual after FFN)
   uint64_t x_resid;           // bf16  [BS, hidden]         (layer input / next layer input)
   uint64_t lm_logits;         // float [16, vocab]          (WMMA out, pre-argmax)
-  // split-K attention partials (when attn split > 1; NOT implemented yet —
-  // tg_attn_decode_op does not write them, so keep attn_splits == 1)
-  uint64_t o_partial;         // float [BS, hkv, max_splits, hidden]
-  uint64_t lse_partial;       // float [BS, hkv, max_splits]
+  // Split attention partials, used when attn_splits > 1. ATTN_DECODE writes
+  // the UNNORMALIZED per-split output plus its LSE (m + log Z); ATTN_COMBINE
+  // rescales by exp(lse - max_lse) and normalizes. The q heads of one kv_head
+  // occupy the first group_size*head_dim floats of each split's `hidden` slice.
+  uint64_t o_partial;         // float [BS, hkv, max_attn_splits, hidden]
+  uint64_t lse_partial;       // float [BS, hkv, max_attn_splits]
 
   // --- barriers ------------------------------------------------------------
   TgBars bars;

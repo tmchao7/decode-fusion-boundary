@@ -213,7 +213,7 @@ class TaskGraphPositionTests(unittest.TestCase):
         cls.geo = tg_schedule.default_geometry(BS=1, attn_splits=1)
         cls.sched = tg_schedule.build_schedule(cls.geo, num_sms=1)
 
-    def _alloc_scratch(self, sched=None, BS=1):
+    def _alloc_scratch(self, sched=None, BS=1, max_attn_splits=1):
         sched = sched or self.sched
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
@@ -238,8 +238,9 @@ class TaskGraphPositionTests(unittest.TestCase):
         s["x_ffn"] = torch.empty(BS, HIDDEN_SIZE, **f32)
         s["x_resid"] = torch.empty(BS, HIDDEN_SIZE, **bf16)
         s["lm_logits"] = torch.empty(WMMA_PAD, VOCAB, **f32)
-        s["o_partial"] = torch.empty(BS, NUM_KV_HEADS, 1, HIDDEN_SIZE, **f32)
-        s["lse_partial"] = torch.empty(BS, NUM_KV_HEADS, 1, **f32)
+        s["o_partial"] = torch.empty(BS, NUM_KV_HEADS, max_attn_splits,
+                                      HIDDEN_SIZE, **f32)
+        s["lse_partial"] = torch.empty(BS, NUM_KV_HEADS, max_attn_splits, **f32)
 
         d = sched.bar_dims
         s["bar_qkv"] = torch.zeros(d.bar_qkv, **u32)
@@ -256,7 +257,8 @@ class TaskGraphPositionTests(unittest.TestCase):
         s["row_active"] = torch.ones(BS, dtype=torch.int32, device="cuda")
         return s
 
-    def _run_step(self, s, token_id, position, sched=None, num_sms=1):
+    def _run_step(self, s, token_id, position, sched=None, num_sms=1,
+                  max_attn_splits=1):
         """One teacher-forced decode step; KV cache persists across calls."""
         sched = sched or self.sched
         skip = {"inst_buf", "num_inst_per_sm", "page_table",
@@ -294,12 +296,12 @@ class TaskGraphPositionTests(unittest.TestCase):
             s["bar_combine"], s["bar_lm_head"],
             NUM_LAYERS, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE,
             Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
-            HEAD_DIM, VOCAB, 1, 1, 1,
+            HEAD_DIM, VOCAB, 1, 1, max_attn_splits,
         )
         torch.cuda.synchronize()
         return s
 
-    def _check_sequence(self, sched, num_sms):
+    def _check_sequence(self, sched, num_sms, max_attn_splits=1):
         ref_logits = pytorch_causal_reference(
             self.weights["layer_weights"], self.embed_weight,
             self.final_norm_weight, self.cos_table, self.sin_table, PROMPT,
@@ -309,12 +311,13 @@ class TaskGraphPositionTests(unittest.TestCase):
         # Fresh KV cache: each step writes its own position.
         self.k_cache.zero_()
         self.v_cache.zero_()
-        s = self._alloc_scratch(sched, 1)
+        s = self._alloc_scratch(sched, 1, max_attn_splits)
 
         got_tokens = []
         print(f"\nPrompt: {PROMPT}  (num_sms={num_sms})")
         for position, token_id in enumerate(PROMPT):
-            s = self._run_step(s, token_id, position, sched, num_sms)
+            s = self._run_step(s, token_id, position, sched, num_sms,
+                               max_attn_splits)
             tok = s["lm_logits"][0, 0].view(torch.int32).item()
             got_tokens.append(tok)
             # Compare logits at this position (index 0 is clobbered by the
@@ -351,6 +354,18 @@ class TaskGraphPositionTests(unittest.TestCase):
         num_sms = int(os.environ.get("TG_MULTI_SM", "8"))
         sched = tg_schedule.build_schedule(self.geo, num_sms=num_sms)
         self._check_sequence(sched, num_sms)
+
+    def test_attn_splits_matches_causal_reference(self):
+        """attn_splits=2 must still match the reference.
+
+        Splitting only repartitions the positions across instructions; the
+        LSE combine is mathematically identical, so the per-position tokens
+        and logits must match (up to fp reduction order). This is the only
+        test of the o_partial/lse_partial path.
+        """
+        geo2 = tg_schedule.default_geometry(BS=1, attn_splits=2)
+        sched2 = tg_schedule.build_schedule(geo2, num_sms=1)
+        self._check_sequence(sched2, 1, max_attn_splits=4)
 
     def test_greedy_generation_matches_reference(self):
         """Autoregressive greedy generation: feed the kernel's own output back.

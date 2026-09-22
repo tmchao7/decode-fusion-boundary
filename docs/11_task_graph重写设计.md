@@ -745,8 +745,9 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 
 ### 10.3 未实现（明确不可用）
 
-- `attn_splits > 1`：`tg_attn_decode_op` 不写 `o_partial/lse_partial`，combine 会读垃圾。
-  （attention 已按 SM×warp 并行，短/中 context 不缺这个 split。）
+- ~~`attn_splits > 1`~~：已实现（ATTN_DECODE 写 unnormalized partial + LSE，
+  ATTN_COMBINE 按 `exp(lse - max_lse)` 重标定并归一化）。有对拍参考的测试 + 死锁模拟覆盖。
+  注：attention 已按 SM×warp 并行，短/中 context 不缺这个 split。
 - `oproj_splits / down_splits > 1`：`build_schedule` 直接 `NotImplementedError`。
 - 连续批处理：`row_active` 未使用；缺 `runtime.cu`/session；`backend.py` 未接 taskgraph。
 - sampling：只有 greedy argmax，无 temperature/top-p。
