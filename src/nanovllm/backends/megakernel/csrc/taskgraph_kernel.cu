@@ -677,9 +677,10 @@ __device__ __forceinline__ void tg_cp_async_b_tile(
 // WMMA GEMM — ported from kernel.cu:962-1012, adapted for 7 worker warps.
 //
 // Computes C[M,N] = H[M,K] @ W[N,K]^T (W is stored row-major as [N,K]).
-// Each warp handles one 16x16 tile. `s_a` is shared memory for the A fragment
-// (float→bf16 staging); all warps share the same s_a because for M≤16
-// (decode BS≤8), tiles_M=1 and all warps use the same A row.
+// Each warp handles one 16x16 tile. `s_a` is a per-warp slice of shared memory
+// for the A fragment (float→bf16 staging): the A data is the same for every
+// warp (M≤16 so tiles_M=1), but staging it per-warp keeps the K loop free of
+// CTA barriers.
 //
 // The B fragment is staged through tg_s_b with a TG_B_STAGES-deep cp.async
 // pipeline so the weight load of K step ks+TG_B_STAGES-1 overlaps the A
@@ -704,8 +705,8 @@ __device__ __forceinline__ void tg_wmma_gemm(
   // that many times (idle warps skip work but still hit the syncs).
   const int my_max_tiles = (total_tiles + num_warps - 1) / num_warps;
   const int num_k = K / TG_WMMA_TILE;
-  int wtid = tg_wtid();
   __nv_bfloat16* s_b = &tg_s_b[global_warp][0][0];
+  __nv_bfloat16* my_a = s_a + global_warp * (TG_WMMA_TILE * TG_WMMA_TILE);
 
   for (int t = 0; t < my_max_tiles; ++t) {
     int tile = global_warp + t * num_warps;
@@ -743,23 +744,28 @@ __device__ __forceinline__ void tg_wmma_gemm(
       tg_cp_async_wait<TG_B_STAGES - 1>();
       __syncwarp();  // make this warp's cp.async writes visible to its lanes
 
-      // Fill s_a with the A fragment (float -> bf16). All worker threads
-      // cooperate; the barrier below publishes it to every warp.
+      // Per-warp A staging: each warp converts its own A fragment into its own
+      // slice of s_a. The A data is identical across warps (tiles_M=1), but a
+      // shared copy needed two CTA barriers per K step, forcing all 7 warps
+      // into lockstep; with K up to 3072 that overhead was comparable to the
+      // weight traffic. Redundant staging is cheap (16x16 elements).
       const int k = ks * TG_WMMA_TILE;
-      for (int idx = wtid; idx < TG_WMMA_TILE * TG_WMMA_TILE;
-           idx += TG_NUM_WORKER_THREADS) {
+      const int lane = tg_wlane();
+      #pragma unroll
+      for (int idx = lane; idx < TG_WMMA_TILE * TG_WMMA_TILE;
+           idx += TG_WARP_SIZE) {
         int mi = idx / TG_WMMA_TILE, ki = idx % TG_WMMA_TILE;
         float v = 0.0f;
         if (active && m0 + mi < M && k + ki < K)
           v = H[(m0 + mi) * STRIDE_K + k + ki];
-        s_a[idx] = __float2bfloat16(v);
+        my_a[idx] = __float2bfloat16(v);
       }
-      tg_worker_sync_inner();
+      __syncwarp();  // publish this warp's staging to its own lanes
 
       if (active) {
         wmma::fragment<wmma::matrix_a, TG_WMMA_TILE, TG_WMMA_TILE,
                        TG_WMMA_TILE, __nv_bfloat16, wmma::row_major> a;
-        wmma::load_matrix_sync(a, s_a, TG_WMMA_TILE);
+        wmma::load_matrix_sync(a, my_a, TG_WMMA_TILE);
 
         // The staged tile is row-major [16][16] = W[n0+r, k+c], so the B
         // fragment b(r,c) = W[n0+c, k+r] is its transpose: load col_major.
@@ -771,10 +777,9 @@ __device__ __forceinline__ void tg_wmma_gemm(
 
         wmma::mma_sync(acc, a, b, acc);
       }
-      // Ensure all warps have finished reading s_a (and their B stage) before
-      // the next k iteration overwrites either. All warps must hit this sync,
-      // even idle ones.
-      tg_worker_sync_inner();
+      // No CTA barrier: my_a and the B stages are per-warp, so the next
+      // iteration can overwrite them as soon as this warp's mma has read them.
+      // (mma_sync is synchronous, so its shared-memory reads are done.)
     }
     // Drain the trailing (empty) commit groups so the next tile's pipeline
     // starts from a known group count.
@@ -854,7 +859,7 @@ __device__ __forceinline__ void tg_rope(
 // consumer's target counts the total tile arrivals, so the sum is unchanged.
 
 // Shared memory layout for QKV / GEMM ops (declared in kernel entry):
-//   s_a[256]       — WMMA A fragment staging (512 bytes)
+//   s_a[7][256]    — per-warp WMMA A fragment staging (3.5 KiB)
 //   s_norm[hidden] — RMSNorm input/output (4 KiB)
 //   s_reduce[wwarps] — block reduce (28 bytes)
 
@@ -1570,7 +1575,7 @@ __device__ __forceinline__ void tg_lm_argmax_op(
 // =============================================================================
 
 struct TgSmem {
-  __nv_bfloat16* s_a;           // [16*16] = 256 bf16 = 512 B (WMMA A fragment)
+  __nv_bfloat16* s_a;           // [7][16*16] — per-warp WMMA A staging (3.5 KiB)
   float* s_norm;                // [1024] = 4 KiB (RMSNorm input/output)
   float* s_reduce;              // [7] = 28 B (block reduce)
   float* s_max;                 // [7] = 28 B (attention warp max)
@@ -1694,7 +1699,11 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
   // Shared memory for compute ops (see TgSmem).
   // s_norm is in dynamic shared memory (extern __shared__) because it needs
   // [TG_WMMA_TILE * TG_HIDDEN] = 64 KB, exceeding the 48 KB static limit.
-  __shared__ __nv_bfloat16 s_a[TG_WMMA_TILE * TG_WMMA_TILE];
+  // Per-warp A staging (each warp converts its own 16x16 fragment), so the
+  // GEMM K loop needs no CTA barrier. __align__(16) is required by
+  // wmma::load_matrix_sync.
+  __shared__ __align__(16)
+      __nv_bfloat16 s_a[TG_WORKER_WARPS * TG_WMMA_TILE * TG_WMMA_TILE];
   __shared__ float s_reduce[TG_WORKER_WARPS];
   __shared__ float s_max[TG_WORKER_WARPS];
   __shared__ float s_sum[TG_WORKER_WARPS];
