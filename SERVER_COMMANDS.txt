@@ -17,7 +17,8 @@ set -euo pipefail
 #   RUN_MODE=roofline bash SERVER_COMMANDS.txt       # device lower-bound probe + bandwidth
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
-#   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM kernel tests
+#   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM/position tests + bench
+#   RUN_MODE=taskgraph-sanitize bash SERVER_COMMANDS.txt  # compute-sanitizer memcheck on the task-graph kernel
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
 # Overridable: REPO, NANOVLLM_MODEL_PATH (or MODEL), PREFERRED_GPUS,
@@ -608,6 +609,46 @@ run_taskgraph() {
     2>&1 | tee results/taskgraph_bench.log
 }
 
+run_taskgraph_sanitize() {
+  mkdir -p results
+  require_model
+  export NANOVLLM_CUDA_SANITIZE=1
+  build_extension
+  verify_extension_import
+
+  # memcheck on the task-graph kernel: the cp.async staging, the per-warp
+  # shared arrays, the paged KV indexing and the WMMA 16-row stores are all
+  # new/unusual memory accesses. Kept to a single step per case so the
+  # 10-50x sanitizer slowdown stays bounded. Does NOT check races (the
+  # intentional same-value x_attn writes would trip racecheck).
+  local sanitizer_log=results/taskgraph_compute_sanitizer.log
+  set +e
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  compute-sanitizer --tool memcheck \
+    --error-exitcode=1 \
+    --target-processes all \
+    --show-backtrace yes \
+    --print-limit 200 \
+    env CUDA_LAUNCH_BLOCKING=1 \
+      PYTHONPATH=src python -m unittest \
+        tests.test_taskgraph_smoke \
+        tests.test_taskgraph_multi_sm -v \
+    2>&1 | tee "$sanitizer_log"
+  local sanitizer_status=${PIPESTATUS[0]}
+  set -e
+
+  echo
+  echo "===== FIRST COMPUTE-SANITIZER REPORT ====="
+  if ! grep -n -m 1 -B 5 -A 40 -E \
+      'Invalid __global__|Invalid __shared__|Invalid __local__|Address .* out of bounds|misaligned|illegal memory|unspecified launch' \
+      "$sanitizer_log"; then
+    echo "No detailed sanitizer report marker found; inspect $sanitizer_log"
+  fi
+  echo "===== END FIRST COMPUTE-SANITIZER REPORT ====="
+  return "$sanitizer_status"
+}
+
 case "$RUN_MODE" in
   model)
     run_model_download
@@ -652,6 +693,10 @@ case "$RUN_MODE" in
     select_gpu
     run_taskgraph
     ;;
+  taskgraph-sanitize)
+    select_gpu
+    run_taskgraph_sanitize
+    ;;
   all)
     select_gpu
     verify_environment
@@ -660,7 +705,7 @@ case "$RUN_MODE" in
     ;;
   *)
     echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
-    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, taskgraph, or all." >&2
+    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, taskgraph, taskgraph-sanitize, or all." >&2
     exit 2
     ;;
 esac
