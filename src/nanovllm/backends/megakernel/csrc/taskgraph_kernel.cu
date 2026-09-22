@@ -1390,7 +1390,7 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
 
   // One GEMM per operand covering all packed (contiguous) tiles, so the N
   // tiles are split across the worker warps instead of serialized on warp 0.
-  const int tile_n0 = inst[10] & 0xFFFF;
+  // (tile_n0 is declared in Phase 1.)
   const int n_total = num_tiles * TG_WMMA_TILE;
   // Gate GEMM → silu_out:
   tg_wmma_gemm<TG_HIDDEN, TG_INTERMEDIATE>(
