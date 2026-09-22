@@ -1343,33 +1343,43 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
   int wwarp = tg_wwarp();
   int wtid = tg_wtid();
 
-  // Phase 1: residual add + RMSNorm (per batch row, redundantly computed)
-  // For BS=1, there's only one row. For BS>1, each tile instruction does all
-  // rows (since M=BS in the GEMM, all rows are needed).
+  // Phase 1: residual add + RMSNorm (per batch row, redundantly computed).
+  // For BS=1 there is one row; for BS>1 every tile instruction still needs all
+  // rows because M=BS in the GEMM.
   //
-  // Every tile instruction re-derives x_attn from o_proj_out + x_resid and
-  // writes the same values to g.x_attn, so with num_sms > 1 concurrent CTAs
-  // write identical values to the same addresses. That is intentional and
-  // safe (32-bit aligned stores; every instruction writes before its own
-  // RMSNorm reads, and ADD_RMSNORM reads only after bar_ffn_down). It will
-  // still be reported by compute-sanitizer racecheck; a cleaner split would
-  // hoist this into a per-layer POST_ATTN_NORM instruction producing its own
-  // bar (the ABI already reserves post_attn_norm for that).
+  // x_attn is staged in the shared s_norm slice and normalized in place, so
+  // the RMSNorm never round-trips through global memory. Only the first
+  // packed instruction (tile_n0 == 0) also publishes x_attn to g.x_attn for
+  // ADD_RMSNORM. Previously every instruction wrote the same global addresses
+  // from every CTA — same-value, so functionally safe, but a data race that
+  // racecheck flags. ADD_RMSNORM still reads a complete x_attn because it
+  // waits on bar_ffn_down, which is only produced after every FFN_UPGATE
+  // (including the publisher) has arrived.
+  const int tile_n0 = inst[10] & 0xFFFF;
+  const bool publishes_x_attn = (tile_n0 == 0);
   for (int batch = 0; batch < g.BS; batch++) {
-    float* x_attn = g.x_attn + batch * g.hidden;
+    float* xa_smem = s_norm + batch * g.hidden;  // staged x_attn (shared)
     float* o_proj = g.o_proj_out + batch * g.hidden;
     const __nv_bfloat16* x_res = g.x_resid + batch * g.hidden;
 
-    // Residual add: x_attn = round_bf16(o_proj_out) + x_resid
     for (int i = wtid; i < g.hidden; i += TG_NUM_WORKER_THREADS) {
-      x_attn[i] = tg_round_bf16(o_proj[i]) + __bfloat162float(x_res[i]);
+      xa_smem[i] = tg_round_bf16(o_proj[i]) + __bfloat162float(x_res[i]);
     }
     tg_worker_sync_inner();
 
-    // RMSNorm: x_attn (float) → s_norm[batch*hidden] (normalized, for GEMM input)
+    if (publishes_x_attn) {
+      float* x_attn = g.x_attn + batch * g.hidden;
+      for (int i = wtid; i < g.hidden; i += TG_NUM_WORKER_THREADS) {
+        x_attn[i] = xa_smem[i];
+      }
+      tg_worker_sync_inner();
+    }
+
+    // In-place RMSNorm: input and output are the same shared slice, which is
+    // safe because the staging pass only re-reads what it just wrote.
     const __nv_bfloat16* post_norm_w =
         tg_layer_weight(g.layer_weights, layer, tg::TG_LW_POST_ATTN_LAYERNORM);
-    tg_rmsnorm_f(s_norm + batch * g.hidden, s_reduce, x_attn, post_norm_w, g.hidden);
+    tg_rmsnorm_f(xa_smem, s_reduce, xa_smem, post_norm_w, g.hidden);
   }
 
   // Phase 2: Gate + Up GEMM

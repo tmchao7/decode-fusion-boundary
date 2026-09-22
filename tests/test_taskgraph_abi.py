@@ -507,6 +507,20 @@ class DependencyGraphTests(unittest.TestCase):
                     self.assertLess(inst[6], self._bar_len("bar_lm_head"))
                 # NOP: no bar refs
 
+    def test_exactly_one_ffn_upgate_publishes_x_attn(self) -> None:
+        """tg_ffn_upgate_op stages x_attn in shared memory and only the packed
+        instruction with tile_n0 == 0 publishes it to g.x_attn (so concurrent
+        CTAs no longer write the same global addresses). Each layer must have
+        exactly one such instruction or ADD_RMSNORM would read stale x_attn."""
+        per_layer: dict[int, int] = {}
+        for inst in self._iter_instructions():
+            if inst[0] == tg.TgOp.FFN_UPGATE_ACT and (inst[10] & 0xFFFF) == 0:
+                per_layer[inst[1]] = per_layer.get(inst[1], 0) + 1
+        self.assertEqual(len(per_layer), self.geo.num_layers,
+                         "some layer has no FFN_UPGATE x_attn publisher")
+        self.assertTrue(all(c == 1 for c in per_layer.values()),
+                        f"expected exactly one publisher per layer: {per_layer}")
+
     def test_packed_gemm_tiles_are_consecutive(self) -> None:
         """A packed GEMM group becomes ONE kernel GEMM call with
         ``N = num_tiles * 16`` based at the first tile's ``tile_n``. The group's
