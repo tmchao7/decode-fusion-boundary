@@ -111,6 +111,34 @@ __device__ __forceinline__ void tg_fence_gpu() {
 __device__ __forceinline__ void tg_worker_sync_inner();
 __device__ __forceinline__ int tg_wwarp();
 
+// Bounded spin for the bar polls. A dependency that never arrives (a lost
+// arrival, a corrupted counter) would otherwise spin forever and wedge the GPU
+// until the process is killed — miserable to diagnose on a remote box. After
+// this many nanosleeps we print the offending bar and trap, which surfaces as
+// a CUDA error in seconds instead. The schedule itself is proven
+// deadlock-free by test_taskgraph_abi's execution simulator, so this is a
+// safety net, not an expected path. Set to 0 to disable.
+#ifndef TG_WAIT_TIMEOUT_SPINS
+#define TG_WAIT_TIMEOUT_SPINS 200000000  // ~4-8 s (nanosleep can overshoot)
+#endif
+
+__device__ __forceinline__ void tg_bar_spin(const volatile uint32_t* p,
+                                            uint32_t target, int idx) {
+#if TG_WAIT_TIMEOUT_SPINS > 0
+  uint64_t spins = 0;
+#endif
+  while (*p < target) {
+    __nanosleep(20);
+#if TG_WAIT_TIMEOUT_SPINS > 0
+    if (++spins > (uint64_t)TG_WAIT_TIMEOUT_SPINS) {
+      printf("tg_wait timeout: bar[%d] target=%u observed=%u\n", idx, target,
+             (unsigned)*p);
+      __trap();
+    }
+#endif
+  }
+}
+
 // Consumer: wait for bar[idx] >= target, then acquire.
 //
 // The poll must be a volatile load so the compiler does not hoist it out of the
@@ -131,10 +159,7 @@ __device__ __forceinline__ void tg_wait(const uint32_t* bar, int idx,
     return;
   }
   if (tg_wwarp() == 0) {
-    const volatile uint32_t* p = bar + idx;
-    while (*p < target) {
-      __nanosleep(20);
-    }
+    tg_bar_spin(bar + idx, target, idx);
     tg_fence_gpu();
   }
   tg_worker_sync_inner();
@@ -185,8 +210,18 @@ __device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
   if (tg_wwarp() == 0) {
     const volatile uint32_t* p1 = bar1 + idx1;
     const volatile uint32_t* p2 = bar2 + idx2;
+#if TG_WAIT_TIMEOUT_SPINS > 0
+    uint64_t spins = 0;
+#endif
     while ((need1 && *p1 < target1) || (need2 && *p2 < target2)) {
       __nanosleep(20);
+#if TG_WAIT_TIMEOUT_SPINS > 0
+      if (++spins > (uint64_t)TG_WAIT_TIMEOUT_SPINS) {
+        printf("tg_wait_all timeout: bar[%d] %u/%u | bar[%d] %u/%u\n", idx1,
+               (unsigned)*p1, target1, idx2, (unsigned)*p2, target2);
+        __trap();
+      }
+#endif
     }
     tg_fence_gpu();
   }
