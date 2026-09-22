@@ -699,3 +699,61 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 
 > 本设计稿完成后，进入阶段 0 实现。每阶段完成后回填本文档的"实测状态"小节，
 > 并更新 `docs/10_交接文档.md` §1/§2/§3。
+
+---
+
+## 10. 实现状态（2026-09-22，服务器实测前）
+
+> 本节记录代码实际落地到哪、哪些已静态验证、哪些还没做。设计与实现的偏差都列在
+> §10.2。服务器实测后回填 §10.4。
+
+### 10.1 已完成并验证
+
+| 模块 | 状态 | 验证方式 |
+|---|---|---|
+| `tg_abi.h` 指令/bar/desc 布局 | ✅ | `test_taskgraph_abi.py` 解析头文件与 `schedule.py` 对齐（37 项） |
+| `schedule.py` 调度构建（QKV/ATTN/O/FFN/ADD_RMSNORM/LM_HEAD/LM_ARGMAX） | ✅ | ABI 测试 + 到达计数 + tile 连续性 |
+| 调度**无死锁**（任意 num_sms） | ✅ | CPU 执行模拟器（BS∈{1,2,4,8} × num_sms∈{1,4,8,108}）；灵敏度已验证 |
+| cross-SM `tg_wait/tg_arrive` | ✅ 编译 | nvcc 12.4 sm_80；语义待真机 |
+| LM_HEAD → `TG_LM_ARGMAX` 跨 SM argmax | ✅ | 逻辑推导 + 单/多 SM 测试（待真机） |
+| cp.async 权重流水（4 stage/warp） | ✅ 编译 + group 计数静态验证 | nvcc；group 计数与 buffer 复用对 S=2..5、K/16∈1..192 验证 |
+| per-warp A staging（GEMM K loop 无 CTA barrier） | ✅ 编译 | nvcc（120 regs / 0 spill / 21.9KB static smem） |
+| GEMM fan-out（QKV/O/FFN/LM 一次 GEMM，N=num_tiles*16） | ✅ | 指令数 10516→4916；到达计数不变 |
+| `x_attn` 单发布者 + 就地 RMSNorm | ✅ | ABI 测试锁定"每层一个发布者" |
+| `tg_zero_regions` | ✅ | 回归测试 + 静态检查 |
+| bar 自旋超时 trap | ✅ 编译 | nvcc |
+| cooperative launch 失败抛异常 | ✅ | 代码路径 |
+| 多 position / 跨 KV block / 自回归 greedy | ✅ 测试已写 | 待真机（对拍 causal PyTorch 参考） |
+
+### 10.2 与设计稿的偏差
+
+1. **bar 等待**：不是所有线程自旋，而是 **worker warp 0 轮询 + worker barrier 广播**
+   （108 CTA × 224 线程全自旋会打爆 L2 计数器行）。`tg_arrive` 必须 **单线程**
+   atomicAdd + worker barrier，否则到达数 ×224。
+2. **GEMM 打包**：设计稿写"Q/K/V 每个 N tile 一条指令"；实际把**连续 tile_n 打包**
+   （QKV 用 `_pack_qkv`，其余用 `_pack_tiles`），每条指令发一次 GEMM，
+   `N = num_tiles*16`，把 N tile 扇出到 7 个 warp。否则 `total_tiles=1` 只有 warp 0 干活。
+3. **权重加载**：cohere 用 TMA；A100 无 TMA，改为 `cp.async.cg` + 4 stage 流水
+   （`.cg` 绕 L1，权重无复用）。`fence.proxy.async` 不需要。
+4. **A staging**：改为 per-warp（`s_a[7][256]`），K loop 内 0 个 CTA barrier。
+5. **LM head**：argmax 从 LM_HEAD 拆出为终结 op `TG_LM_ARGMAX` + `bar_lm_head`
+   （否则多 SM 下每个 tile 指令扫全 vocab 会读到别的 SM 还没写的 logits）。
+6. **x_attn**：FFN_UPGATE 在 shared `s_norm` 里就地 staging + 就地 RMSNorm，
+   只有 `tile_n0==0` 的指令发布给 ADD_RMSNORM（消除跨 CTA 同值写）。
+7. **ring buffer**：仍是死代码；实测显示 dispatch 的 `__syncthreads` 开销 ~2µs/SM
+   （vs 权重 800µs），暂不值得启用。
+
+### 10.3 未实现（明确不可用）
+
+- `attn_splits > 1`：`tg_attn_decode_op` 不写 `o_partial/lse_partial`，combine 会读垃圾。
+  （attention 已按 SM×warp 并行，短/中 context 不缺这个 split。）
+- `oproj_splits / down_splits > 1`：`build_schedule` 直接 `NotImplementedError`。
+- 连续批处理：`row_active` 未使用；缺 `runtime.cu`/session；`backend.py` 未接 taskgraph。
+- sampling：只有 greedy argmax，无 temperature/top-p。
+
+### 10.4 服务器实测待填
+
+- 多 SM token 是否匹配参考（`test_taskgraph_multi_sm` / `positions` multi_sm）
+- `bench_taskgraph` 的 ms/step 与有效权重 GB/s（目标：接近 A100 HBM 峰值 ~1.5TB/s）
+- `RUN_MODE=taskgraph-sanitize` 的 memcheck 是否干净
+- `generate_taskgraph` 输出文本是否连贯

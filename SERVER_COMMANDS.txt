@@ -607,6 +607,16 @@ run_taskgraph() {
     --batch-size 1,2,4,8 --context-len 512 \
     --json results/taskgraph_bench.json \
     2>&1 | tee results/taskgraph_bench.log
+
+  # End-to-end greedy generation: eyeball the decoded text (the numeric tests
+  # cannot judge fluency). --prompt is repeatable; one row per prompt.
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  PYTHONPATH=src python tools/generate_taskgraph.py \
+    --prompt "The capital of France is" \
+    --prompt "def fibonacci(n):" \
+    --max-tokens 32 \
+    2>&1 | tee results/taskgraph_generate.log
 }
 
 run_taskgraph_sanitize() {
