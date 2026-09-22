@@ -57,6 +57,8 @@ PROMPT = [
     42, 1234, 100, 7, 999, 555, 31337, 2, 888, 17,
     4096, 63, 123, 77, 2024, 5, 1, 9999, 314, 271,
 ]
+# Greedy tokens generated after the prompt (must fit in the KV cache).
+N_GENERATE = 8
 # Logit agreement with the reference. The kernel uses ex2.approx softmax and
 # rounds at different boundaries, so allow absolute slack; the position-0
 # comparison (test_tg_logits_compare) measured < 0.13, but errors can
@@ -349,6 +351,53 @@ class TaskGraphPositionTests(unittest.TestCase):
         num_sms = int(os.environ.get("TG_MULTI_SM", "8"))
         sched = tg_schedule.build_schedule(self.geo, num_sms=num_sms)
         self._check_sequence(sched, num_sms)
+
+    def test_greedy_generation_matches_reference(self):
+        """Autoregressive greedy generation: feed the kernel's own output back.
+
+        Every other test is teacher-forced. This is the only one that exercises
+        the feedback loop real inference uses (sampled token -> next step's
+        x_resid), including a KV cache that keeps growing past the prompt.
+        """
+        # Reference greedy decode: the model is causal, so recomputing the
+        # forward on the growing sequence and taking the last position's
+        # argmax is exact.
+        ref_seq = list(PROMPT)
+        ref_gen = []
+        for _ in range(N_GENERATE):
+            logits = pytorch_causal_reference(
+                self.weights["layer_weights"], self.embed_weight,
+                self.final_norm_weight, self.cos_table, self.sin_table, ref_seq,
+            )
+            tok = logits[-1].argmax().item()
+            ref_gen.append(tok)
+            ref_seq.append(tok)
+
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        s = self._alloc_scratch(self.sched, 1)
+        # Teacher-force the prompt to fill the KV cache.
+        for position, token_id in enumerate(PROMPT):
+            s = self._run_step(s, token_id, position, self.sched, 1)
+
+        # Then feed each sampled token back as the next step's input.
+        ker_gen = []
+        pos = len(PROMPT)
+        for i in range(N_GENERATE):
+            tok = s["lm_logits"][0, 0].view(torch.int32).item()
+            ker_gen.append(tok)
+            if i + 1 < N_GENERATE:
+                s = self._run_step(s, tok, pos, self.sched, 1)
+                pos += 1
+
+        print(f"\nprompt:      {PROMPT}")
+        print(f"greedy ref:  {ref_gen}")
+        print(f"greedy ker:  {ker_gen}")
+        self.assertEqual(
+            ker_gen, ref_gen,
+            "autoregressive greedy generation diverged from the reference "
+            "(teacher-forced steps can pass while the feedback loop is wrong)",
+        )
 
 
 if __name__ == "__main__":
