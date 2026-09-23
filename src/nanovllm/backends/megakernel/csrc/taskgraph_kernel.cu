@@ -802,28 +802,41 @@ __device__ __forceinline__ void tg_wmma_gemm(
       // multiples of 4 floats, and ki is in {0,4,8,12}. The guard cannot cut a
       // vector short because k + ki + 3 <= K - 1 for every ks < K/16.
       //
-      // ORDER MATTERS: this runs BEFORE the wait below. The staging's global
-      // loads are then in flight while the warp blocks in cp_async_wait, so the
-      // two latencies overlap instead of adding up. It only touches this warp's
-      // own s_a slice, so it cannot race with the B pipeline.
+      // ORDER MATTERS: this runs BEFORE the wait below. The staging's loads are
+      // then in flight while the warp blocks in cp_async_wait, so the two
+      // latencies overlap instead of adding up. It only touches this warp's own
+      // s_a slice, so it cannot race with the B pipeline.
+      //
+      // Both loads are issued before either is consumed, on purpose: written as
+      // a two-iteration loop the compiler reuses the load registers and emits
+      // LDS.128 -> F2FP -> STS.64 -> LDS.128, serialising the two latencies
+      // (verified in SASS). The lane map is fixed:
+      //   lane -> (row lane/4, cols k + 4*(lane%4) .. +3) and the same +8 rows,
+      //   i.e. s_a[4*lane] and s_a[4*lane + 128].
       const int k = ks * TG_WMMA_TILE;
       const int lane = tg_wlane();
+      const int ki = (lane % 4) * 4;      // 0, 4, 8 or 12
+      const int row_lo = lane / 4;        // 0..7
+      const int col = k + ki;
+      float4 f_lo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 f_hi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (active && m0 + row_lo < M && col < K)
+        f_lo = *reinterpret_cast<const float4*>(
+            H + (m0 + row_lo) * STRIDE_K + col);
+      if (active && m0 + row_lo + 8 < M && col < K)
+        f_hi = *reinterpret_cast<const float4*>(
+            H + (m0 + row_lo + 8) * STRIDE_K + col);
+      const int idx_lo = lane * 4;        // == row_lo * 16 + ki
+      const int idx_hi = idx_lo + 128;    // == (row_lo + 8) * 16 + ki
       #pragma unroll
-      for (int v = lane; v < (TG_WMMA_TILE * TG_WMMA_TILE) / 4;
-           v += TG_WARP_SIZE) {
-        const int idx = v * 4;
-        const int mi = idx / TG_WMMA_TILE;  // row 0..15
-        const int ki = idx % TG_WMMA_TILE;  // 0, 4, 8 or 12
-        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (active && m0 + mi < M && k + ki < K)
-          f = *reinterpret_cast<const float4*>(
-              H + (m0 + mi) * STRIDE_K + k + ki);
+      for (int half = 0; half < 2; ++half) {
+        const float4 f = (half == 0) ? f_lo : f_hi;
         const __nv_bfloat162 lo = __floats2bfloat162_rn(f.x, f.y);
         const __nv_bfloat162 hi = __floats2bfloat162_rn(f.z, f.w);
         uint2 packed;
         packed.x = *reinterpret_cast<const uint32_t*>(&lo);
         packed.y = *reinterpret_cast<const uint32_t*>(&hi);
-        *reinterpret_cast<uint2*>(my_a + idx) = packed;
+        *reinterpret_cast<uint2*>(my_a + (half == 0 ? idx_lo : idx_hi)) = packed;
       }
 
       tg_cp_async_wait<TG_B_STAGES - 1>();
