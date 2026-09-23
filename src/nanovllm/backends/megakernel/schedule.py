@@ -166,7 +166,7 @@ def make_qkv_proj(
     wait_target: int,
     produce_bar_idx: int,
     batch_row: int,
-    extra_tiles: list[int] | None = None,
+    num_tiles: int = 1,
 ) -> list[int]:
     """TG_QKV_PROJ. See docs/11 §3.3.
 
@@ -174,16 +174,15 @@ def make_qkv_proj(
     cache write); False for V (V is written to KV cache without RoPE). The
     schedule builder decides per gemm_idx.
 
-    ``extra_tiles`` packs additional consecutive ``tile_n`` into the same
-    instruction (data[9]=count, data[10..15]=tile_n list, mirroring the generic
-    GEMM layout). The kernel then issues ONE GEMM with N = count*16 so the
-    tiles are split across the worker warps. All packed tiles must share the
-    same (gemm_idx, produce_bar_idx) so they write the same weight and signal
+    ``num_tiles`` packs the ``num_tiles`` CONSECUTIVE ``tile_n`` starting at
+    ``tile_n`` into one instruction (data[9]=count, data[10]=first tile_n). The
+    kernel issues ONE GEMM with N = count*16 based at that tile, splitting the N
+    across the worker warps. All packed tiles must share the same
+    (gemm_idx, produce_bar_idx) so they read the same weight matrix and signal
     the same bar slot.
     """
-    tiles = [tile_n] + list(extra_tiles or [])
-    if len(tiles) > 6:
-        raise ValueError(f"too many QKV tiles per instruction: {len(tiles)} > 6")
+    if num_tiles < 1:
+        raise ValueError(f"num_tiles must be >= 1, got {num_tiles}")
     return _inst(
         TgOp.QKV_PROJ,
         layer,
@@ -194,8 +193,8 @@ def make_qkv_proj(
         wait_target,
         produce_bar_idx,
         batch_row,
-        len(tiles),
-        *tiles,
+        num_tiles,
+        tile_n,   # inst[10] = range start; the kernel reads tile_n0 from here
     )
 
 
@@ -263,19 +262,21 @@ def make_gemm(
     wait_bar_idx: int,
     wait_target: int,
     produce_bar_idx: int,
-    extra_tiles: list[tuple[int, int]] | None = None,
+    num_tiles: int = 1,
 ) -> list[int]:
     """Generic GEMM instruction (O_PROJ / FFN_UPGATE_ACT / FFN_DOWN / LM_HEAD).
 
-    Packs the primary (tile_m, tile_n) plus up to 5 extra tiles sharing the
-    same dependency. ``extra_tiles`` lets one instruction cover multiple tiles
-    that all wait on the same bar and produce the same bar — the worker loop
-    fans the tiles out across its warps.
+    Covers the ``num_tiles`` CONSECUTIVE N tiles starting at ``tile_n``
+    (data[9]=count, data[10]=first tile_n). The kernel derives N = count*16 and
+    the weight/output base from the first tile, so one instruction is one GEMM
+    whose N is split across the worker warps — which is why the packer must
+    keep the tiles consecutive.
+
+    ``tile_m`` is always 0 (batch fits in one WMMA M tile, M<=16) and is kept
+    for layout compatibility.
     """
-    tiles = [(tile_m, tile_n)] + (extra_tiles or [])
-    if len(tiles) > 6:
-        raise ValueError(f"too many tiles per instruction: {len(tiles)} > 6")
-    tile_ids = [_pack_tile(m, n) for m, n in tiles]
+    if num_tiles < 1:
+        raise ValueError(f"num_tiles must be >= 1, got {num_tiles}")
     return _inst(
         opcode,
         layer,
@@ -286,8 +287,11 @@ def make_gemm(
         wait_bar_idx,
         wait_target,
         produce_bar_idx,
-        len(tiles),
-        *tile_ids,
+        num_tiles,
+        # inst[10] = range start (tile_m<<16 | tile_n, as before). The kernel
+        # masks to 16 bits; inst[11..15] stay unused because the range replaces
+        # the old tile list.
+        _pack_tile(tile_m, tile_n),
     )
 
 
@@ -320,7 +324,7 @@ def make_lm_head(
     tile_n: int,
     wait_bar_idx: int,
     wait_target: int,
-    extra_tiles: list[tuple[int, int]] | None = None,
+    num_tiles: int = 1,
 ) -> list[int]:
     """TG_LM_HEAD tile. Waits on bar_layer, produces bar_lm_head[0].
 
@@ -339,7 +343,7 @@ def make_lm_head(
         wait_bar_idx=wait_bar_idx,
         wait_target=wait_target,
         produce_bar_idx=0,
-        extra_tiles=extra_tiles,
+        num_tiles=num_tiles,
     )
 
 
@@ -417,22 +421,79 @@ def _qkv_wait_idx(layer: int) -> int:
 _Q_TILES_PER_KV_HEAD = 16   # q_size=2048, bn=16 -> 128 tiles / 8 kv_heads = 16
 _KV_TILES_PER_KV_HEAD = 8   # kv_size=1024, bn=16 -> 64 tiles / 8 kv_heads = 8
 
+# Consecutive tiles packed into one GEMM instruction. The kernel derives
+# N = num_tiles*16 from the first tile and splits that N across the 7 worker
+# warps, so this is also the warp-saturation width: 7 tiles = one per warp.
+# inst[11..15] are unused (the tile *list* was replaced by the tile *range*).
+_TILE_SLOTS_PER_INST = 7
 
-def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[list[int]]:
-    """Merge consecutive instructions with identical (opcode, wait, produce, split)
-    into single instructions carrying up to ``max_per_inst`` tiles.
 
-    This is a simple greedy pack: it groups runs of instructions that share
-    everything except (tile_m, tile_n) and emits one instruction per group with
-    the tiles in ``TILE_IDS``. Packing cuts inst_buf size by up to 6x without
-    changing the dependency graph.
+def _qkv_tile_count(geo: TgGeometry) -> int:
+    bn = geo.tiling.qkv_bn
+    return geo.q_size // bn + 2 * (geo.kv_size // bn)
+
+
+def _oproj_tile_count(geo: TgGeometry) -> int:
+    return geo.hidden // geo.tiling.oproj_bn
+
+
+def _ffn_upgate_tile_count(geo: TgGeometry) -> int:
+    return (geo.intermediate // geo.tiling.ffn_bn) * geo.tiling.down_splits
+
+
+def _ffn_down_tile_count(geo: TgGeometry) -> int:
+    return (geo.hidden // geo.tiling.ffn_bn) * geo.tiling.down_splits
+
+
+def _lm_head_tile_count(geo: TgGeometry) -> int:
+    return geo.vocab // geo.tiling.lm_head_bn
+
+
+def _max_per_inst(num_tiles: int, num_sms: int) -> int:
+    """How many consecutive tiles to pack into one GEMM instruction.
+
+    Answer: as many as fit, i.e. :data:`_TILE_SLOTS_PER_INST`. The tempting
+    alternative — pack only ``ceil(tiles / num_sms)`` so every SM gets one
+    instruction — is *not* better, because the tiles inside one instruction run
+    in PARALLEL across the 7 worker warps. Per-SM the wave costs
+
+        ceil(ceil(tiles / M) / num_sms) * ceil(M / 7) * (K / 16) K-steps
+
+    and both ``M = 7`` and ``M = 2`` evaluate to the same number of K-steps:
+    fewer tiles per instruction means proportionally fewer active warps, so the
+    SM streams proportionally less per K-step. What actually sets the wave time
+    is ``(K/16) * k_step_time``, which this knob cannot change — only the
+    kernel's per-warp pipeline depth can (see TG_B_STAGES in the kernel).
+
+    ``M = 7`` is therefore chosen because it saturates all seven warps (more
+    bytes in flight per SM than M < 7) while keeping the instruction count, and
+    hence the barrier traffic, minimal. ``num_sms`` is accepted for callers that
+    want to reason about grid coverage but does not change the answer.
+
+    Bar accounting is unaffected by the choice: every GEMM arrival carries its
+    tile count as ``inc`` (``tg_arrive(bar, idx, num_tiles)``), so the totals
+    consumers wait on are identical however the tiles are grouped.
+    """
+    if num_tiles <= 0:
+        return 1
+    return max(1, min(_TILE_SLOTS_PER_INST, num_tiles))
+
+
+def _pack_tiles(instructions: list[list[int]],
+                max_per_inst: int = _TILE_SLOTS_PER_INST) -> list[list[int]]:
+    """Merge consecutive instructions sharing a dependency into one GEMM.
+
+    Greedy pack: groups runs of instructions that differ only in ``tile_n`` and
+    emits one instruction per group covering the whole consecutive range
+    (``num_tiles`` + first ``tile_n``). Packing cuts inst_buf size by up to
+    ``max_per_inst``x without changing the dependency graph.
 
     The kernel turns each group into ONE GEMM call with
     ``N = num_tiles * TG_WMMA_TILE`` based at the first tile's ``tile_n``, so
-    the packed tiles MUST be consecutive in ``tile_n``. That lets
-    ``tg_wmma_gemm`` split the N tiles across the worker warps instead of
-    serializing them on warp 0. The grouping loop below therefore breaks the
-    run on a non-consecutive ``tile_n``.
+    the packed tiles MUST be consecutive. That lets ``tg_wmma_gemm`` split the N
+    tiles across the worker warps instead of serializing them on warp 0; the
+    grouping loop below therefore breaks the run on a non-consecutive ``tile_n``
+    and on a differing ``tile_m``.
 
     Applies to the generic GEMM opcodes (O_PROJ / FFN_UPGATE_ACT / FFN_DOWN /
     LM_HEAD). TG_QKV_PROJ is packed by :func:`_pack_qkv` (its own field layout);
@@ -450,53 +511,53 @@ def _pack_tiles(instructions: list[list[int]], max_per_inst: int = 6) -> list[li
             out.append(inst)
             i += 1
             continue
-        # Group key: (opcode, layer, split, k_tiles, wait_idx, wait_target, produce_idx)
-        key = (inst[1], inst[4], inst[5], inst[6], inst[7], inst[8])
-        group: list[tuple[int, int]] = [(inst[2], inst[3])]
+        # Group key: (layer, tile_m, split, k_tiles, wait_idx, wait_target,
+        # produce_idx). tile_m is part of the key because the kernel does not
+        # tile M: mixing two tile_m values in one range would be wrong.
+        key = (inst[1], inst[2], inst[4], inst[5], inst[6], inst[7], inst[8])
+        first_n = inst[3]
+        count = 1
         j = i + 1
-        while j < len(instructions) and len(group) < max_per_inst:
+        while j < len(instructions) and count < max_per_inst:
             nxt = instructions[j]
             if nxt[0] != opcode:
                 break
-            nxt_key = (nxt[1], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8])
-            if nxt_key != key:
+            if (nxt[1], nxt[2], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8]) != key:
                 break
             # The kernel derives N = num_tiles*16 from the first tile_n, so the
-            # group must stay consecutive in tile_n (inst[3]). A gap would make
-            # that one GEMM cover the wrong weight/output range.
-            if nxt[3] != group[-1][1] + 1:
+            # group must stay consecutive in tile_n. A gap would make that one
+            # GEMM cover the wrong weight/output range.
+            if nxt[3] != first_n + count:
                 break
-            group.append((nxt[2], nxt[3]))
+            count += 1
             j += 1
-        if len(group) == 1:
-            out.append(inst)
-        else:
-            out.append(
-                make_gemm(
-                    opcode,
-                    layer=inst[1],
-                    tile_m=group[0][0],
-                    tile_n=group[0][1],
-                    split=inst[4],
-                    k_tiles=inst[5],
-                    wait_bar_idx=inst[6],
-                    wait_target=inst[7],
-                    produce_bar_idx=inst[8],
-                    extra_tiles=group[1:],
-                )
+        out.append(
+            make_gemm(
+                opcode,
+                layer=inst[1],
+                tile_m=inst[2],
+                tile_n=first_n,
+                split=inst[4],
+                k_tiles=inst[5],
+                wait_bar_idx=inst[6],
+                wait_target=inst[7],
+                produce_bar_idx=inst[8],
+                num_tiles=count,
             )
+        )
         i = j
     return out
 
 
-def _pack_qkv(instructions: list[list[int]], max_per_inst: int = 6) -> list[list[int]]:
+def _pack_qkv(instructions: list[list[int]],
+              max_per_inst: int = _TILE_SLOTS_PER_INST) -> list[list[int]]:
     """Pack consecutive TG_QKV_PROJ tiles that share everything but tile_n.
 
-    QKV has its own field layout (no TILE_IDS), so it needs its own packer. The
-    group key includes ``gemm_idx`` (Q/K/V use different weights) and
-    ``produce_bar_idx`` (tiles of different kv_heads must not be merged). The
-    kernel derives N = count*16 from the first tile_n, so the group must stay
-    consecutive in tile_n.
+    QKV has its own field layout, so it needs its own packer. The group key
+    includes ``gemm_idx`` (Q/K/V use different weights) and ``produce_bar_idx``
+    (tiles of different kv_heads must not be merged). The kernel derives
+    N = count*16 from the first tile_n, so the group must stay consecutive in
+    tile_n.
     """
     if not instructions:
         return []
@@ -506,26 +567,27 @@ def _pack_qkv(instructions: list[list[int]], max_per_inst: int = 6) -> list[list
         inst = instructions[i]
         # (layer, gemm_idx, needs_rope, wait_idx, wait_target, produce, batch)
         key = (inst[1], inst[3], inst[4], inst[5], inst[6], inst[7], inst[8])
-        group = [inst[2]]  # tile_n
+        first_n = inst[2]
+        count = 1
         j = i + 1
-        while j < len(instructions) and len(group) < max_per_inst:
+        while j < len(instructions) and count < max_per_inst:
             nxt = instructions[j]
             nxt_key = (nxt[1], nxt[3], nxt[4], nxt[5], nxt[6], nxt[7], nxt[8])
-            if nxt_key != key or nxt[2] != group[-1] + 1:
+            if nxt_key != key or nxt[2] != first_n + count:
                 break
-            group.append(nxt[2])
+            count += 1
             j += 1
         out.append(
             make_qkv_proj(
                 layer=inst[1],
-                tile_n=group[0],
+                tile_n=first_n,
                 gemm_idx=inst[3],
                 needs_rope=bool(inst[4]),
                 wait_bar_idx=inst[5],
                 wait_target=inst[6],
                 produce_bar_idx=inst[7],
                 batch_row=inst[8],
-                extra_tiles=group[1:],
+                num_tiles=count,
             )
         )
         i = j
@@ -823,20 +885,26 @@ def build_lm_head_wave(geo: TgGeometry) -> list[list[int]]:
 # =============================================================================
 
 
-def build_layer_waves(geo: TgGeometry, layer: int) -> list[list[list[int]]]:
+def build_layer_waves(geo: TgGeometry, layer: int,
+                      num_sms: int = _TILE_SLOTS_PER_INST) -> list[list[list[int]]]:
     """Return the 7 named waves for one layer (LM_HEAD is separate).
 
     GEMM waves (O_PROJ, FFN_UPGATE_ACT, FFN_DOWN) are tile-packed to cut
     inst_buf size; QKV/ATTN/ADD_RMSNORM use opcode-specific layouts that
-    are not packed.
+    are not packed. ``num_sms`` sets the tile granularity so each wave covers
+    as many SMs as possible (see :func:`_max_per_inst`).
     """
     return [
-        _pack_qkv(build_qkv_wave(geo, layer)),
+        _pack_qkv(build_qkv_wave(geo, layer),
+                  _max_per_inst(_qkv_tile_count(geo), num_sms)),
         build_attn_wave(geo, layer),
         build_attn_combine_wave(geo, layer),
-        _pack_tiles(build_o_proj_wave(geo, layer)),
-        _pack_tiles(build_ffn_upgate_wave(geo, layer)),
-        _pack_tiles(build_ffn_down_wave(geo, layer)),
+        _pack_tiles(build_o_proj_wave(geo, layer),
+                    _max_per_inst(_oproj_tile_count(geo), num_sms)),
+        _pack_tiles(build_ffn_upgate_wave(geo, layer),
+                    _max_per_inst(_ffn_upgate_tile_count(geo), num_sms)),
+        _pack_tiles(build_ffn_down_wave(geo, layer),
+                    _max_per_inst(_ffn_down_tile_count(geo), num_sms)),
         build_add_rmsnorm_wave(geo, layer),
     ]
 
@@ -926,8 +994,9 @@ def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
         )
     waves: list[list[list[int]]] = []
     for layer in range(geo.num_layers):
-        waves.extend(build_layer_waves(geo, layer))
-    waves.append(_pack_tiles(build_lm_head_wave(geo)))
+        waves.extend(build_layer_waves(geo, layer, num_sms))
+    waves.append(_pack_tiles(build_lm_head_wave(geo),
+                             _max_per_inst(_lm_head_tile_count(geo), num_sms)))
 
     per_sm = place_round_robin(waves, num_sms)
     flat, counts, max_inst = serialize_inst_buf(per_sm, num_sms)

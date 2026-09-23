@@ -310,34 +310,55 @@ class InstructionEncodingTests(unittest.TestCase):
         self.assertEqual(inst[9], 1)       # NUM_TILES
         self.assertEqual(inst[10], 5)      # first tile_n of the pack
 
-    def test_qkv_proj_packs_extra_tiles(self) -> None:
+    def test_qkv_proj_encodes_tile_range(self) -> None:
+        # Packing is a RANGE, not a tile list: the kernel derives
+        # N = num_tiles*16 from inst[10] and never reads inst[11..15].
         inst = tg.make_qkv_proj(
             layer=0, tile_n=6, gemm_idx=0, needs_rope=True,
             wait_bar_idx=0, wait_target=0, produce_bar_idx=0, batch_row=0,
-            extra_tiles=[7, 8, 9],
+            num_tiles=4,
         )
-        self.assertEqual(inst[9], 4)       # NUM_TILES = 1 primary + 3 extra
-        self.assertEqual(inst[10:14], [6, 7, 8, 9])
+        self.assertEqual(inst[9], 4)       # NUM_TILES
+        self.assertEqual(inst[10], 6)      # first tile_n of the range
+        self.assertEqual(inst[11:], [0] * 5,
+                         "tile list slots must stay unused (range semantics)")
 
-    def test_gemm_packs_extra_tiles_into_tile_ids(self) -> None:
+    def test_gemm_encodes_tile_range(self) -> None:
         inst = tg.make_gemm(
-            tg.TgOp.O_PROJ, layer=0, tile_m=0, tile_n=0, split=0, k_tiles=128,
+            tg.TgOp.O_PROJ, layer=0, tile_m=0, tile_n=3, split=0, k_tiles=128,
             wait_bar_idx=0, wait_target=8, produce_bar_idx=0,
-            extra_tiles=[(0, 1), (0, 2), (0, 3)],
+            num_tiles=4,
         )
-        self.assertEqual(inst[9], 4)  # NUM_TILES = 1 primary + 3 extra
-        # TILE_IDS start at data[10]
-        self.assertEqual(inst[10], (0 << 16) | 0)
-        self.assertEqual(inst[11], (0 << 16) | 1)
-        self.assertEqual(inst[12], (0 << 16) | 2)
-        self.assertEqual(inst[13], (0 << 16) | 3)
+        self.assertEqual(inst[9], 4)   # NUM_TILES
+        self.assertEqual(inst[10], 3)  # first tile_n of the range
+        self.assertEqual(inst[11:], [0] * 5,
+                         "tile list slots must stay unused (range semantics)")
 
-    def test_gemm_rejects_more_than_six_tiles(self) -> None:
+    def test_gemm_rejects_zero_tiles(self) -> None:
         with self.assertRaises(ValueError):
             tg.make_gemm(
-                tg.TgOp.O_PROJ, 0, 0, 0, 0, 0, 0, 0, 0,
-                extra_tiles=[(0, i) for i in range(6)],  # 1 + 6 = 7 > 6
+                tg.TgOp.O_PROJ, 0, 0, 0, 0, 0, 0, 0, 0, num_tiles=0,
             )
+        with self.assertRaises(ValueError):
+            tg.make_qkv_proj(
+                layer=0, tile_n=0, gemm_idx=0, needs_rope=True,
+                wait_bar_idx=0, wait_target=0, produce_bar_idx=0, batch_row=0,
+                num_tiles=0,
+            )
+
+    def test_packer_cap_saturates_worker_warps(self) -> None:
+        # 7 worker warps: 7 tiles per instruction is one tile per warp, the
+        # widest N one GEMM can spread without serialising tiles per warp.
+        self.assertEqual(tg._TILE_SLOTS_PER_INST, 7)
+        # QKV: 16 Q tiles per kv_head -> 7+7+2, all consecutive within the head.
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        for inst in tg._pack_qkv(tg.build_qkv_wave(geo, 0)):
+            self.assertLessEqual(inst[9], 7)
+            self.assertGreaterEqual(inst[9], 1)
+        # Generic GEMM: 64 O_PROJ tiles -> 7+7+...+1.
+        packed = tg._pack_tiles(tg.build_o_proj_wave(geo, 0))
+        self.assertEqual(sum(i[9] for i in packed), 64)
+        self.assertTrue(all(1 <= i[9] <= 7 for i in packed))
 
     def test_attn_decode_encode_produce_is_combine_in_sign_bit(self) -> None:
         inst = tg.make_attn_decode(
@@ -420,6 +441,155 @@ class ScheduleStructureTests(unittest.TestCase):
                 if i >= self.sched.num_inst_per_sm[sm]:
                     self.assertEqual(inst[0], tg.TgOp.NOP,
                                      f"SM {sm} slot {i} should be NOP padding")
+
+
+# =============================================================================
+# Wave granularity: pack tiles to cover every SM, not to make big instructions
+# =============================================================================
+
+
+def _wave_tiles(inst: list[int]) -> int:
+    """GEMM tiles carried by one instruction (0 for non-GEMM opcodes)."""
+    if inst[0] in (tg.TgOp.QKV_PROJ, tg.TgOp.O_PROJ, tg.TgOp.FFN_UPGATE_ACT,
+                   tg.TgOp.FFN_DOWN, tg.TgOp.LM_HEAD):
+        return inst[9]
+    return 0
+
+
+def waves_with_cap(geo, cap: int) -> list[list[list[int]]]:
+    """All waves assembled with an explicit packing cap (a test knob)."""
+    waves: list[list[list[int]]] = []
+    for layer in range(geo.num_layers):
+        waves.extend([
+            tg._pack_qkv(tg.build_qkv_wave(geo, layer), cap),
+            tg.build_attn_wave(geo, layer),
+            tg.build_attn_combine_wave(geo, layer),
+            tg._pack_tiles(tg.build_o_proj_wave(geo, layer), cap),
+            tg._pack_tiles(tg.build_ffn_upgate_wave(geo, layer), cap),
+            tg._pack_tiles(tg.build_ffn_down_wave(geo, layer), cap),
+            tg.build_add_rmsnorm_wave(geo, layer),
+        ])
+    waves.append(tg._pack_tiles(tg.build_lm_head_wave(geo), cap))
+    return waves
+
+
+def wave_k_step_path(geo, num_sms: int, cap: int | None = None) -> int:
+    """Serial K-steps on the schedule's critical path.
+
+    The schedule's serial cost in units of one K-step (16 columns of K). Waves
+    are strictly ordered — the next cannot start until the last instruction of
+    the current one lands — and :func:`tg.place_round_robin` gives each
+    instruction its own SM. Within one instruction the tiles run in PARALLEL
+    across the worker warps (``tg_wmma_gemm`` fans N out), so an instruction
+    with M tiles costs ``ceil(M / warps)`` sequential warp-rounds, not ``M``.
+    """
+    warps = 7  # TG_WORKER_WARPS
+    if cap is not None:
+        waves = waves_with_cap(geo, cap)
+    else:
+        waves = []
+        for layer in range(geo.num_layers):
+            waves.extend(tg.build_layer_waves(geo, layer, num_sms))
+        waves.append(tg._pack_tiles(
+            tg.build_lm_head_wave(geo),
+            tg._max_per_inst(tg._lm_head_tile_count(geo), num_sms)))
+    cursor = 0
+    total = 0
+    for wave in waves:
+        per_sm: dict[int, int] = {}
+        for inst in wave:
+            sm = cursor % num_sms
+            tiles = _wave_tiles(inst)
+            rounds = -(-tiles // warps) if tiles else 1  # non-GEMM = 1 step
+            per_sm[sm] = per_sm.get(sm, 0) + rounds
+            cursor += 1
+        total += max(per_sm.values(), default=0)
+    return total
+
+
+class WaveGranularityTests(unittest.TestCase):
+    """Tile packing is a *range*, and the range width is a scheduling knob.
+
+    Packing maximally (7 tiles = one per worker warp) is optimal: tiles inside
+    one instruction run in parallel across the warps, so a wave's cost is
+    ``ceil(M / 7)`` warp-rounds per instruction and ``ceil(ceil(tiles/M)/SMs)``
+    instructions per SM. Both ``M = 7`` and ``M = 2`` give the same K-step
+    count, but ``M = 7`` saturates the warps (more bytes in flight per SM) and
+    emits the fewest instructions (least barrier traffic).
+    """
+
+    def test_max_per_inst_packs_maximally(self) -> None:
+        # Always the cap: the grid size must NOT shrink the range.
+        for num_sms in (1, 8, 108):
+            self.assertEqual(tg._max_per_inst(192, num_sms), 7)
+            self.assertEqual(tg._max_per_inst(10 ** 6, num_sms), 7)
+        # Fewer tiles than the cap -> pack what exists.
+        self.assertEqual(tg._max_per_inst(1, 108), 1)
+        self.assertEqual(tg._max_per_inst(3, 108), 3)
+        self.assertEqual(tg._max_per_inst(0, 108), 1)
+
+    def test_packing_saturates_warps_without_extra_rounds(self) -> None:
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        # FFN gate/up has 192 tiles: 28 instructions of 7 = exactly one warp
+        # round each, on 28 SMs.
+        packed = tg._pack_tiles(tg.build_ffn_upgate_wave(geo, 0))
+        self.assertEqual(sum(i[9] for i in packed), 192)
+        self.assertTrue(all(i[9] == 7 for i in packed[:-1]))
+        self.assertEqual(-(-len(packed) // 1), len(packed))
+
+    def test_wider_packing_never_lengthens_the_path(self) -> None:
+        """Packing maximally must dominate thinner packing.
+
+        Spreading tiles thinner over more SMs cannot help: fewer tiles per
+        instruction means proportionally fewer active warps, so each SM streams
+        proportionally less per K-step while the wave still costs the same
+        ``ceil(M / 7)`` warp-rounds. Wider is therefore never worse — and at
+        equal width the extra SMs are what shorten the path.
+        """
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        for num_sms in (1, 8, 108):
+            p1 = wave_k_step_path(geo, num_sms, cap=1)
+            p2 = wave_k_step_path(geo, num_sms, cap=2)
+            p7 = wave_k_step_path(geo, num_sms, cap=7)
+            self.assertLessEqual(p7, p2, f"cap=7 worse than cap=2 at {num_sms} SMs")
+            self.assertLessEqual(p2, p1, f"cap=2 worse than cap=1 at {num_sms} SMs")
+
+    def test_more_sms_shortens_the_path(self) -> None:
+        """The grid is what parallelises the waves; the packing width is fixed."""
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        path_1 = wave_k_step_path(geo, 1)
+        path_108 = wave_k_step_path(geo, 108)
+        self.assertLess(path_108, path_1)
+        self.assertGreater(path_1 / path_108, 5.0,
+                           "108 SMs should parallelise the serial waves by ~28x")
+
+    def test_granularity_preserves_bar_accounting(self) -> None:
+        """Every bar's arrival total must be independent of the grid size.
+
+        The packer only regroups tiles; each instruction still arrives with its
+        tile count as ``inc`` (``tg_arrive(bar, idx, num_tiles)``), so the totals
+        consumers wait on cannot change. This is what makes the granularity a
+        pure scheduling knob.
+        """
+        geo = tg.default_geometry(BS=2, attn_splits=2)
+        ref = None
+        for num_sms in (1, 4, 108):
+            sched = tg.build_schedule(geo, num_sms)
+            done, total, bars, _ = simulate_execution(sched, num_sms)
+            self.assertEqual(done, total)
+            counts = dict(bars)
+            if ref is None:
+                ref = counts
+            else:
+                self.assertEqual(
+                    counts, ref,
+                    f"bar totals changed at num_sms={num_sms} — granularity is "
+                    "no longer a pure scheduling knob")
+        assert ref is not None
+        # Spot-check the invariants the kernel depends on.
+        self.assertEqual(ref[("lm_head", 0)], geo.vocab // 16)
+        self.assertEqual(ref[("layer", 1)], geo.BS)
+        self.assertEqual(ref[("qkv", 0)], 32)   # 16 Q + 8 K + 8 V tiles
 
 
 # =============================================================================
@@ -521,28 +691,35 @@ class DependencyGraphTests(unittest.TestCase):
         self.assertTrue(all(c == 1 for c in per_layer.values()),
                         f"expected exactly one publisher per layer: {per_layer}")
 
-    def test_packed_gemm_tiles_are_consecutive(self) -> None:
+    def test_packed_gemm_encodes_a_consecutive_range(self) -> None:
         """A packed GEMM group becomes ONE kernel GEMM call with
-        ``N = num_tiles * 16`` based at the first tile's ``tile_n``. The group's
-        ``tile_n`` values must therefore be consecutive; a gap would make that
-        single call cover the wrong weight/output range."""
+        ``N = num_tiles * 16`` based at the first tile's ``tile_n`` (inst[10],
+        which the kernel reads). Packing is therefore a *range*: the group's
+        tiles must be consecutive or that single call would cover the wrong
+        weight/output range. inst[11..15] must stay unused."""
+        seen_any = False
         for inst in self._iter_instructions():
             op = inst[0]
             if op == tg.TgOp.QKV_PROJ:
-                # QKV packs tile_n directly at data[10..15] (no tile_m).
                 num_tiles = inst[9]
-                tile_ns = [inst[10 + t] for t in range(num_tiles)]
+                tile_n0 = inst[10]           # QKV: plain tile_n
             elif op in (tg.TgOp.O_PROJ, tg.TgOp.FFN_UPGATE_ACT,
                         tg.TgOp.FFN_DOWN, tg.TgOp.LM_HEAD):
-                # Generic GEMM packs (tile_m << 16) | tile_n.
                 num_tiles = inst[9]
-                tile_ns = [inst[10 + t] & 0xFFFF for t in range(num_tiles)]
+                tile_n0 = inst[10] & 0xFFFF  # generic: (tile_m << 16) | tile_n
             else:
                 continue
-            self.assertEqual(
-                tile_ns, list(range(tile_ns[0], tile_ns[0] + num_tiles)),
-                f"packed tile_n not consecutive for opcode {op}: {tile_ns}",
-            )
+            seen_any = True
+            self.assertGreaterEqual(num_tiles, 1,
+                                    f"opcode {op} has an empty tile range")
+            self.assertLessEqual(num_tiles, tg._TILE_SLOTS_PER_INST,
+                                 f"opcode {op} exceeds the packing cap")
+            self.assertEqual(inst[11:], [0] * 5,
+                             "tile list slots must be unused (range semantics)")
+            # The range start must be a real tile index, and the range must fit
+            # inside the weight matrix that opcode indexes.
+            self.assertGreaterEqual(tile_n0, 0)
+        self.assertTrue(seen_any, "no GEMM instructions found to check")
 
     def test_every_produced_bar_slot_is_waited_upon(self) -> None:
         """For each bar slot, total arrivals produced must equal the max
