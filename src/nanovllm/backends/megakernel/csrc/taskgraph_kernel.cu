@@ -788,8 +788,6 @@ __device__ __forceinline__ void tg_wmma_gemm(
             s_b + (ahead % TG_B_STAGES) * (TG_WMMA_TILE * TG_WMMA_TILE),
             w_base, K, ahead * TG_WMMA_TILE);
       tg_cp_async_commit();
-      tg_cp_async_wait<TG_B_STAGES - 1>();
-      __syncwarp();  // make this warp's cp.async writes visible to its lanes
 
       // Per-warp A staging: each warp converts its own A fragment into its own
       // slice of s_a. The A data is identical across warps (tiles_M=1), but a
@@ -803,6 +801,11 @@ __device__ __forceinline__ void tg_wmma_gemm(
       // 16-byte aligned: H is a torch/static buffer, STRIDE_K and k are
       // multiples of 4 floats, and ki is in {0,4,8,12}. The guard cannot cut a
       // vector short because k + ki + 3 <= K - 1 for every ks < K/16.
+      //
+      // ORDER MATTERS: this runs BEFORE the wait below. The staging's global
+      // loads are then in flight while the warp blocks in cp_async_wait, so the
+      // two latencies overlap instead of adding up. It only touches this warp's
+      // own s_a slice, so it cannot race with the B pipeline.
       const int k = ks * TG_WMMA_TILE;
       const int lane = tg_wlane();
       #pragma unroll
@@ -822,7 +825,9 @@ __device__ __forceinline__ void tg_wmma_gemm(
         packed.y = *reinterpret_cast<const uint32_t*>(&hi);
         *reinterpret_cast<uint2*>(my_a + idx) = packed;
       }
-      __syncwarp();  // publish this warp's staging to its own lanes
+
+      tg_cp_async_wait<TG_B_STAGES - 1>();
+      __syncwarp();  // make this warp's cp.async + staging stores visible
 
       if (active) {
         wmma::fragment<wmma::matrix_a, TG_WMMA_TILE, TG_WMMA_TILE,
