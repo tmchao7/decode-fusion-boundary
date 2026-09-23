@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     u32 = dict(dtype=torch.uint32, device="cuda")
     WMMA_PAD = 16
     s = {
-        "inst_buf": torch.tensor(sched.flat_inst_buf, dtype=torch.int32).cuda(),
+        "inst_buf": torch.tensor(sched.flat_inst_buf, dtype=torch.uint32).cuda().view(torch.int32),
         "num_inst_per_sm": torch.tensor(sched.num_inst_per_sm, dtype=torch.int32).cuda(),
         "norm_out": torch.empty(BS, HIDDEN_SIZE, **f32),
         "q_out": torch.empty(WMMA_PAD, Q_SIZE, **f32),
