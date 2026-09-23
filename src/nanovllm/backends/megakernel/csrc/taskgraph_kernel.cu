@@ -670,9 +670,21 @@ __device__ __forceinline__ void tg_rmsnorm_f(
 using namespace nvcuda;
 constexpr int TG_WMMA_TILE = 16;
 // In-flight weight stages per warp. TG_B_STAGES-1 real loads stay outstanding
-// after each wait, so with 6 active warps the SM keeps ~(STAGES-1)*6*512 B in
-// flight; 4 stages ~= 9 KB, roughly the HBM latency-bandwidth product per SM.
-constexpr int TG_B_STAGES = 4;
+// after each wait, so the SM keeps (STAGES-1) * active_warps * 512 B in flight.
+//
+// The K loop advances one stage per iteration and blocks in
+// tg_cp_async_wait<STAGES-1>, so in the latency-bound steady state the loop
+// rate is `latency / (STAGES-1)` per K-step: 3 stages deep gives ~200 ns per
+// K-step for a 600 ns HBM latency, which is what capped the A100 measurement
+// at ~4.4 GB/s per SM. 8 stages -> 7 deep -> ~86 ns, a ~2.3x deeper pipeline.
+// The A100 allows at most 8 outstanding cp.async commit groups, so 8 stages
+// (7 prologue groups + the one issued before each wait) is the maximum.
+constexpr int TG_B_STAGES = 8;
+// The prologue commits TG_B_STAGES-1 groups and one more is issued before each
+// wait, so TG_B_STAGES groups are outstanding at the wait. 8 is the hardware
+// maximum for cp.async commit groups.
+static_assert(TG_B_STAGES >= 2 && TG_B_STAGES <= 8,
+              "TG_B_STAGES must stay within the cp.async commit-group limit");
 
 // Per-warp B staging. File-scope __shared__ so the op bodies do not have to
 // thread another pointer through their signatures.
@@ -784,16 +796,31 @@ __device__ __forceinline__ void tg_wmma_gemm(
       // shared copy needed two CTA barriers per K step, forcing all 7 warps
       // into lockstep; with K up to 3072 that overhead was comparable to the
       // weight traffic. Redundant staging is cheap (16x16 elements).
+      //
+      // Vectorized 4-wide: one lane moves a float4 (4 K values of one row) and
+      // writes the four converted bf16 as a single 8-byte store — 2 loads + 2
+      // stores per lane instead of 8 + 8. Every address the loop touches is
+      // 16-byte aligned: H is a torch/static buffer, STRIDE_K and k are
+      // multiples of 4 floats, and ki is in {0,4,8,12}. The guard cannot cut a
+      // vector short because k + ki + 3 <= K - 1 for every ks < K/16.
       const int k = ks * TG_WMMA_TILE;
       const int lane = tg_wlane();
       #pragma unroll
-      for (int idx = lane; idx < TG_WMMA_TILE * TG_WMMA_TILE;
-           idx += TG_WARP_SIZE) {
-        int mi = idx / TG_WMMA_TILE, ki = idx % TG_WMMA_TILE;
-        float v = 0.0f;
+      for (int v = lane; v < (TG_WMMA_TILE * TG_WMMA_TILE) / 4;
+           v += TG_WARP_SIZE) {
+        const int idx = v * 4;
+        const int mi = idx / TG_WMMA_TILE;  // row 0..15
+        const int ki = idx % TG_WMMA_TILE;  // 0, 4, 8 or 12
+        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         if (active && m0 + mi < M && k + ki < K)
-          v = H[(m0 + mi) * STRIDE_K + k + ki];
-        my_a[idx] = __float2bfloat16(v);
+          f = *reinterpret_cast<const float4*>(
+              H + (m0 + mi) * STRIDE_K + k + ki);
+        const __nv_bfloat162 lo = __floats2bfloat162_rn(f.x, f.y);
+        const __nv_bfloat162 hi = __floats2bfloat162_rn(f.z, f.w);
+        uint2 packed;
+        packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+        packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+        *reinterpret_cast<uint2*>(my_a + idx) = packed;
       }
       __syncwarp();  // publish this warp's staging to its own lanes
 
