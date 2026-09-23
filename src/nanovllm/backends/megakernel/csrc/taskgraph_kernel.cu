@@ -679,7 +679,12 @@ constexpr int TG_WMMA_TILE = 16;
 // at ~4.4 GB/s per SM. 8 stages -> 7 deep -> ~86 ns, a ~2.3x deeper pipeline.
 // The A100 allows at most 8 outstanding cp.async commit groups, so 8 stages
 // (7 prologue groups + the one issued before each wait) is the maximum.
-constexpr int TG_B_STAGES = 8;
+// Env-overridable (TG_B_STAGES=<n>) so the depth can be A/B'd on hardware
+// without editing the source. build.py's default MUST equal this fallback
+// (test_taskgraph_abi.py::BuildFlagSyncTests enforces it).
+#ifndef TG_B_STAGES
+#define TG_B_STAGES 8
+#endif
 // The prologue commits TG_B_STAGES-1 groups and one more is issued before each
 // wait, so TG_B_STAGES groups are outstanding at the wait. 8 is the hardware
 // maximum for cp.async commit groups.

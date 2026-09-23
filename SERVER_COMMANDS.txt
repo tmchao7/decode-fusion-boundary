@@ -18,6 +18,7 @@ set -euo pipefail
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM/position tests + bench
+#   RUN_MODE=taskgraph-perf bash SERVER_COMMANDS.txt      # bench + ncu stall breakdown + TG_B_STAGES A/B
 #   RUN_MODE=taskgraph-sanitize bash SERVER_COMMANDS.txt  # compute-sanitizer memcheck on the task-graph kernel
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
@@ -619,6 +620,75 @@ run_taskgraph() {
     2>&1 | tee results/taskgraph_generate.log
 }
 
+run_taskgraph_perf() {
+  mkdir -p results
+  require_model
+  build_extension
+  verify_extension_import
+
+  # Step timing first: this is the headline number. docs/12 predicts
+  # 10.8 ms -> 4.7~7 ms from the deeper cp.async pipeline, the vectorized
+  # (and reordered) A staging and the 7-tile packing.
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  PYTHONPATH=src python tools/bench_taskgraph.py \
+    --batch-size 1,2,4,8 --context-len 1,128,512,2048 \
+    --json results/taskgraph_perf_bench.json \
+    2>&1 | tee results/taskgraph_perf_bench.log
+
+  # Isolate WHICH term of k_step_time dominates. One kernel launch, so this is
+  # cheap; --set full is slow but gives the full stall breakdown. If ncu is not
+  # on PATH, skip with a loud note rather than failing the run.
+  if command -v ncu >/dev/null 2>&1; then
+    set +e
+    QWEN3_MODEL_PATH="$MODEL" \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ncu --target-processes all \
+      --kernel-name-base demangled \
+      --kernel-name tg_decode_kernel \
+      --launch-count 1 \
+      --metrics \
+smsp__pcsamp_warps_issue_stalled_long_scoreboard_per_warp_active.pct,\
+smsp__pcsamp_warps_issue_stalled_barrier_per_warp_active.pct,\
+smsp__pcsamp_warps_issue_stalled_short_scoreboard_per_warp_active.pct,\
+smsp__pcsamp_warps_issue_stalled_wait_per_warp_active.pct,\
+sm__warps_active.avg.pct_of_peak_sustained_active,\
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+gpu__time_duration.sum \
+      env CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=src python -m unittest \
+        tests.test_taskgraph_smoke -v \
+      2>&1 | tee results/taskgraph_perf_ncu.log
+    echo "(ncu exit status: $?)"
+    set -e
+    echo
+    echo "===== NCU SUMMARY (paste this back) ====="
+    grep -E "tg_decode_kernel|smsp__pcsamp|sm__warps_active|l1tex__throughput|dram__throughput|sm__throughput|gpu__time_duration" \
+      results/taskgraph_perf_ncu.log | head -30
+    echo "===== END NCU SUMMARY ====="
+  else
+    echo "WARNING: ncu not found on PATH; skipping the stall breakdown."
+    echo "Install Nsight Compute or run it manually per docs/12 §3.1."
+  fi
+
+  # A/B the cp.async depth without editing any source: TG_B_STAGES is an
+  # env-overridable build flag (build.py -> -DTG_B_STAGES). If stages=8 is not
+  # faster than stages=4, the loop is not cp.async-latency bound and the
+  # remaining cost is the A staging / issue path (docs/12 §3.2).
+  echo
+  echo "===== TG_B_STAGES=4 (3-deep pipeline) for comparison ====="
+  TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$REPO/.torch_extensions}_b4" \
+  TG_B_STAGES=4 \
+  QWEN3_MODEL_PATH="$MODEL" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  PYTHONPATH=src python tools/bench_taskgraph.py \
+    --batch-size 1,4 --context-len 512 \
+    --json results/taskgraph_perf_bench_b4.json \
+    2>&1 | tee results/taskgraph_perf_bench_b4.log
+  echo "(A separate TORCH_EXTENSIONS_DIR keeps the two builds from thrashing.)"
+}
+
 run_taskgraph_sanitize() {
   mkdir -p results
   require_model
@@ -702,6 +772,10 @@ case "$RUN_MODE" in
   taskgraph)
     select_gpu
     run_taskgraph
+    ;;
+  taskgraph-perf)
+    select_gpu
+    run_taskgraph_perf
     ;;
   taskgraph-sanitize)
     select_gpu

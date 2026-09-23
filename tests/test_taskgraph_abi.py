@@ -174,6 +174,12 @@ class BuildFlagSyncTests(unittest.TestCase):
         self.assertEqual(self._kernel_default("TG_INST_RING"), 4)
         self.assertEqual(self._build_default("TG_INST_RING"), 4)
 
+    def test_tg_b_stages(self) -> None:
+        # The cp.async pipeline depth. Env-overridable so the depth can be A/B'd
+        # on hardware; 8 is the hardware maximum for outstanding commit groups.
+        self.assertEqual(self._kernel_default("TG_B_STAGES"), 8)
+        self.assertEqual(self._build_default("TG_B_STAGES"), 8)
+
     def test_tg_max_batch(self) -> None:
         self.assertEqual(self._kernel_default("TG_MAX_BATCH"), 8)
         # TG_MAX_BATCH is hardcoded in build.py (not env-overridable), matching
