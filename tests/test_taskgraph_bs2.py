@@ -80,11 +80,14 @@ class TaskGraphBS2Tests(unittest.TestCase):
         cls.embed_weight = cls.weights["embed_weight"]
         cls.final_norm_weight = cls.weights["final_norm_weight"]
 
-        # Build schedule for BS=2
+        # Build schedules for BS=1 and BS=2
         cls.geo = tg_schedule.default_geometry(BS=2, attn_splits=1)
         cls.sched = tg_schedule.build_schedule(cls.geo, num_sms=1)
+        cls.geo1 = tg_schedule.default_geometry(BS=1, attn_splits=1)
+        cls.sched1 = tg_schedule.build_schedule(cls.geo1, num_sms=1)
 
-    def _alloc_scratch(self, BS=2):
+    def _alloc_scratch(self, BS=2, sched=None):
+        sched = sched or self.sched
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
         i32 = dict(dtype=torch.int32, device="cuda")
@@ -92,8 +95,8 @@ class TaskGraphBS2Tests(unittest.TestCase):
 
         WMMA_PAD = 16
         s = {}
-        s["inst_buf"] = torch.tensor(self.sched.flat_inst_buf, dtype=torch.int32).cuda()
-        s["num_inst_per_sm"] = torch.tensor(self.sched.num_inst_per_sm, dtype=torch.int32).cuda()
+        s["inst_buf"] = torch.tensor(sched.flat_inst_buf, dtype=torch.uint32).cuda().view(torch.int32)
+        s["num_inst_per_sm"] = torch.tensor(sched.num_inst_per_sm, dtype=torch.int32).cuda()
 
         s["norm_out"] = torch.empty(BS, HIDDEN_SIZE, **f32)
         s["q_out"] = torch.empty(WMMA_PAD, Q_SIZE, **f32)
@@ -112,7 +115,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
         s["o_partial"] = torch.empty(BS, NUM_KV_HEADS, 1, HIDDEN_SIZE, **f32)
         s["lse_partial"] = torch.empty(BS, NUM_KV_HEADS, 1, **f32)
 
-        d = self.sched.bar_dims
+        d = sched.bar_dims
         s["bar_qkv"] = torch.zeros(d.bar_qkv, **u32)
         s["bar_attn"] = torch.zeros(d.bar_attn, **u32)
         s["bar_oproj"] = torch.zeros(d.bar_oproj, **u32)
@@ -138,7 +141,8 @@ class TaskGraphBS2Tests(unittest.TestCase):
     def _run(self, token_ids, row_active=None):
         """Run one decode step for ``token_ids`` and return the sampled tokens."""
         BS = len(token_ids)
-        s = self._alloc_scratch(BS)
+        sched = self.sched1 if BS == 1 else self.sched
+        s = self._alloc_scratch(BS, sched=sched)
         for b, tid in enumerate(token_ids):
             s["x_resid"][b] = self.embed_weight[tid]
             s["cache_seqlens"][b] = 0  # first token, no previous KV
@@ -147,7 +151,7 @@ class TaskGraphBS2Tests(unittest.TestCase):
 
         _tg_ops.tg_decode_step(
             s["inst_buf"], s["num_inst_per_sm"],
-            self.sched.max_inst, 1,
+            sched.max_inst, 1,
             self.layer_weights_packed, self.embed_weight,
             self.final_norm_weight, self.cos_table, self.sin_table,
             self.k_cache, self.v_cache, s["page_table"],

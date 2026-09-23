@@ -117,8 +117,8 @@ def pytorch_causal_reference(layer_weights, embed_weight, final_norm_weight,
         # x: [T, H, D]. Tables use the .repeat(1,2) trick so both halves share
         # the same angle vector; partner of i is i +/- D/2.
         T = x.shape[0]
-        c = cos_table[:T].to(f32)
-        s = sin_table[:T].to(f32)
+        c = cos_table[:T].to(f32).unsqueeze(1)   # [T, 1, D]
+        s = sin_table[:T].to(f32).unsqueeze(1)
         half = HEAD_DIM // 2
         x1, x2 = x[..., :half], x[..., half:]
         c1, s1 = c[..., :half], s[..., :half]
@@ -221,7 +221,7 @@ class TaskGraphPositionTests(unittest.TestCase):
 
         WMMA_PAD = 16
         s = {}
-        s["inst_buf"] = torch.tensor(sched.flat_inst_buf, dtype=torch.int32).cuda()
+        s["inst_buf"] = torch.tensor(sched.flat_inst_buf, dtype=torch.uint32).cuda().view(torch.int32)
         s["num_inst_per_sm"] = torch.tensor(sched.num_inst_per_sm, dtype=torch.int32).cuda()
 
         s["norm_out"] = torch.empty(BS, HIDDEN_SIZE, **f32)

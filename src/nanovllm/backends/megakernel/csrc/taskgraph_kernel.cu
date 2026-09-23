@@ -1110,8 +1110,13 @@ __device__ __forceinline__ void tg_attn_decode_op(
     }
   }
 
-  // Sync: ensure KV cache write (warp 0) and Q-norm (all warps) are done
+  // Sync: ensure KV cache write (warp 0) and Q-norm (all warps) are done.
+  // CRITICAL: bar.sync 1 only orders shared memory. Warp 0's global KV cache
+  // stores need fence.acq_rel.gpu to be visible to other warps after the
+  // barrier. Without this, the attention reads stale KV data non-deterministically.
+  tg_fence_gpu();
   tg_worker_sync_inner();
+  tg_fence_gpu();
 
   // --- Phase D: Scalar flash attention ---
   // Each Q head is processed by all worker warps (striding over positions).
@@ -1443,6 +1448,14 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
       g.BS, n_total, g.hidden,
       wwarp, TG_WORKER_WARPS, s_a);
 
+  // CRITICAL: synchronize between GEMMs and SiLU. The gate/up GEMMs write
+  // to g.silu_out and g.up_out (global memory) with different warps handling
+  // different tiles. Without this fence+barrier, a fast warp could reach the
+  // SiLU phase and read a tile written by a slow warp that hasn't finished
+  // its wmma::store_matrix_sync yet — a classic cross-warp global memory race.
+  tg_fence_gpu();
+  tg_worker_sync_inner();
+
   // Phase 3: SiLU(gate) * up (elementwise) — ONLY for this instruction's tiles.
   // Each instruction packs up to 6 tiles; each tile covers 16 columns of the
   // intermediate dimension. We must NOT process all 3072 positions, only the
@@ -1597,6 +1610,8 @@ __device__ __forceinline__ void tg_lm_argmax_op(
     const int* inst, TgGlobals& g, int bid,
     float* s_argmax_val, int* s_argmax_idx) {
   tg_wait(g.bar_lm_head, inst[6], (uint32_t)inst[7]);
+  tg_fence_gpu();
+  tg_worker_sync_inner();
 
   int wtid = tg_wtid();
   int wwarp = tg_wwarp();

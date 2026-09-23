@@ -887,7 +887,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def(
       "tg_zero_regions(Tensor regions_packed, int num_regions) -> ()");
+  // The binding internally copies to CPU and then to a cached device buffer,
+  // so it accepts both CPU and CUDA input tensors.
   ops.impl("tg_zero_regions", torch::kCUDA, &tg_zero_regions_binding);
+  ops.impl("tg_zero_regions", torch::kCPU, &tg_zero_regions_binding);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

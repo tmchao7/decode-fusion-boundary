@@ -111,7 +111,7 @@ class TaskGraphSmokeTests(unittest.TestCase):
 
         s = {}
         # Instruction stream
-        s["inst_buf"] = torch.tensor(self.sched.flat_inst_buf, dtype=torch.int32).cuda()
+        s["inst_buf"] = torch.tensor(self.sched.flat_inst_buf, dtype=torch.uint32).cuda().view(torch.int32)
         s["num_inst_per_sm"] = torch.tensor(self.sched.num_inst_per_sm, dtype=torch.int32).cuda()
 
         # Scratch (float intermediates matching kernel.cu)
@@ -329,8 +329,10 @@ class TaskGraphSmokeTests(unittest.TestCase):
         """
         BS = 1
         s = self._alloc_scratch(BS)
+        # x_resid is an input (carries the residual from the previous step),
+        # not scratch — it must not be zeroed by tg_zero_regions.
         skip = {"inst_buf", "num_inst_per_sm", "page_table",
-                "cache_seqlens", "row_active"}
+                "cache_seqlens", "row_active", "x_resid"}
         for k, v in s.items():
             if k in skip:
                 continue
@@ -343,7 +345,9 @@ class TaskGraphSmokeTests(unittest.TestCase):
         for k, v in s.items():
             if k in skip:
                 continue
-            self.assertEqual(int(v.max().item()), 0,
+            # uint32 has no max() kernel in PyTorch — view as int32.
+            check = v.view(torch.int32) if v.dtype == torch.uint32 else v
+            self.assertEqual(int(check.max().item()), 0,
                              f"{k} was not fully zeroed by tg_zero_regions")
 
 
