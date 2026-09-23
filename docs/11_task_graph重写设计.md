@@ -714,17 +714,18 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 | `tg_abi.h` 指令/bar/desc 布局 | ✅ | `test_taskgraph_abi.py` 解析头文件与 `schedule.py` 对齐（37 项） |
 | `schedule.py` 调度构建（QKV/ATTN/O/FFN/ADD_RMSNORM/LM_HEAD/LM_ARGMAX） | ✅ | ABI 测试 + 到达计数 + tile 连续性 |
 | 调度**无死锁**（任意 num_sms） | ✅ | CPU 执行模拟器（BS∈{1,2,4,8} × num_sms∈{1,4,8,108}）；灵敏度已验证 |
-| cross-SM `tg_wait/tg_arrive` | ✅ 编译 | nvcc 12.4 sm_80；语义待真机 |
-| LM_HEAD → `TG_LM_ARGMAX` 跨 SM argmax | ✅ | 逻辑推导 + 单/多 SM 测试（待真机） |
+| cross-SM `tg_wait/tg_arrive` | ✅ | nvcc 12.4 sm_80；A100 真机验证 |
+| LM_HEAD → `TG_LM_ARGMAX` 跨 SM argmax | ✅ | 逻辑推导 + 单/多 SM 测试 + A100 真机 |
 | cp.async 权重流水（4 stage/warp） | ✅ 编译 + group 计数静态验证 | nvcc；group 计数与 buffer 复用对 S=2..5、K/16∈1..192 验证 |
-| per-warp A staging（GEMM K loop 无 CTA barrier） | ✅ 编译 | nvcc（120 regs / 0 spill / 21.9KB static smem） |
+| per-warp A staging（GEMM K loop 无 CTA barrier） | ✅ 编译 | nvcc（110 regs / 0 spill / 21.9KB static smem） |
 | GEMM fan-out（QKV/O/FFN/LM 一次 GEMM，N=num_tiles*16） | ✅ | 指令数 10516→4916；到达计数不变 |
 | `x_attn` 单发布者 + 就地 RMSNorm | ✅ | ABI 测试锁定"每层一个发布者" |
 | `tg_zero_regions` | ✅ | 回归测试 + 静态检查 |
 | bar 自旋超时 trap | ✅ 编译 | nvcc |
 | cooperative launch 失败抛异常 | ✅ | 代码路径 |
-| `row_active`：inactive 行不写 KV cache | ✅ 编译 | nvcc；BS=2 测试（inactive 行的页保持哨兵值、active 行不受影响） |
-| 多 position / 跨 KV block / 自回归 greedy | ✅ 测试已写 | 待真机（对拍 causal PyTorch 参考） |
+| `row_active`：inactive 行不写 KV cache | ✅ | A100 真机 BS=2 测试（inactive 行的页保持哨兵值、active 行不受影响） |
+| 多 position / 跨 KV block / 自回归 greedy | ✅ | A100 真机对拍 causal PyTorch 参考；`generate_taskgraph` 文本连贯 |
+| 跨 warp global memory fence（确定性） | ✅ | A100 真机 30/30 次确定性；3 处 race 已修复 |
 
 ### 10.2 与设计稿的偏差
 
@@ -754,9 +755,79 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
   其余计算照跑、bar 照到达）；但缺 `runtime.cu`/scheduler/session，`backend.py` 未接 taskgraph。
 - sampling：只有 greedy argmax，无 temperature/top-p。
 
-### 10.4 服务器实测待填
+### 10.4 服务器实测结果（2026-09-23，A100-SXM4-80GB）
 
-- 多 SM token 是否匹配参考（`test_taskgraph_multi_sm` / `positions` multi_sm）
-- `bench_taskgraph` 的 ms/step 与有效权重 GB/s（目标：接近 A100 HBM 峰值 ~1.5TB/s）
-- `RUN_MODE=taskgraph-sanitize` 的 memcheck 是否干净
-- `generate_taskgraph` 输出文本是否连贯
+#### 硬件 / 环境
+
+- GPU: A100-SXM4-80GB (sm_80, 108 SM)
+- 模型: Qwen3-0.6B (28 层, hidden=1024, intermediate=3072, vocab=151936)
+- CUDA 12.8, PyTorch nightly (cu128), Python 3.12
+- `attn_splits=1`, `oproj_splits=1`, `down_splits=1`, `num_sms=108`（全 SM）
+
+#### 确定性验证
+
+发现并修复了 **3 处跨 warp global memory race**——根因相同：`bar.sync` 只保证
+shared memory 可见性，global store 需要 `fence.acq_rel.gpu` 才能跨 warp 可见。
+
+| 位置 | race 描述 | 修复 |
+|---|---|---|
+| `tg_ffn_upgate_op` | gate/up GEMM → SiLU 读 `g.silu_out`/`g.up_out`，不同 warp 负责不同 tile，无 fence | GEMM 后加 `tg_fence_gpu()` + `tg_worker_sync_inner()` |
+| `tg_attn_decode_op` | warp 0 写 KV cache → flash attention 读，`bar.sync` 不保证 global 可见 | 写后 `tg_fence_gpu()` + sync + `tg_fence_gpu()` |
+| `tg_lm_argmax_op` | LM_HEAD GEMM 写 `lm_logits` → argmax 扫 vocab，跨 tile 不可见 | `tg_wait` 后加 `tg_fence_gpu()` + sync |
+
+修复后 **30/30 次运行全确定性**（token=14582），修复前约 60-70% 正确。
+
+#### 测试结果
+
+| 测试套件 | 结果 |
+|---|---|
+| `test_taskgraph_smoke.py` | ✅ 3 passed |
+| `test_taskgraph_abi.py` (attn_splits=1) | ✅ 37 passed, 5011 subtests |
+| `test_taskgraph_positions.py` (attn_splits=1) | ✅ 3 passed (max logit diff 0.21) |
+| `test_taskgraph_positions.py` (attn_splits=2) | ❌ schedule deadlock（预存问题，非确定性修复引入） |
+| `test_taskgraph_bs2.py` | ✅ 4 passed (BS=2 与独立 BS=1 结果一致) |
+| `test_taskgraph_multi_sm.py` | ✅ passed |
+| `compute-sanitizer --tool memcheck` | ✅ 无内核内存错误 |
+| `compute-sanitizer --tool racecheck` | ✅ 无 shared memory race |
+
+#### 端到端文本生成
+
+```
+prompt: The capital of France is
+output: The capital of France is Paris. The capital of Italy is Rome.
+        The capital of Spain is Madrid. The capital of Portugal is Lisbon.
+        The capital of Germany is Berlin.
+
+prompt: Hello, how are you? I am
+output: Hello, how are you? I am a student, and I am studying for the final exam.
+        I am also a member of the school's club.
+```
+
+1 SM 和 4 SM 均输出相同文本，multi-SM 端到端正确。
+
+#### 性能（ms/step 与有效权重带宽）
+
+| BS | ctx=1 | ctx=128 | ctx=512 | ctx=2048 |
+|---|---|---|---|---|
+| 1 | 10.8 ms (111 GB/s) | 11.5 ms (104 GB/s) | 15.9 ms (76 GB/s) | 25.8 ms (47 GB/s) |
+| 2 | 11.1 ms (108 GB/s) | 11.9 ms (101 GB/s) | 15.4 ms (78 GB/s) | 26.1 ms (46 GB/s) |
+| 4 | 12.5 ms (96 GB/s) | 13.4 ms (90 GB/s) | 16.5 ms (73 GB/s) | 32.4 ms (37 GB/s) |
+| 8 | 13.6 ms (88 GB/s) | 14.4 ms (83 GB/s) | 17.5 ms (69 GB/s) | 33.6 ms (36 GB/s) |
+
+- 权重总量 ~1.2 GB（0.6B params × 2 bytes），每步全读一遍
+- A100 HBM 峰值 ~1.5 TB/s；当前 ctx=1 达到 ~111 GB/s（~7% 峰值）
+- 1 SM: 275 ms/step (4 GB/s)——单 SM 串行，确认是 weight-bandwidth bound
+- BS 1→8 增量很小（10.8→13.6 ms），说明 decode 几乎不受 batch 影响（权重只读一次）
+- ctx 增长时 attention 成本上升（scalar flash attention，未向量化）
+
+#### kernel 资源使用
+
+- 110 regs / 0 spill / 64B stack / 21920B static shared + 64KB dynamic shared
+- 7 worker warps (224 threads) + 1 controller warp = 256 threads/CTA
+
+#### 已知问题
+
+- `attn_splits=2` schedule deadlock：ABI 模拟器显示 184/10264 指令可执行，
+  调度器逻辑问题，与确定性修复无关
+- 性能远未优化：当前用 `__syncthreads` dispatch（~2µs/SM 开销），ring buffer
+  仍是死代码；scalar attention 未向量化；权重带宽利用率低
