@@ -721,7 +721,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 | GEMM fan-out（QKV/O/FFN/LM 一次 GEMM，N=num_tiles*16） | ✅ | 指令数 10516→4916→4522（cap 7）；到达计数不变 |
 | tile 打包区间语义（inst[9]=num_tiles, inst[10]=tile_n0） | ✅ | ABI 测试锁定 inst[11..15] 未用；`_TILE_SLOTS_PER_INST=7` 饱和 7 个 worker warp |
 | bar 记账与打包粒度无关 | ✅ | num_sms=1/4/108 的 814 个 bar 槽位计数逐位相同 |
-| 性能诊断与优化计划 | 📄 | 见 `docs/12_性能诊断与优化计划.md`（Amdahl 拟合、波次模型、ncu 决策点、split-K） |
+| 性能诊断与优化计划 | 📄 | 见 `docs/12_性能诊断与优化计划.md`（Amdahl 拟合、波次模型、nsys 决策点、split-K） |
 | `x_attn` 单发布者 + 就地 RMSNorm | ✅ | ABI 测试锁定"每层一个发布者" |
 | `tg_zero_regions` | ✅ | 回归测试 + 静态检查 |
 | bar 自旋超时 trap | ✅ 编译 | nvcc |

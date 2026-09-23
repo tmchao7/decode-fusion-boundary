@@ -18,7 +18,7 @@ set -euo pipefail
 #   RUN_MODE=profile bash SERVER_COMMANDS.txt        # short Nsight Systems/Compute run
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM/position tests + bench
-#   RUN_MODE=taskgraph-perf bash SERVER_COMMANDS.txt      # bench + ncu stall breakdown + TG_B_STAGES A/B
+#   RUN_MODE=taskgraph-perf bash SERVER_COMMANDS.txt      # bench + nsys timeline + TG_B_STAGES A/B
 #   RUN_MODE=taskgraph-sanitize bash SERVER_COMMANDS.txt  # compute-sanitizer memcheck on the task-graph kernel
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
@@ -636,40 +636,34 @@ run_taskgraph_perf() {
     --json results/taskgraph_perf_bench.json \
     2>&1 | tee results/taskgraph_perf_bench.log
 
-  # Isolate WHICH term of k_step_time dominates. One kernel launch, so this is
-  # cheap; --set full is slow but gives the full stall breakdown. If ncu is not
-  # on PATH, skip with a loud note rather than failing the run.
-  if command -v ncu >/dev/null 2>&1; then
+  # Kernel timeline + SM occupancy. MUST use nsys, NOT ncu: tg_decode_kernel is
+  # launched with cudaLaunchCooperativeKernel, and ncu's kernel replay conflicts
+  # with cooperative launch — it hangs the GPU (even nvidia-smi blocks). See
+  # docs/05 §6 and docs/13 §7. nsys does not replay, so it is safe here.
+  if command -v nsys >/dev/null 2>&1; then
     set +e
     QWEN3_MODEL_PATH="$MODEL" \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    ncu --target-processes all \
-      --kernel-name-base demangled \
-      --kernel-name tg_decode_kernel \
-      --launch-count 1 \
-      --metrics \
-smsp__pcsamp_warps_issue_stalled_long_scoreboard_per_warp_active.pct,\
-smsp__pcsamp_warps_issue_stalled_barrier_per_warp_active.pct,\
-smsp__pcsamp_warps_issue_stalled_short_scoreboard_per_warp_active.pct,\
-smsp__pcsamp_warps_issue_stalled_wait_per_warp_active.pct,\
-sm__warps_active.avg.pct_of_peak_sustained_active,\
-l1tex__throughput.avg.pct_of_peak_sustained_elapsed,\
-dram__throughput.avg.pct_of_peak_sustained_elapsed,\
-sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-gpu__time_duration.sum \
+    nsys profile \
+      --trace=cuda,nvtx \
+      --force-overwrite=true \
+      --output=results/taskgraph_perf_nsys \
       env CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=src python -m unittest \
         tests.test_taskgraph_smoke -v \
-      2>&1 | tee results/taskgraph_perf_ncu.log
-    echo "(ncu exit status: $?)"
+      2>&1 | tee results/taskgraph_perf_nsys.log
+    echo "(nsys exit status: $?)"
     set -e
     echo
-    echo "===== NCU SUMMARY (paste this back) ====="
-    grep -E "tg_decode_kernel|smsp__pcsamp|sm__warps_active|l1tex__throughput|dram__throughput|sm__throughput|gpu__time_duration" \
-      results/taskgraph_perf_ncu.log | head -30
-    echo "===== END NCU SUMMARY ====="
+    echo "===== NSYS STATS (paste this back) ====="
+    nsys stats --report cuda_gpu_kern_sum --format table \
+      results/taskgraph_perf_nsys.nsys-rep 2>&1 | tee results/taskgraph_perf_nsys_stats.log
+    echo "===== END NSYS STATS ====="
+    echo
+    echo "For SM occupancy, open results/taskgraph_perf_nsys.nsys-rep in the GUI"
+    echo "and read the tg_decode_kernel row (grid/block, achieved occupancy)."
   else
-    echo "WARNING: ncu not found on PATH; skipping the stall breakdown."
-    echo "Install Nsight Compute or run it manually per docs/12 §3.1."
+    echo "WARNING: nsys not found on PATH; skipping the kernel timeline."
+    echo "Do NOT substitute ncu here — it hangs cooperative kernels (docs/13 §7)."
   fi
 
   # A/B the cp.async depth without editing any source: TG_B_STAGES is an
