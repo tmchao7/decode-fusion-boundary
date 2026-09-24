@@ -56,8 +56,8 @@ scripts and is also what `tools/verify_server_env` checks.
 
 Every command intended for the remote GPU machine lives in the single checked-in
 `SERVER_COMMANDS.txt`; select a phase with `RUN_MODE`
-(`model`, `verify`, `build`, `correctness`, `benchmark`, `nosync`, `account`,
-`roofline`, `profile`, `sanitize`, `all`). Please update that file instead of
+(`model`, `verify`, `build`, `correctness`, `benchmark`, `taskgraph`,
+`taskgraph-baseline`, `all`). Please update that file instead of
 adding another `*_COMMANDS.txt` — `tests/test_server_commands.py` also validates
 that every flag it passes exists on the target module.
 
@@ -68,13 +68,11 @@ the one with the most free memory), `PYPI_INDEX_URL` for restricted networks.
 
 ## Correctness policy (please read before gating anything)
 
-**Do not gate on token equality with torch-eager.** The batched WMMA kernel and
-the scalar megakernel are not bit-identical to torch's fused bf16 kernels: a
-~1–2 ULP reduction-order difference at some layer cascades into an occasional
-token flip at greedy decoding. That is expected, not a bug.
+**Do not gate on full-sequence token equality with torch-eager.** The task-graph
+kernel and torch's fused BF16 kernels can differ in reduction order; a small
+cascade at greedy decode is expected.
 
-Use the three-way gate in `tools/correctness_wmma_vs_scalar.py` (and the same
-classification in `tools/correctness_smoke.py`):
+Use the three-way gate in `tools/correctness_smoke.py`:
 
 - **PASS** — identical.
 - **CASCADE** — divergence only at a decode token (index >= 1) with matching
@@ -98,13 +96,6 @@ against torch-eager.
 - **KV cache length contract**: nano-VLLM stores the current K/V and attends over
   `[0, position]` inclusive, so keep `cache_len = position + 1` in both the paged
   and contiguous paths.
-- **Burst scheduling**: the device-side burst runs one `max_steps` for the whole
-  batch, so `max_steps` must be the *minimum* per-sequence budget with every
-  selected sequence pre-reserved for it. `tools/correctness_burst_mixed.py` fails
-  unless it observes a genuinely mixed-budget burst — a `max_tokens=1` row cannot
-  be used as the "short" side, because prefill consumes that token and the
-  sequence never reaches the burst.
-
 ## Commits
 
 Concise, imperative, lowercase subjects with a scope, e.g.

@@ -125,7 +125,7 @@ Task-graph (108 SM, 50 步):
    - `__syncthreads` dispatch (~2µs/SM 开销)，ring buffer 仍是死代码
    - scalar attention 未向量化
    - 权重带宽利用率低 (111 GB/s vs A100 HBM 峰值 1.5 TB/s)
-3. ~~**Task-graph 未集成引擎**~~ **已完成**（本轮）：`decode_backend="megakernel-tg"`
+3. ~~**Task-graph 未集成引擎**~~ **已完成**（本轮）：`decode_backend="megakernel"`
    走 `backends/megakernel/taskgraph.py`，`benchmarks/compare.py` 的
    `BACKEND_CONFIGS` 已加该 backend 并成为默认 `--backends`。
 
@@ -145,7 +145,7 @@ Task-graph (108 SM, 50 步):
 
 | Commit | 描述 |
 |---|---|
-| (本轮) | feat(taskgraph): 阶段 0 集成——`megakernel-tg` backend + compare.py 主表 + taskgraph-baseline 模式 |
+| (本轮) | feat(taskgraph): 阶段 0 集成——`megakernel` backend + compare.py 主表 + taskgraph-baseline 模式 |
 | `ef4e1ab` | docs: integration + baseline plan; fix the ncu-on-cooperative-kernel hazard |
 | `b46d23f` | build: make TG_B_STAGES env-overridable, add taskgraph-perf mode |
 | `1a7539b` | docs: fill §10.4 with A100 real-hardware results |
