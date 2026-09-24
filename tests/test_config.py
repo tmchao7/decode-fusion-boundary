@@ -6,30 +6,27 @@ from nanovllm.sampling_params import SamplingParams
 
 class ConfigTests(unittest.TestCase):
     def test_supported_decode_backends_are_explicit(self):
-        # ``megakernel-tg`` is the task-graph rewrite (docs/11-13); it shares the
-        # greedy/decode-only contract with ``megakernel`` but has its own
-        # whole-batch kernel and its own admission policy.
-        self.assertEqual(
-            VALID_DECODE_BACKENDS, {"torch", "megakernel", "megakernel-tg"}
-        )
+        # The public mainline exposes one Megakernel: the task-graph backend.
+        self.assertEqual(VALID_DECODE_BACKENDS, {"torch", "megakernel"})
         self.assertEqual(validate_decode_backend("torch"), "torch")
         self.assertEqual(validate_decode_backend("megakernel"), "megakernel")
-        self.assertEqual(validate_decode_backend("megakernel-tg"), "megakernel-tg")
+        with self.assertRaisesRegex(ValueError, "decode_backend"):
+            validate_decode_backend("megakernel-tg")
 
     def test_unknown_decode_backend_has_actionable_error(self):
         with self.assertRaisesRegex(ValueError, "decode_backend"):
             validate_decode_backend("cuda_graph")
 
     def test_taskgraph_attn_splits_must_be_positive(self):
-        """``megakernel_tg_attn_splits`` is baked into the schedule; 0 would
+        """``megakernel_attn_splits`` is baked into the schedule; 0 would
         emit an attention wave with no instructions and deadlock on bar_attn."""
 
         from nanovllm.config import Config
 
         # __post_init__ runs before the model directory / transformers checks,
         # so a fake model path is enough to reach the validation.
-        with self.assertRaisesRegex(ValueError, "megakernel_tg_attn_splits"):
-            Config(model="/nonexistent", megakernel_tg_attn_splits=0)
+        with self.assertRaisesRegex(ValueError, "megakernel_attn_splits"):
+            Config(model="/nonexistent", megakernel_attn_splits=0)
 
 
 class SamplingParamsTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Task-graph decode backend plumbing (``decode_backend="megakernel-tg"``).
+"""Task-graph decode backend plumbing (``decode_backend="megakernel"``).
 
 Everything here is CUDA-free: the task-graph *policy* (admission, batch ceiling)
 and the *plumbing* that decides which decoder an engine builds. The kernel
@@ -51,7 +51,7 @@ def make_hf_config(**overrides):
 
 def make_config(**overrides):
     values = dict(
-        decode_backend="megakernel-tg",
+        decode_backend="megakernel",
         tensor_parallel_size=1,
         max_num_seqs=8,
         max_model_len=2048,
@@ -141,23 +141,13 @@ class TaskGraphPolicyTests(unittest.TestCase):
 class BackendDispatchTests(unittest.TestCase):
     """``MegakernelBackend.compatibility`` must route on decode_backend."""
 
-    def test_megakernel_tg_uses_the_taskgraph_policy(self):
+    def test_megakernel_uses_the_taskgraph_policy(self):
         config = make_config(max_num_seqs=64)
         decision = MegakernelBackend.compatibility(
             config, [greedy_seq()] * (TG_MAX_BATCH + 1), is_prefill=False
         )
         self.assertFalse(decision.supported)
         self.assertIn("Task-graph", decision.reason)
-
-    def test_frozen_megakernel_still_rejects_batch_by_default(self):
-        """The task-graph policy must not leak into the frozen path."""
-
-        config = make_config(decode_backend="megakernel", max_num_seqs=8)
-        decision = MegakernelBackend.compatibility(
-            config, [greedy_seq()] * 2, is_prefill=False
-        )
-        self.assertFalse(decision.supported)
-        self.assertIn("megakernel_batch_decode", decision.reason)
 
     def test_taskgraph_checks_the_qwen_shape_contract(self):
         config = make_config(hf_config=make_hf_config(vocab_size=32000))
@@ -175,10 +165,9 @@ class BackendDispatchTests(unittest.TestCase):
 
 
 class DecoderConstructionTests(unittest.TestCase):
-    """The task-graph decoder must not be built on the frozen path and the
-    engine gates must recognise the new backend string everywhere."""
+    """The task-graph decoder is the only mainline Megakernel implementation."""
 
-    def test_config_validates_the_new_backend(self):
+    def test_config_validates_the_taskgraph_backend_name(self):
         source = (REPO_ROOT / "src" / "nanovllm" / "config.py").read_text(
             encoding="utf-8"
         )
@@ -186,7 +175,7 @@ class DecoderConstructionTests(unittest.TestCase):
         self.assertIsNotNone(match)
         assert match is not None
         values = {item.strip().strip('"\'') for item in match.group(1).split(",")}
-        self.assertIn("megakernel-tg", values)
+        self.assertEqual(values, {"torch", "megakernel"})
 
     def test_engine_gates_use_is_megakernel_backend(self):
         """``model_runner`` has two gates keyed on the backend string (graph
@@ -197,9 +186,7 @@ class DecoderConstructionTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("is_megakernel_backend(config.decode_backend)", source)
-        # The burst gate is a different question (only the frozen path bursts),
-        # so it goes through its own predicate rather than an inline compare.
-        self.assertIn("supports_no_sync_burst(self.config.decode_backend)", source)
+        self.assertNotIn("supports_no_sync_burst", source)
         self.assertNotIn('config.decode_backend != "megakernel"', source)
         self.assertNotIn('config.decode_backend == "megakernel"', source)
 
@@ -207,47 +194,10 @@ class DecoderConstructionTests(unittest.TestCase):
         source = (
             REPO_ROOT / "src" / "nanovllm" / "backends" / "megakernel" / "backend.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('== "megakernel-tg"', source)
+        self.assertNotIn('== "megakernel-tg"', source)
+        self.assertIn('decode_backend == "megakernel"', source)
         self.assertIn("TaskGraphDecoder", source)
 
-    def test_burst_is_refused_on_the_taskgraph_path(self):
-        backend = MegakernelBackend(make_config(), model=None)
-        with self.assertRaisesRegex(NotImplementedError, "no no-sync burst"):
-            backend.generate_paged_batch([], None, max_steps=4, eos_token=-1)
-
-    def test_run_burst_short_circuits_before_poisoning_cuda(self):
-        """``run_burst`` wraps the call in try/except and treats any exception
-        after ``decoder`` exists as a mid-kernel fault (poisons CUDA, raises).
-        The task-graph path must return the pre-kernel sentinel instead."""
-
-        source = (
-            REPO_ROOT / "src" / "nanovllm" / "engine" / "model_runner.py"
-        ).read_text(encoding="utf-8")
-        body = source[source.index("def run_burst("):source.index("def capture_cudagraph")]
-        guard = body.index("supports_no_sync_burst(")
-        eos = body.index("burst_eos_token(self.config, seqs)")
-        self.assertLess(guard, eos, "the guard must run before any burst work")
-        self.assertIn("return None", body[guard:eos])
-
-    def test_should_burst_stays_false_for_the_taskgraph_path(self):
-        """Otherwise every step would try the burst path and fall back, adding a
-        wasted schedule_burst() call per decode step."""
-
-        source = (
-            REPO_ROOT / "src" / "nanovllm" / "engine" / "llm_engine.py"
-        ).read_text(encoding="utf-8")
-        body = source[source.index("def _should_burst("):source.index("def _burst_batch_limit")]
-        self.assertIn("supports_no_sync_burst(", body)
-
-    def test_burst_policy_refuses_the_taskgraph_backend(self):
-        from nanovllm.engine.burst_policy import burst_batch_eligibility
-
-        config = make_config(megakernel_burst=True)
-        eligible, reason = burst_batch_eligibility(
-            config, [SimpleNamespace(is_greedy=True, ignore_eos=True)]
-        )
-        self.assertFalse(eligible)
-        self.assertIn("not megakernel", reason)
 
 
 class GeometryHelperTests(unittest.TestCase):
@@ -338,19 +288,18 @@ class CompareBackendPlumbingTests(unittest.TestCase):
                         return ast.literal_eval(node.value)
         raise AssertionError(f"{name} not found in compare.py")
 
-    def test_backend_configs_include_megakernel_tg(self):
+    def test_backend_configs_include_the_single_mainline_megakernel(self):
         configs = self._dict_value("BACKEND_CONFIGS")
-        self.assertIn("megakernel-tg", configs)
-        entry = configs["megakernel-tg"]
-        self.assertEqual(entry["decode_backend"], "megakernel-tg")
-        self.assertFalse(entry["megakernel_burst"])
+        self.assertEqual(set(configs), {"torch-eager", "torch-cudagraph", "megakernel"})
+        entry = configs["megakernel"]
+        self.assertEqual(entry["decode_backend"], "megakernel")
         # run_case() passes max_model_len=2048 to LLM() itself; a copy here would
         # be a duplicate keyword argument at engine construction.
         self.assertNotIn("max_model_len", entry)
 
-    def test_megakernel_family_covers_the_new_backend(self):
+    def test_megakernel_family_contains_only_the_mainline_backend(self):
         family = self._dict_value("MEGAKERNEL_FAMILY")
-        self.assertIn("megakernel-tg", family)
+        self.assertEqual(family, ("megakernel",))
 
     def test_default_backends_are_the_docs_13_main_table(self):
         for node in ast.walk(self.tree):
@@ -372,14 +321,14 @@ class CompareBackendPlumbingTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     ast.literal_eval(default),
-                    "torch-eager,torch-cudagraph,megakernel-tg",
+                    "torch-eager,torch-cudagraph,megakernel",
                 )
                 return
         self.fail("compare.py has no --backends argument")
 
     def test_batch_ceiling_matches_the_compile_time_constant(self):
         self.assertEqual(
-            self._dict_value("MEGAKERNEL_TG_MAX_BATCH"), TG_MAX_BATCH
+            self._dict_value("MEGAKERNEL_MAX_BATCH"), TG_MAX_BATCH
         )
 
     def test_grid_mode_exists_for_the_batch_by_context_table(self):
