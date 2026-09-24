@@ -321,14 +321,13 @@ class ModelRunner:
                 try:
                     with nvtx_range("megakernel_decode"):
                         if len(seqs) == 1:
-                            # Single-seq decode reads seq.last_token/len(seq)
-                            # itself; only the block table (device tensor) is
-                            # required, so skip the full prepare_decode() which
-                            # would otherwise build unused CUDA tensors each step.
-                            block_tables = self.prepare_block_tables(seqs)
-                            set_context(False, block_tables=block_tables)
+                            # TaskGraphDecoder owns a persistent one-row GPU
+                            # table. Pass the scheduler's host table directly;
+                            # avoid creating a temporary [1, pages] CUDA tensor
+                            # on every batch=1 step.
+                            set_context(False)
                             token_ids = self.megakernel.decode(
-                                seqs[0], block_tables[0]
+                                seqs[0], seqs[0].block_table
                             )
                         else:
                             input_ids, positions = self.prepare_decode(seqs)

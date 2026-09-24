@@ -31,6 +31,12 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        # Runtime observability. Prefix-cache counters are block counts, not
+        # request counts: one request can reuse several complete blocks.
+        self.prefix_cache_hits = 0
+        self.prefix_cache_misses = 0
+        self.freed_blocks = 0
+        self.peak_used_blocks = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -48,12 +54,14 @@ class BlockManager:
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
+        self.peak_used_blocks = max(self.peak_used_blocks, len(self.used_block_ids))
         return block_id
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        self.freed_blocks += 1
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
@@ -74,6 +82,8 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
+        self.prefix_cache_hits += num_cached_blocks
+        self.prefix_cache_misses += max(0, seq.num_blocks - num_cached_blocks)
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -118,3 +128,16 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def stats(self) -> dict[str, int]:
+        """Return lightweight KV/prefix-cache counters for runtime reports."""
+
+        return {
+            "block_size": self.block_size,
+            "allocated_blocks": len(self.used_block_ids),
+            "free_blocks": len(self.free_block_ids),
+            "freed_blocks": self.freed_blocks,
+            "peak_used_blocks": self.peak_used_blocks,
+            "prefix_cache_hits": self.prefix_cache_hits,
+            "prefix_cache_misses": self.prefix_cache_misses,
+        }

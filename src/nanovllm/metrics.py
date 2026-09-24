@@ -256,7 +256,11 @@ class MetricsCollector:
         if request is not None:
             request.error = error
 
-    def report(self, wall_time: float | None = None) -> dict[str, Any]:
+    def report(
+        self,
+        wall_time: float | None = None,
+        scheduler_stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self._finalize_cuda_timing()
         summary = aggregate_requests(self.requests.values(), wall_time=wall_time)
         summary["prefill_tok_s"] = _safe_rate(
@@ -276,6 +280,8 @@ class MetricsCollector:
                 "cuda_decode_time_ms_total": self.cuda_decode_time * 1000.0,
             }
         )
+        if scheduler_stats is not None:
+            summary["scheduler"] = dict(scheduler_stats)
         return {
             "summary": summary,
             "requests": [

@@ -184,7 +184,10 @@ class LLMEngine:
         ]
         report = None
         if metrics is not None:
-            report = metrics.report(wall_time=perf_counter() - started_at)
+            report = metrics.report(
+                wall_time=perf_counter() - started_at,
+                scheduler_stats=self.scheduler.stats(),
+            )
         return outputs, report
 
     def generate(

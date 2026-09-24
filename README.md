@@ -23,7 +23,8 @@ The active Megakernel is deliberately narrow:
 - `max_model_len <= 2048`;
 - batch sizes `1..8` (`TG_MAX_BATCH`);
 - one whole-batch cooperative launch per decode step;
-- prefill remains on the torch model path.
+- prefill remains on the torch model path; it already uses FlashAttention varlen.
+- scheduler-level `max_prefill_tokens_per_step` and `prefill_decode_ratio` control mixed prefill/decode fairness.
 
 The kernel reuses nano-vLLM's paged KV cache. It does not allocate a second KV
 cache or replay the prompt. Unsupported requests fall back to the standard torch
@@ -94,6 +95,25 @@ Benchmarks and server commands:
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/benchmarks/compare.py`
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/tools/bench_taskgraph.py`
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/SERVER_COMMANDS.txt`
+
+## Prefill/decode scheduling controls
+
+The engine already uses FlashAttention for prefill (`flash_attn_varlen_func`) and
+for torch decode (`flash_attn_with_kvcache`). The current Phase 0 scheduler adds
+controls for mixed workloads:
+
+```python
+LLM(
+    model,
+    max_prefill_tokens_per_step=512,  # 0 keeps the full token budget
+    prefill_decode_ratio=1,            # at most one decode round before prefill
+)
+```
+
+Runtime reports include waiting/running sequence counts, allocated/free/peak KV
+blocks, and prefix-cache hit/miss counters. These controls do not change the
+Megakernel CUDA arithmetic; they make the pre-server system behavior measurable
+and prevent a long waiting prompt from starving active decode.
 
 ## Validation rules
 

@@ -19,6 +19,14 @@ def validate_decode_backend(value: str) -> str:
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
+    # Scheduler controls for mixed prefill/decode service behavior. A value of
+    # 0 keeps the legacy full token budget for prefill; positive values cap one
+    # prefill iteration so long prompts cannot monopolize the engine.
+    max_prefill_tokens_per_step: int = 0
+    # When both queues are non-empty, run at most this many decode iterations
+    # before allowing one prefill iteration. This preserves decode ITL while
+    # still making progress on waiting requests.
+    prefill_decode_ratio: int = 1
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
@@ -37,6 +45,16 @@ class Config:
 
     def __post_init__(self):
         self.decode_backend = validate_decode_backend(self.decode_backend)
+        if self.max_prefill_tokens_per_step < 0:
+            raise ValueError(
+                "max_prefill_tokens_per_step must be >= 0; got "
+                f"{self.max_prefill_tokens_per_step}"
+            )
+        if self.prefill_decode_ratio < 1:
+            raise ValueError(
+                "prefill_decode_ratio must be >= 1; got "
+                f"{self.prefill_decode_ratio}"
+            )
         if self.megakernel_attn_splits < 1:
             raise ValueError(
                 "megakernel_attn_splits must be >= 1; got "

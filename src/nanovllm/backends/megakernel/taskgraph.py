@@ -235,6 +235,7 @@ class TaskGraphDecoder:
         self._row_input = None
         self._row_pos = None
         self._row_table = None
+        self._row_table_host = None
         # ---- schedules (built for the bucket batches; others lazily) -------
         self._bar_names = (
             "bar_qkv", "bar_attn", "bar_oproj", "bar_silu",
@@ -387,19 +388,38 @@ class TaskGraphDecoder:
             self._row_table = torch.zeros(
                 1, self._max_pages, dtype=torch.int32, device="cuda"
             )
+            self._row_table_host = torch.zeros(
+                self._max_pages, dtype=torch.int32, pin_memory=True
+            )
         self._row_input[0] = int(token_id)
         self._row_pos[0] = int(position)
         table = block_table
-        if not torch.is_tensor(table):
-            table = torch.as_tensor(table, dtype=torch.int32, device="cuda")
+        if torch.is_tensor(table):
+            cols = min(int(table.numel()), self._max_pages)
+            if table.is_cuda:
+                self._row_table[0, :cols].copy_(table[:cols])
+            else:
+                self._row_table_host[:cols].copy_(table[:cols].to(torch.int32))
+                self._row_table[0, :cols].copy_(
+                    self._row_table_host[:cols], non_blocking=True
+                )
+        else:
+            cols = min(len(table), self._max_pages)
+            # Keep the host staging allocation persistent. This still performs
+            # one host->device copy, but avoids a transient CUDA allocation in
+            # the latency-sensitive batch=1 path.
+            self._row_table_host[:cols] = torch.as_tensor(
+                table[:cols], dtype=torch.int32
+            )
+            self._row_table[0, :cols].copy_(
+                self._row_table_host[:cols], non_blocking=True
+            )
         # Only the first ``cols`` entries are ever read: the kernel maps a
         # position to ``block_table[position // block_size]`` and every position
         # it touches is < the sequence length, whose block count is ``cols``
         # (prepare_block_tables pads to exactly that). Columns past ``cols`` may
         # therefore keep a stale value from an earlier, longer sequence without
         # being read -- so no per-step tail clear is needed.
-        cols = min(int(table.numel()), self._max_pages)
-        self._row_table[0, :cols] = table[:cols]
         return int(
             self.decode_rows(self._row_input, self._row_pos, self._row_table)[0]
         )
