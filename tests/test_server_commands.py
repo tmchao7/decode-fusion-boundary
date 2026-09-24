@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 SERVER_COMMANDS = REPO_ROOT / "SERVER_COMMANDS.txt"
-DOCS_09 = REPO_ROOT / "docs" / "10_交接文档.md"
+DOCS_09 = REPO_ROOT / "docs" / "08_服务器运行手册.md"
 
 # Modules we own; everything else in the file (pip, nsys, nvidia-smi) is not
 # ours to validate.
@@ -120,7 +120,6 @@ class ServerCommandReferenceTests(unittest.TestCase):
 
     def test_every_referenced_module_has_a_source_file(self) -> None:
         modules = {module for module, _ in self.calls}
-        self.assertIn("tools.verdict", modules)
         self.assertIn("tools.account_decode", modules)
         for module in sorted(modules):
             if module == "unittest":
@@ -158,13 +157,13 @@ class ServerCommandReferenceTests(unittest.TestCase):
                         self.assertIn(token, allowed)
 
     def test_new_run_modes_are_dispatched(self) -> None:
-        for mode in ("account", "roofline"):
+        for mode in ("taskgraph", "taskgraph-baseline"):
             with self.subTest(mode=mode):
                 self.assertTrue(
                     re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE),
                     f"RUN_MODE={mode} has no case branch",
                 )
-                self.assertIn(f"run_{mode}()", self.text)
+                self.assertIn(f"run_{mode.replace('-', '_')}()", self.text)
 
     def test_documented_run_modes_are_all_dispatched(self) -> None:
         advertised = set(
@@ -178,11 +177,15 @@ class ServerCommandReferenceTests(unittest.TestCase):
                     f"advertised RUN_MODE={mode} has no dispatch branch",
                 )
 
-    def test_verdict_is_computed_by_both_probe_phases(self) -> None:
-        for function in ("run_account", "run_roofline"):
-            block = self._function_body(function)
-            with self.subTest(function=function):
-                self.assertIn("tools.verdict", block)
+    def test_mainline_commands_do_not_reference_archived_backends(self) -> None:
+        for name in (
+            "megakernel-tg",
+            "megakernel-wmma",
+            "megakernel-burst",
+            "megakernel_batch_decode",
+            "megakernel_burst",
+        ):
+            self.assertNotIn(name, self.text)
 
     def _function_body(self, name: str) -> str:
         match = re.search(

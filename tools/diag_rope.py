@@ -21,10 +21,10 @@ def torch_rope_tables():
 
 
 def mega_rope_tables():
-    """Build cos/sin exactly like megakernel/model.py _rope_tables."""
+    """Build cos/sin exactly like megakernel/weights.py _rope_tables."""
     from nanovllm.backends.megakernel.build import get_extension
     get_extension()  # ensure JIT op is registered
-    from nanovllm.backends.megakernel.model import _rope_tables
+    from nanovllm.backends.megakernel.weights import _rope_tables
     cos_table, sin_table = _rope_tables(ROPE_THETA)
     # cos_table is [max_seq_len, 128] with repeat(1,2)
     # First 64 cols are the unique cos values

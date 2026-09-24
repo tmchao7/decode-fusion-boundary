@@ -17,27 +17,6 @@ BACKENDS = {
     "torch-eager": {"decode_backend": "torch", "enforce_eager": True},
     "torch-cudagraph": {"decode_backend": "torch", "enforce_eager": False},
     "megakernel": {"decode_backend": "megakernel", "enforce_eager": False},
-    "megakernel-wmma": {
-        "decode_backend": "megakernel",
-        "enforce_eager": False,
-        "megakernel_batch_kernel": "wmma",
-        "megakernel_burst": False,
-        "megakernel_batch_decode": True,
-    },
-    "megakernel-burst": {
-        "decode_backend": "megakernel",
-        "enforce_eager": False,
-        "megakernel_batch_kernel": "wmma",
-        "megakernel_burst": True,
-        "megakernel_batch_decode": True,
-    },
-    "megakernel-tg": {
-        "decode_backend": "megakernel-tg",
-        "enforce_eager": False,
-        "megakernel_burst": False,
-        # No max_model_len here: run_backend() passes max_model_len=2048 to LLM()
-        # explicitly, so a copy in this dict would be a duplicate keyword.
-    },
 }
 
 
@@ -223,7 +202,7 @@ def compare_outputs(reference, actual):
 def classify_comparison(reference, actual):
     """Classify a reference-vs-actual comparison (PASS / CASCADE / FAIL).
 
-    Mirrors the classification in ``correctness_wmma_vs_scalar.py``:
+    This is the mainline Megakernel correctness classification:
 
       - PASS: token-for-token identical.
       - CASCADE (tolerated): every divergence starts at a decode token
@@ -334,7 +313,7 @@ def main() -> None:
             actuals = result["metrics"]["summary"].get("backend_actuals", [])
             mismatches, first_mismatch = compare_outputs(reference, result["outputs"])
             status, cascade_details = classify_comparison(reference, result["outputs"])
-            used_megakernel = "megakernel" in actuals or "megakernel-tg" in actuals
+            used_megakernel = "megakernel" in actuals
             checks[backend] = {
                 "passed": not mismatches,
                 "status": status,
@@ -347,7 +326,7 @@ def main() -> None:
                     "fallback_reasons", []
                 ),
             }
-            if args.require_megakernel and backend in ("megakernel", "megakernel-tg") and not used_megakernel:
+            if args.require_megakernel and backend == "megakernel" and not used_megakernel:
                 raise SystemExit(
                     f"Megakernel was requested but did not execute for {case['id']}"
                 )

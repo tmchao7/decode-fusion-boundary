@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     from nanovllm.backends.megakernel.build import get_extension
     get_extension()
 
-    from nanovllm.backends.megakernel.model import (
+    from nanovllm.backends.megakernel.weights import (
         load_weights, _pack_layer_weights, _rope_tables,
         NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
         NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE,

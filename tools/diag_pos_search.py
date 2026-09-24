@@ -17,7 +17,7 @@ def main():
     from nanovllm import LLM
     from nanovllm.backends.megakernel.build import get_extension
     get_extension()
-    from nanovllm.backends.megakernel.model import _rope_tables
+    from nanovllm.backends.megakernel.weights import _rope_tables
 
     model_path = os.environ.get(
         "NANOVLLM_MODEL_PATH", os.path.expanduser("~/models/Qwen3-0.6B")

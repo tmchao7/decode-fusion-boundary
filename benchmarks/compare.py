@@ -32,43 +32,26 @@ from tools.workloads import load_workloads
 BACKEND_CONFIGS = {
     "torch-eager": {"decode_backend": "torch", "enforce_eager": True},
     "torch-cudagraph": {"decode_backend": "torch", "enforce_eager": False},
-    "megakernel": {"decode_backend": "megakernel", "enforce_eager": False},
-    "megakernel-wmma": {
-        "decode_backend": "megakernel",
-        "enforce_eager": False,
-        "megakernel_batch_kernel": "wmma",
-        "megakernel_burst": False,
-        "megakernel_batch_decode": True,
-    },
-    "megakernel-burst": {
-        "decode_backend": "megakernel",
-        "enforce_eager": False,
-        "megakernel_batch_kernel": "wmma",
-        "megakernel_burst": True,
-        "megakernel_batch_decode": True,
-    },
-    # The task-graph rewrite (docs/11-13). One whole-batch cooperative launch
-    # per decode step, so batch>1 needs no opt-in flag; the ceiling is the
-    # compile-time TG_MAX_BATCH (8). Burst is off by construction.
+    # The task-graph Megakernel: one whole-batch cooperative launch per decode
+    # step, with the compile-time TG_MAX_BATCH (8) ceiling.
     #
     # No max_model_len here: run_case() already passes max_model_len=2048 to
     # LLM() explicitly, and a second copy in this dict would be a duplicate
     # keyword argument (TypeError at construction).
-    "megakernel-tg": {
-        "decode_backend": "megakernel-tg",
+    "megakernel": {
+        "decode_backend": "megakernel",
         "enforce_eager": False,
-        "megakernel_burst": False,
     },
 }
 
 # Backends whose results are gated by the megakernel correctness rule (first
 # token must match torch-eager; full-sequence divergence is the documented bf16
 # cascade) and whose fallback rows are not comparable (docs/05 §6).
-MEGAKERNEL_FAMILY = ("megakernel", "megakernel-tg", "megakernel-wmma", "megakernel-burst")
+MEGAKERNEL_FAMILY = ("megakernel",)
 
 # Compile-time task-graph batch ceiling; mirrors
 # nanovllm.backends.megakernel.taskgraph.TG_MAX_BATCH.
-MEGAKERNEL_TG_MAX_BATCH = 8
+MEGAKERNEL_MAX_BATCH = 8
 PromptFactory = Callable[[int, int], str | list[int]]
 
 
@@ -183,20 +166,11 @@ def run_case(
 ) -> dict[str, Any]:
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"unknown backend: {backend_name}")
-    # The megakernel batch kernel (WMMA/burst) is sequence-level parallel (one
-    # cooperative grid partitioned per sequence), but each sequence needs >=
-    # LDG_ATTN_BLOCKS blocks; the default 80-block grid caps parallel batch near
-    # 8-10. Plain "megakernel" now falls back to cudagraph for batch>1, so the
-    # guard only applies to the explicit batch backends.
-    if backend_name in ("megakernel-wmma", "megakernel-burst") and batch_size > 10:
-        raise ValueError("Megakernel parallel batch is bounded by the 80-block grid")
-    # The task-graph kernel is one whole-batch cooperative launch, so it has no
-    # grid-partition ceiling -- its limit is the compile-time scratch/bar sizing
-    # (TG_MAX_BATCH). Reject here so the row is skipped with a reason instead of
-    # silently falling back to torch and being reported as a megakernel result.
-    if backend_name == "megakernel-tg" and batch_size > MEGAKERNEL_TG_MAX_BATCH:
+    # The task-graph kernel is one whole-batch cooperative launch. Its only
+    # benchmark-level ceiling is the compile-time scratch/bar sizing limit.
+    if backend_name == "megakernel" and batch_size > MEGAKERNEL_MAX_BATCH:
         raise ValueError(
-            f"Task-graph megakernel supports batch <= {MEGAKERNEL_TG_MAX_BATCH} "
+            f"Task-graph megakernel supports batch <= {MEGAKERNEL_MAX_BATCH} "
             "(TG_MAX_BATCH)"
         )
 
@@ -307,8 +281,8 @@ def run_case(
 def run_case_safe(*args, **kwargs) -> dict[str, Any] | None:
     """Wrap run_case to gracefully skip unsupported backend/batch combos.
 
-    The megakernel batch kernel is bounded by the 80-block grid (batch <= 10);
-    rather than crashing the whole benchmark, log and skip.
+    Task-graph batches above TG_MAX_BATCH are unsupported; log and skip them
+    rather than crashing the whole benchmark.
     """
     try:
         return run_case(*args, **kwargs)
@@ -489,12 +463,10 @@ def main() -> None:
     parser.add_argument("--suite", choices=("performance", "realistic", "all"), default="performance")
     parser.add_argument(
         "--backends",
-        default="torch-eager,torch-cudagraph,megakernel-tg",
+        default="torch-eager,torch-cudagraph,megakernel",
         help=(
-            "Comma-separated backend names. The default is the docs/13 §1.1 "
-            "main table: the task-graph kernel against its two torch controls. "
-            "The frozen kernel.cu backends (megakernel / -wmma / -burst) stay "
-            "available but are no longer in the default set."
+            "Comma-separated backend names. The default compares the task-graph "
+            "Megakernel against the two torch controls."
         ),
     )
     parser.add_argument("--prompt-lengths", type=parse_int_list)
