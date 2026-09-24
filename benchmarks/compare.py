@@ -47,7 +47,28 @@ BACKEND_CONFIGS = {
         "megakernel_burst": True,
         "megakernel_batch_decode": True,
     },
+    # The task-graph rewrite (docs/11-13). One whole-batch cooperative launch
+    # per decode step, so batch>1 needs no opt-in flag; the ceiling is the
+    # compile-time TG_MAX_BATCH (8). Burst is off by construction.
+    #
+    # No max_model_len here: run_case() already passes max_model_len=2048 to
+    # LLM() explicitly, and a second copy in this dict would be a duplicate
+    # keyword argument (TypeError at construction).
+    "megakernel-tg": {
+        "decode_backend": "megakernel-tg",
+        "enforce_eager": False,
+        "megakernel_burst": False,
+    },
 }
+
+# Backends whose results are gated by the megakernel correctness rule (first
+# token must match torch-eager; full-sequence divergence is the documented bf16
+# cascade) and whose fallback rows are not comparable (docs/05 §6).
+MEGAKERNEL_FAMILY = ("megakernel", "megakernel-tg", "megakernel-wmma", "megakernel-burst")
+
+# Compile-time task-graph batch ceiling; mirrors
+# nanovllm.backends.megakernel.taskgraph.TG_MAX_BATCH.
+MEGAKERNEL_TG_MAX_BATCH = 8
 PromptFactory = Callable[[int, int], str | list[int]]
 
 
@@ -169,6 +190,15 @@ def run_case(
     # guard only applies to the explicit batch backends.
     if backend_name in ("megakernel-wmma", "megakernel-burst") and batch_size > 10:
         raise ValueError("Megakernel parallel batch is bounded by the 80-block grid")
+    # The task-graph kernel is one whole-batch cooperative launch, so it has no
+    # grid-partition ceiling -- its limit is the compile-time scratch/bar sizing
+    # (TG_MAX_BATCH). Reject here so the row is skipped with a reason instead of
+    # silently falling back to torch and being reported as a megakernel result.
+    if backend_name == "megakernel-tg" and batch_size > MEGAKERNEL_TG_MAX_BATCH:
+        raise ValueError(
+            f"Task-graph megakernel supports batch <= {MEGAKERNEL_TG_MAX_BATCH} "
+            "(TG_MAX_BATCH)"
+        )
 
     backend_config = BACKEND_CONFIGS[backend_name]
     llm = LLM(
@@ -321,7 +351,7 @@ def mark_correctness(experiments: list[dict[str, Any]]) -> None:
             # sequence (documented ~1 ulp reduction-order cascade). Treat it as
             # correct when it actually ran and every request's first token
             # matches, which is the strong signal that the decode path is sound.
-            if experiment["backend"] in ("megakernel", "megakernel-wmma", "megakernel-burst"):
+            if experiment["backend"] in MEGAKERNEL_FAMILY:
                 first_token_matches = all(
                     bool(exp and act and exp[0] == act[0])
                     for exp, act in zip(reference_outputs, experiment["outputs"])
@@ -367,7 +397,7 @@ def add_comparisons(
             comparison = compare_metric_summaries(
                 baseline["summary"], optimized["summary"]
             )
-            if optimized["backend"] in ("megakernel", "megakernel-wmma", "megakernel-burst") and (
+            if optimized["backend"] in MEGAKERNEL_FAMILY and (
                 not _backend_actual_is_megakernel(optimized["summary"])
                 or not optimized.get("correctness", {}).get("passed", False)
             ):
@@ -459,8 +489,13 @@ def main() -> None:
     parser.add_argument("--suite", choices=("performance", "realistic", "all"), default="performance")
     parser.add_argument(
         "--backends",
-        default="torch-eager,torch-cudagraph,megakernel",
-        help="Comma-separated backend names",
+        default="torch-eager,torch-cudagraph,megakernel-tg",
+        help=(
+            "Comma-separated backend names. The default is the docs/13 §1.1 "
+            "main table: the task-graph kernel against its two torch controls. "
+            "The frozen kernel.cu backends (megakernel / -wmma / -burst) stay "
+            "available but are no longer in the default set."
+        ),
     )
     parser.add_argument("--prompt-lengths", type=parse_int_list)
     parser.add_argument("--batch-sizes", type=parse_int_list, default=[1, 8, 32])
@@ -472,6 +507,30 @@ def main() -> None:
     parser.add_argument("--markdown", dest="markdown_path")
     parser.add_argument("--skip-batch", action="store_true")
     parser.add_argument("--skip-mixed-batch", action="store_true")
+    parser.add_argument(
+        "--grid",
+        action="store_true",
+        help=(
+            "Replace the two fixed controlled shapes with the full "
+            "batch x prompt-length cross product (docs/13 §1.3), i.e. "
+            "--batch-sizes x --grid-lengths. Use this for the task-graph "
+            "baseline table so the same workload id exists for every "
+            "(backend, batch, context) triple."
+        ),
+    )
+    parser.add_argument(
+        "--grid-lengths",
+        type=parse_int_list,
+        default=[32, 512, 1920],
+        help=(
+            "Prompt lengths for --grid (default 32,512,1920). docs/13 §1.3 "
+            "names 32/512/2048, but an end-to-end generate row must satisfy "
+            "prompt + max_tokens <= 2048 (RoPE table + KV pool), so with the "
+            "default 128 max_tokens the long-context row is 1920. The kernel "
+            "microbenchmark (tools/bench_taskgraph.py) still measures ctx=2048 "
+            "directly."
+        ),
+    )
     parser.add_argument("--baseline", default="torch-cudagraph")
     args = parser.parse_args()
 
@@ -490,25 +549,65 @@ def main() -> None:
     experiments = []
     performance_lengths = args.prompt_lengths or workload_payload["performance"]["prompt_lengths"]
     if args.suite in ("performance", "all"):
-        for prompt_length in performance_lengths:
-            for backend in backends:
-                experiments.append(
-                    run_case_safe(
-                        args.model,
-                        backend,
-                        f"perf_p{prompt_length}_b1",
-                        "controlled_performance",
-                        synthetic_factory([prompt_length], args.seed),
-                        [prompt_length],
-                        1,
-                        args.max_tokens,
-                        args.warmup,
-                        args.runs,
-                        args.seed,
-                        ignore_eos=True,
+        if args.grid:
+            # docs/13 §1.3 grid: batch x prompt length, so the same workload id
+            # exists for every (backend, batch, context) triple and the four
+            # accounting numbers can be read off one table.
+            #
+            # A row needs prompt_length + max_tokens <= 2048: the kernels' RoPE
+            # table has MAX_SEQ_LEN=2048 rows, the task-graph page_table stride
+            # is max_model_len//block_size columns, and the engine's KV pool is
+            # sized from max_model_len. A longer row would decode at positions
+            # past the table. Skip it loudly rather than emit a row that is
+            # wrong for one backend and fine for another.
+            for prompt_length in args.grid_lengths:
+                total_len = prompt_length + args.max_tokens
+                if total_len > 2048:
+                    print(
+                        f"SKIP grid row p{prompt_length}: prompt + max_tokens = "
+                        f"{total_len} > max_model_len 2048 (the RoPE table and "
+                        "the KV pool are both capped there)",
+                        file=sys.stderr,
                     )
-                )
-        if not args.skip_batch:
+                    continue
+                for batch_size in args.batch_sizes:
+                    for backend in backends:
+                        experiments.append(
+                            run_case_safe(
+                                args.model,
+                                backend,
+                                f"perf_p{prompt_length}_b{batch_size}",
+                                "controlled_grid",
+                                synthetic_factory([prompt_length], args.seed),
+                                [prompt_length],
+                                batch_size,
+                                args.max_tokens,
+                                args.warmup,
+                                args.runs,
+                                args.seed,
+                                ignore_eos=True,
+                            )
+                        )
+        else:
+            for prompt_length in performance_lengths:
+                for backend in backends:
+                    experiments.append(
+                        run_case_safe(
+                            args.model,
+                            backend,
+                            f"perf_p{prompt_length}_b1",
+                            "controlled_performance",
+                            synthetic_factory([prompt_length], args.seed),
+                            [prompt_length],
+                            1,
+                            args.max_tokens,
+                            args.warmup,
+                            args.runs,
+                            args.seed,
+                            ignore_eos=True,
+                        )
+                    )
+        if not args.skip_batch and not args.grid:
             for batch_size in args.batch_sizes:
                 for backend in backends:
                     experiments.append(
@@ -527,7 +626,7 @@ def main() -> None:
                             ignore_eos=True,
                         )
                     )
-        if not args.skip_mixed_batch:
+        if not args.skip_mixed_batch and not args.grid:
             for mix in workload_payload["performance"].get("batch_mixes", []):
                 mix_lengths = [int(length) for length in mix["prompt_lengths"]]
                 for backend in backends:

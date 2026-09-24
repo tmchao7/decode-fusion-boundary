@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
-VALID_DECODE_BACKENDS = {"torch", "megakernel"}
+# ``megakernel``      -> the frozen kernel.cu persistent/WMMA path (docs/07)
+# ``megakernel-tg``   -> the task-graph persistent kernel (docs/11/12/13)
+# Both own the decode path; ``torch`` is the standard nano-vLLM path.
+VALID_DECODE_BACKENDS = {"torch", "megakernel", "megakernel-tg"}
 VALID_MEGAKERNEL_BATCH_KERNELS = {"scalar", "wmma"}
 
 
@@ -43,6 +46,11 @@ class Config:
     # loses batch>=2). Set True to force the megakernel batch (WMMA) path for
     # batch>1, used for correctness research (tools/correctness_wmma_vs_scalar).
     megakernel_batch_decode: bool = False
+    # Task-graph (``decode_backend="megakernel-tg"``) knobs. ``attn_splits``
+    # selects the static attention split count baked into the schedule; 1 is the
+    # validated default (docs/12 §3.4 wants vectorization before more splits).
+    megakernel_tg_attn_splits: int = 1
+    megakernel_tg_verbose: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -53,6 +61,11 @@ class Config:
         self.megakernel_batch_kernel = validate_megakernel_batch_kernel(
             self.megakernel_batch_kernel
         )
+        if self.megakernel_tg_attn_splits < 1:
+            raise ValueError(
+                "megakernel_tg_attn_splits must be >= 1; got "
+                f"{self.megakernel_tg_attn_splits}"
+            )
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8

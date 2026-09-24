@@ -103,32 +103,41 @@ Task-graph (108 SM, 50 步):
 
 ### 3.3 PK 方案
 
-需要写独立对比脚本 `tools/compare_tg_vs_cudagraph.py`：
-- 同一进程内分别跑 task-graph kernel 和引擎 CUDA Graph 路径
-- 相同配置 (BS, ctx, num_steps)
-- 输出 ms/step 对比表
+**已改为扩 `benchmarks/compare.py`，不再写独立脚本**（`docs/13 §2`）：该脚本已经是
+"一个 case 一个 `LLM()`，串行跑"的结构，天然支持两条路径各自建引擎，并且自动继承
+全部公平性规则与 correctness gate。新增 `RUN_MODE=taskgraph-baseline` 一次跑完
+"correctness → 主表 → 四口径账"。
+
+原计划的 `tools/compare_tg_vs_cudagraph.py` **已废弃**，避免第二套计时/公平性逻辑漂移。
 
 ---
 
 ## 4. 已知问题
 
-1. **`attn_splits=2` schedule deadlock**: ABI 模拟器显示 184/10264 指令可执行，
-   调度器逻辑问题，与确定性修复无关
+1. ~~**`attn_splits=2` schedule deadlock**~~ **已失效**：该结论记录于 `f6cd3a8`
+   （`184/10264`），但**用同一份 `simulate_execution` 在 `f6cd3a8` / `1a7539b` 上
+   复现不出来**（`10264/10264` 全部可执行）。当时的 `184` 与模拟器的实际输出不符，
+   应视为**未经验证的记录**而非已确认缺陷。`f3d8114` 之后指令数降到 9870，ABI 测试
+   现覆盖 `attn_splits ∈ {1,2}` × `BS ∈ {1..8}` × `num_sms ∈ {1,4,8,108}` 全部无死锁；
+   新加的 `tests/test_taskgraph_backend.py` 把 `BS 1..8` 也纳入了模拟器覆盖。
+   **数值侧仍需服务器**（`test_taskgraph_positions::test_attn_splits_matches_causal_reference`）。
 2. **性能远未优化**:
    - `__syncthreads` dispatch (~2µs/SM 开销)，ring buffer 仍是死代码
    - scalar attention 未向量化
    - 权重带宽利用率低 (111 GB/s vs A100 HBM 峰值 1.5 TB/s)
-3. **Task-graph 未集成引擎**: 需要接入 `MegakernelBackend` 才能用 `benchmarks/compare.py` 对比
+3. ~~**Task-graph 未集成引擎**~~ **已完成**（本轮）：`decode_backend="megakernel-tg"`
+   走 `backends/megakernel/taskgraph.py`，`benchmarks/compare.py` 的
+   `BACKEND_CONFIGS` 已加该 backend 并成为默认 `--backends`。
 
 ---
 
 ## 5. 下一步
 
-1. 写 `tools/compare_tg_vs_cudagraph.py` 对比脚本
-2. 跑引擎 CUDA Graph bench 取基线数据
-3. 调查 `attn_splits=2` schedule deadlock
-4. 性能优化: 启用 ring buffer dispatch、向量化 attention
-5. 集成 task-graph 到引擎 `MegakernelBackend`
+1. ~~写 `tools/compare_tg_vs_cudagraph.py`~~ → 改为扩 `compare.py`（已完成）
+2. 服务器跑 `RUN_MODE=taskgraph-baseline` 取主表 + 四口径账
+3. ~~调查 `attn_splits=2` schedule deadlock~~ → 记录已失效，改为服务器数值验证
+4. 性能优化: 启用 ring buffer dispatch、向量化 attention（`docs/12 §3`）
+5. ~~集成 task-graph 到引擎 `MegakernelBackend`~~（已完成）
 
 ---
 
@@ -136,6 +145,9 @@ Task-graph (108 SM, 50 步):
 
 | Commit | 描述 |
 |---|---|
+| (本轮) | feat(taskgraph): 阶段 0 集成——`megakernel-tg` backend + compare.py 主表 + taskgraph-baseline 模式 |
+| `ef4e1ab` | docs: integration + baseline plan; fix the ncu-on-cooperative-kernel hazard |
+| `b46d23f` | build: make TG_B_STAGES env-overridable, add taskgraph-perf mode |
 | `1a7539b` | docs: fill §10.4 with A100 real-hardware results |
 | `9c7b707` | fix: use uint32 for inst_buf in tools (barrier count overflow) |
 | `c8dbb33` | fix: eliminate cross-warp global memory races with fence.acq_rel.gpu |

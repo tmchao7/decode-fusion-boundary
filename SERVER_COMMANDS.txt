@@ -19,6 +19,7 @@ set -euo pipefail
 #   RUN_MODE=sanitize bash SERVER_COMMANDS.txt       # compute-sanitizer minimal case
 #   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt      # task-graph ABI + BS=1/BS=2/multi-SM/position tests + bench
 #   RUN_MODE=taskgraph-perf bash SERVER_COMMANDS.txt      # bench + nsys timeline + TG_B_STAGES A/B
+#   RUN_MODE=taskgraph-baseline bash SERVER_COMMANDS.txt  # docs/13 phase 0: megakernel-tg vs torch, four-number table
 #   RUN_MODE=taskgraph-sanitize bash SERVER_COMMANDS.txt  # compute-sanitizer memcheck on the task-graph kernel
 #   RUN_MODE=all bash SERVER_COMMANDS.txt            # build, correctness, benchmark
 #
@@ -32,6 +33,12 @@ RUN_MODE="${RUN_MODE:-correctness}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$SCRIPT_DIR}"
 MODEL="${MODEL:-${NANOVLLM_MODEL_PATH:-$HOME/models/Qwen3-0.6B}}"
+# The engine and benchmarks read NANOVLLM_MODEL_PATH; the task-graph tests and
+# tools read QWEN3_MODEL_PATH. Export both from the single $MODEL so a mode can
+# never silently fall back to a stale ~/models default (or reach the HF hub with
+# HF_HUB_OFFLINE=1 set, which fails the run).
+export NANOVLLM_MODEL_PATH="$MODEL"
+export QWEN3_MODEL_PATH="$MODEL"
 # Space-separated physical GPU ids; select_gpu() picks the one with the most free
 # memory. Point it at the GPUs you are allowed to use on a shared box.
 PREFERRED_GPUS="${PREFERRED_GPUS:-0}"
@@ -600,8 +607,8 @@ run_taskgraph() {
 
   # Step timing. Decode streams ~1.2 GB of weights per step regardless of
   # batch, so GB/s is the number to watch; if it is far below HBM peak the
-  # cp.async pipeline is not covering the latency. Vary --context-len to
-  # expose the scalar attention cost.
+  # cp.async pipeline is not covering the latency. --context-len takes a list
+  # and the tool runs the batch x context cross product.
   QWEN3_MODEL_PATH="$MODEL" \
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   PYTHONPATH=src python tools/bench_taskgraph.py \
@@ -681,6 +688,96 @@ run_taskgraph_perf() {
     --json results/taskgraph_perf_bench_b4.json \
     2>&1 | tee results/taskgraph_perf_bench_b4.log
   echo "(A separate TORCH_EXTENSIONS_DIR keeps the two builds from thrashing.)"
+}
+
+run_taskgraph_baseline() {
+  mkdir -p results
+  require_model
+  select_gpu
+  build_extension
+  verify_extension_import
+
+  # ---------------------------------------------------------------------
+  # docs/13 §5 phase 0: the task-graph kernel behind decode_backend=
+  # "megakernel-tg", measured against its two torch controls with the four
+  # accounting numbers (wall / GPU / host residual / GPU share).
+  #
+  # 1) Correctness first. The engine-level path (backend.py -> taskgraph.py)
+  #    is a different call sequence from the tools/ tests, so it needs its own
+  #    PASS/CASCADE gate before any number from it is believed. The task-graph
+  #    path is bf16 and reorders reductions, so CASCADE (divergence starting at
+  #    decode token >= 1) is expected; FAIL (token 0 or length) is not.
+  # ---------------------------------------------------------------------
+  set +e
+  python -m tools.correctness_smoke \
+    "$MODEL" \
+    --workloads benchmarks/workloads.json \
+    --backends torch-eager,megakernel-tg \
+    --batch-sizes 1,2,4,8 \
+    --max-tokens 16 \
+    --require-megakernel \
+    --allow-cascade \
+    --json results/taskgraph_baseline_correctness.json \
+    2>&1 | tee results/taskgraph_baseline_correctness.log
+  local correctness_status=$?
+  set -e
+  echo "taskgraph correctness exit code: $correctness_status (0 = no FAIL)"
+
+  # ---------------------------------------------------------------------
+  # 2) The main table. --grid runs the batch x context cross product
+  #    (docs/13 §1.3), so perf_p<len>_b<batch> exists for every backend and
+  #    the comparison block is per (batch, context) instead of per shape.
+  #
+  #    prompt 1920 + max_tokens 128 = 2048: the RoPE table, the page_table
+  #    stride and the KV pool are all capped at max_model_len=2048, so an
+  #    end-to-end row cannot use a 2048-token prompt. The kernel-only ctx=2048
+  #    number comes from RUN_MODE=taskgraph-perf instead.
+  #
+  #    warmup 2 / runs 3 matches docs/06's min-of-3 provenance.
+  # ---------------------------------------------------------------------
+  python -m benchmarks.compare \
+    "$MODEL" \
+    --suite performance \
+    --workloads benchmarks/workloads.json \
+    --backends torch-eager,torch-cudagraph,megakernel-tg \
+    --grid \
+    --grid-lengths 32,512,1920 \
+    --batch-sizes 1,2,4,8 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 3 \
+    --baseline torch-cudagraph \
+    --json results/taskgraph_baseline.json \
+    --markdown results/taskgraph_baseline.md \
+    2>&1 | tee results/taskgraph_baseline.log
+
+  # ---------------------------------------------------------------------
+  # 3) Four-number accounting (wall / GPU / host residual / GPU share).
+  #    cuda_decode_time_ms comes from the CudaEventTimer around the decode
+  #    step, so it covers the whole task-graph launch for both paths.
+  # ---------------------------------------------------------------------
+  python -m tools.account_decode \
+    results/taskgraph_baseline.json \
+    --seq-len 2048 \
+    --json results/taskgraph_baseline_breakdown.json \
+    2>&1 | tee results/taskgraph_baseline_breakdown.md
+
+  # ---------------------------------------------------------------------
+  # 4) The old frozen megakernel is OUT of the default --backends but must
+  #    still build and run: it is backend.py's batch=1 production path and the
+  #    A/B reference (docs/13 §1.2). One command re-adds it.
+  # ---------------------------------------------------------------------
+  echo
+  echo "===== optional: frozen megakernel A/B (not in the default table) ====="
+  echo "python -m benchmarks.compare \"\$MODEL\" --suite performance \\"
+  echo "  --backends torch-cudagraph,megakernel --prompt-lengths 32 --batch-sizes 1 \\"
+  echo "  --max-tokens 128 --warmup 2 --runs 3"
+
+  echo
+  echo "Send back: results/taskgraph_baseline.md,"
+  echo "           results/taskgraph_baseline_breakdown.md,"
+  echo "           results/taskgraph_baseline_correctness.log"
+  return "$correctness_status"
 }
 
 run_taskgraph_sanitize() {
@@ -771,6 +868,9 @@ case "$RUN_MODE" in
     select_gpu
     run_taskgraph_perf
     ;;
+  taskgraph-baseline)
+    run_taskgraph_baseline
+    ;;
   taskgraph-sanitize)
     select_gpu
     run_taskgraph_sanitize
@@ -783,7 +883,7 @@ case "$RUN_MODE" in
     ;;
   *)
     echo "ERROR: unknown RUN_MODE=$RUN_MODE" >&2
-    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, taskgraph, taskgraph-sanitize, or all." >&2
+    echo "Use: model, verify, build, correctness, benchmark, nosync, account, roofline, profile, sanitize, taskgraph, taskgraph-perf, taskgraph-baseline, taskgraph-sanitize, or all." >&2
     exit 2
     ;;
 esac

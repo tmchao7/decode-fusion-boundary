@@ -11,6 +11,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.burst_policy import burst_batch_eligibility, clamp_burst_batch
+from nanovllm.backends.megakernel.backend import supports_no_sync_burst
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.metrics import CudaEventTimer, MetricsCollector, nvtx_range
@@ -28,11 +29,15 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         # The Megakernel contract fixes max_model_len at 2048 and the check is
         # inside compatibility(), which is only reached per step -- a user who
-        # sets decode_backend="megakernel" but leaves the 4096 default gets a
+        # sets a megakernel decode_backend but leaves the 4096 default gets a
         # silent full fallback.  Say it once, loudly.
-        if config.decode_backend == "megakernel" and config.max_model_len > 2048:
+        if (
+            config.decode_backend in ("megakernel", "megakernel-tg")
+            and config.max_model_len > 2048
+        ):
             warnings.warn(
-                "decode_backend='megakernel' requires max_model_len <= 2048 "
+                f"decode_backend={config.decode_backend!r} requires "
+                "max_model_len <= 2048 "
                 f"(got {config.max_model_len}); every request will fall back to "
                 "the torch path. Pass max_model_len=2048 to actually use the "
                 "Megakernel.",
@@ -104,6 +109,12 @@ class LLMEngine:
         if mr._cuda_poisoned:
             return False
         if self._burst_disabled:
+            return False
+        # Only the frozen kernel.cu path has a no-sync burst (its persistent
+        # kernel loops N steps on device). The task-graph kernel decodes exactly
+        # one step per cooperative launch, so this must stay False rather than
+        # let run_burst() return the fallback sentinel on every step.
+        if not supports_no_sync_burst(getattr(self.config, "decode_backend", None)):
             return False
         if self.scheduler.waiting:
             return False

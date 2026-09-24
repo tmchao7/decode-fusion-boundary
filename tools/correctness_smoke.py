@@ -31,6 +31,13 @@ BACKENDS = {
         "megakernel_burst": True,
         "megakernel_batch_decode": True,
     },
+    "megakernel-tg": {
+        "decode_backend": "megakernel-tg",
+        "enforce_eager": False,
+        "megakernel_burst": False,
+        # No max_model_len here: run_backend() passes max_model_len=2048 to LLM()
+        # explicitly, so a copy in this dict would be a duplicate keyword.
+    },
 }
 
 
@@ -327,7 +334,7 @@ def main() -> None:
             actuals = result["metrics"]["summary"].get("backend_actuals", [])
             mismatches, first_mismatch = compare_outputs(reference, result["outputs"])
             status, cascade_details = classify_comparison(reference, result["outputs"])
-            used_megakernel = "megakernel" in actuals
+            used_megakernel = "megakernel" in actuals or "megakernel-tg" in actuals
             checks[backend] = {
                 "passed": not mismatches,
                 "status": status,
@@ -340,7 +347,7 @@ def main() -> None:
                     "fallback_reasons", []
                 ),
             }
-            if args.require_megakernel and backend == "megakernel" and not used_megakernel:
+            if args.require_megakernel and backend in ("megakernel", "megakernel-tg") and not used_megakernel:
                 raise SystemExit(
                     f"Megakernel was requested but did not execute for {case['id']}"
                 )

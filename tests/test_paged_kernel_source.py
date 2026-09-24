@@ -39,7 +39,12 @@ class PagedKernelSourceTests(unittest.TestCase):
         self.assertIn('ldg_check_phase("transformer decode"', kernel_source)
         self.assertIn('ldg_check_phase("LM head"', kernel_source)
         runner_source = (ROOT / "src/nanovllm/engine/model_runner.py").read_text(encoding="utf-8")
-        self.assertIn("config.decode_backend != \"megakernel\"", runner_source)
+        # CUDA-graph capture must stay off for EVERY megakernel backend. The
+        # check used to be an inline string comparison against "megakernel";
+        # it now goes through the shared predicate so adding a backend (e.g.
+        # "megakernel-tg") cannot silently leave graph capture enabled.
+        self.assertIn("is_megakernel_backend(config.decode_backend)", runner_source)
+        self.assertNotIn("config.decode_backend != \"megakernel\"", runner_source)
         self.assertIn("not self.use_cudagraph", runner_source)
         self.assertIn("cudaPeekAtLastError", kernel_source)
         self.assertIn("cudaLaunchCooperativeKernel", kernel_source)

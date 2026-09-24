@@ -9,6 +9,10 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.backends.megakernel import MegakernelBackend
+from nanovllm.backends.megakernel.backend import (
+    is_megakernel_backend,
+    supports_no_sync_burst,
+)
 from nanovllm.engine.burst_policy import burst_eos_token
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
@@ -36,7 +40,8 @@ class ModelRunner:
         # unnecessary overhead. Unsupported Megakernel requests still use the
         # eager torch path through this flag.
         self.use_cudagraph = (
-            not self.enforce_eager and config.decode_backend != "megakernel"
+            not self.enforce_eager
+            and not is_megakernel_backend(config.decode_backend)
         )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -61,7 +66,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if config.decode_backend == "megakernel":
+        if is_megakernel_backend(config.decode_backend):
             self.megakernel = MegakernelBackend(config, self.model)
             self.megakernel.set_kv_cache(self.kv_cache)
             # Build the decoder (pack weights, allocate scratch) eagerly so the
@@ -352,7 +357,11 @@ class ModelRunner:
                         stacklevel=2,
                     )
                 else:
-                    self.last_backend_used = "megakernel"
+                    # Report the concrete path so the benchmark can attribute
+                    # rows: "megakernel" (frozen kernel.cu) or "megakernel-tg"
+                    # (task-graph). compare.py keys its correctness/fallback
+                    # gates off the ``megakernel`` prefix.
+                    self.last_backend_used = self.config.decode_backend
                     return token_ids
                 finally:
                     reset_context()
@@ -382,6 +391,17 @@ class ModelRunner:
         """
         self.last_backend_used = "torch"
         self.last_fallback_reason = None
+        if not supports_no_sync_burst(self.config.decode_backend):
+            # Only the frozen kernel.cu path has a no-sync burst; the task-graph
+            # kernel decodes exactly one step per cooperative launch. Return the
+            # "failed before the kernel ran" sentinel so _step_burst falls back
+            # to the step-wise schedule instead of poisoning CUDA (the except
+            # block below would misread this as a mid-kernel fault).
+            self.last_fallback_reason = (
+                f"decode_backend={self.config.decode_backend!r} has no no-sync "
+                "burst; use the step-wise schedule"
+            )
+            return None
         eos_token = burst_eos_token(self.config, seqs)
         try:
             with nvtx_range("megakernel_burst"):

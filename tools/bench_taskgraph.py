@@ -9,9 +9,12 @@ to watch.
 The KV cache is pre-filled to ``--context-len`` so the attention cost reflects
 a realistic context. Positions beyond ``context_len`` are not exercised.
 
+``--batch-size`` and ``--context-len`` both take comma-separated lists and the
+tool runs their full cross product, which is the grid docs/13 §1.3 asks for.
+
 Usage:
     CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 \
-    python tools/bench_taskgraph.py --batch-size 1 --context-len 512
+    python tools/bench_taskgraph.py --batch-size 1,2,4,8 --context-len 1,128,512,2048
 """
 
 from __future__ import annotations
@@ -19,12 +22,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-DEFAULT_MODEL = os.environ.get(
-    "NANOVLLM_MODEL_PATH", os.path.expanduser("~/models/Qwen3-0.6B")
+DEFAULT_MODEL = (
+    os.environ.get("QWEN3_MODEL_PATH")
+    or os.environ.get("NANOVLLM_MODEL_PATH")
+    or os.path.expanduser("~/models/Qwen3-0.6B")
 )
 VOCAB = 151936
 NUM_Q_HEADS = 16
@@ -34,11 +38,30 @@ def parse_batches(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x]
 
 
+def parse_ints(text: str) -> list[int]:
+    """Comma-separated positive integers (shared by --batch-size/--context-len)."""
+
+    values = [int(x) for x in text.split(",") if x.strip()]
+    if not values or any(value < 1 for value in values):
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of positive integers"
+        )
+    return values
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=parse_batches, default=[1])
-    parser.add_argument("--context-len", type=int, default=512)
+    parser.add_argument(
+        "--context-len",
+        type=parse_ints,
+        default=[512],
+        help=(
+            "Comma-separated context lengths; the benchmark runs the full "
+            "batch x context cross product (default 512)."
+        ),
+    )
     parser.add_argument("--num-sms", type=int, default=0,
                         help="grid size; 0 = the device's SM count")
     parser.add_argument("--num-steps", type=int, default=50)
@@ -71,12 +94,39 @@ def main(argv: list[str] | None = None) -> int:
     embed_weight = weights["embed_weight"]
     final_norm_weight = weights["final_norm_weight"]
 
+    results = []
+    for context_len in args.context_len:
+        results.extend(
+            _bench_one_context(
+                args, context_len, torch, tg_schedule, _tg_ops,
+                layer_weights_packed, embed_weight, final_norm_weight,
+                cos_table, sin_table,
+                NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE,
+            )
+        )
+
+    if args.json_path:
+        with open(args.json_path, "w") as fh:
+            json.dump(results, fh, indent=2)
+    return 0
+
+
+def _bench_one_context(
+    args, context_len, torch, tg_schedule, _tg_ops,
+    layer_weights_packed, embed_weight, final_norm_weight,
+    cos_table, sin_table,
+    NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+    NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE,
+):
+    """Run every batch size at one context length; returns one row per batch."""
+
     block_size = args.block_size
     # The kernel writes the new token at position cache_seqlens, so with
     # cache_seqlens = context_len - 1 the highest logical block is
     # (context_len-1)//block_size and max_pages of them are enough.
-    max_pages = max(1, args.context_len // block_size)
-    ctx_position = max(0, args.context_len - 1)
+    max_pages = max(1, context_len // block_size)
+    ctx_position = max(0, context_len - 1)
 
     results = []
     for BS in args.batch_size:
@@ -182,17 +232,20 @@ def main(argv: list[str] | None = None) -> int:
         # Every weight is read once per step: ~0.6B params * 2 bytes = 1.2 GB.
         weight_gb = 1.2
         bw = weight_gb / (ms / 1000.0)
-        results.append({"batch_size": BS, "ms_per_step": ms, "weight_gbps": bw})
-        print(f"BS={BS} num_sms={args.num_sms} ctx={args.context_len}: "
+        results.append({
+            "batch_size": BS,
+            "context_len": context_len,
+            "num_sms": args.num_sms,
+            "ms_per_step": ms,
+            "weight_gbps": bw,
+        })
+        print(f"BS={BS} num_sms={args.num_sms} ctx={context_len}: "
               f"{ms:.3f} ms/step  ({bw:.0f} GB/s effective weight bw)")
 
         del s, k_cache, v_cache
         torch.cuda.empty_cache()
 
-    if args.json_path:
-        with open(args.json_path, "w") as fh:
-            json.dump(results, fh, indent=2)
-    return 0
+    return results
 
 
 if __name__ == "__main__":

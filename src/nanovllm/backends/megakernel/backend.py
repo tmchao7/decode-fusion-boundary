@@ -5,14 +5,50 @@ usable on machines without CUDA, and so importing the package never triggers a
 CUDA build. The initial paged implementation supports Qwen3-0.6B greedy decode
 with a conservative batch limit; callers should use :meth:`compatibility`
 before invoking :meth:`decode` or :meth:`decode_batch`.
+
+Two decode kernels live behind this class, selected by
+``config.decode_backend``:
+
+* ``"megakernel"`` — the frozen ``kernel.cu`` persistent/WMMA path. batch=1
+  wins by removing host launch overhead; batch>1 is bounded by the cooperative
+  grid partitioning (``LDG_ATTN_BLOCKS``) and defaults to the torch fallback
+  (docs/07).
+* ``"megakernel-tg"`` — the persistent task-graph kernel
+  (``csrc/taskgraph_kernel.cu``, docs/11-13). One whole-batch cooperative
+  launch, so no per-sequence grid ceiling; the batch limit is the compile-time
+  ``TG_MAX_BATCH`` (8). See :mod:`nanovllm.backends.megakernel.taskgraph`.
 """
 
 from dataclasses import dataclass
 from typing import Any
 
+from nanovllm.backends.megakernel.taskgraph import taskgraph_compatibility
+
 
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
 MAX_BATCH_SIZE = 32
+
+# decode_backend values that this class serves.
+MEGAKERNEL_BACKENDS = ("megakernel", "megakernel-tg")
+
+
+def is_megakernel_backend(value: Any) -> bool:
+    """Whether ``value`` selects a megakernel decode path."""
+
+    return value in MEGAKERNEL_BACKENDS
+
+
+def supports_no_sync_burst(value: Any) -> bool:
+    """Whether ``value`` selects a decode backend with a no-sync burst path.
+
+    Only the frozen ``kernel.cu`` path qualifies: its persistent kernel loops
+    ``max_steps`` decode steps on device with a device-side EOS flag. The
+    task-graph kernel decodes exactly one step per cooperative launch
+    (docs/11 §10.5), so it has no burst.
+    """
+
+    return value == "megakernel"
+
 
 # Fixed-shape contract baked into the fused CUDA kernel (kernel.cu). This is
 # the single Python-side source of truth for what the kernel was compiled for;
@@ -30,6 +66,31 @@ QWEN3_CONTRACT = {
     "max_model_len": 2048,
     "head_dim": 128,
 }
+
+
+def qwen3_contract_mismatch(config) -> str | None:
+    """Name of the first :data:`QWEN3_CONTRACT` field the config violates.
+
+    Shared by both megakernel paths: the frozen kernel and the task-graph kernel
+    are compiled for the same Qwen3-0.6B shapes, so a mismatch means neither can
+    run and the caller must stay on torch.
+    """
+
+    hf_config = _get_attr(config, "hf_config")
+    for name, expected in QWEN3_CONTRACT.items():
+        if name == "max_model_len":
+            actual = _get_attr(config, "max_model_len", 2048)
+        else:
+            actual = (
+                _get_attr(hf_config, "head_dim", None)
+                if name == "head_dim"
+                else _get_attr(hf_config, name)
+            )
+            if name == "head_dim" and actual is None:
+                actual = hf_config.hidden_size // hf_config.num_attention_heads
+        if actual != expected:
+            return name
+    return None
 
 
 def wmma_batch_limit(default: int = MAX_BATCH_SIZE) -> int:
@@ -103,6 +164,10 @@ class MegakernelBackend:
 
     @staticmethod
     def compatibility(config, seqs, is_prefill: bool) -> Compatibility:
+        if _get_attr(config, "decode_backend") == "megakernel-tg":
+            return MegakernelBackend._taskgraph_compatibility(
+                config, seqs, is_prefill
+            )
         if is_prefill:
             return Compatibility(False, "Megakernel is decode-only; use the prefill backend")
         max_batch_size = min(
@@ -166,20 +231,29 @@ class MegakernelBackend:
                 "the megakernel batch kernel.",
             )
 
-        hf_config = _get_attr(config, "hf_config")
-        for name, expected in QWEN3_CONTRACT.items():
-            if name == "max_model_len":
-                actual = _get_attr(config, "max_model_len", 2048)
-            else:
-                actual = (
-                    _get_attr(hf_config, "head_dim", None)
-                    if name == "head_dim"
-                    else _get_attr(hf_config, name)
-                )
-                if name == "head_dim" and actual is None:
-                    actual = hf_config.hidden_size // hf_config.num_attention_heads
-            if actual != expected:
-                return Compatibility(False, f"unsupported Qwen config: {name}")
+        mismatch = qwen3_contract_mismatch(config)
+        if mismatch is not None:
+            return Compatibility(False, f"unsupported Qwen config: {mismatch}")
+        return Compatibility(True)
+
+    @staticmethod
+    def _taskgraph_compatibility(config, seqs, is_prefill: bool) -> Compatibility:
+        """Bridge the torch-free task-graph policy to :class:`Compatibility`.
+
+        The task-graph path is a whole-batch cooperative launch, so it has no
+        ``LDG_ATTN_BLOCKS`` grid-partition ceiling and no
+        ``megakernel_batch_decode`` opt-in: batch 1..``TG_MAX_BATCH`` is the
+        supported range by construction. The Qwen3 shape contract is shared with
+        the frozen path (both kernels are compiled for the same model).
+        """
+
+        decision = taskgraph_compatibility(config, seqs, is_prefill)
+        if not decision.supported:
+            return Compatibility(False, decision.reason)
+
+        mismatch = qwen3_contract_mismatch(config)
+        if mismatch is not None:
+            return Compatibility(False, f"unsupported Qwen config: {mismatch}")
         return Compatibility(True)
 
     def set_kv_cache(self, kv_cache) -> None:
@@ -275,7 +349,24 @@ class MegakernelBackend:
 
         get_extension()
         from .model import Decoder, weights_from_nano_model
+
         weights = weights_from_nano_model(self.model, self.config.hf_config)
+        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
+            from .taskgraph import TaskGraphDecoder
+
+            self.decoder = TaskGraphDecoder(
+                weights,
+                k_cache=self.kv_cache[0],
+                v_cache=self.kv_cache[1],
+                block_size=self.config.kvcache_block_size,
+                num_cache_blocks=self.kv_cache.shape[2],
+                max_model_len=_get_attr(self.config, "max_model_len", 2048),
+                attn_splits=int(
+                    _get_attr(self.config, "megakernel_tg_attn_splits", 1)
+                ),
+                verbose=bool(_get_attr(self.config, "megakernel_tg_verbose", False)),
+            )
+            return
         self.decoder = Decoder(
             weights=weights,
             tokenizer=None,
@@ -292,12 +383,14 @@ class MegakernelBackend:
     def decode_batch(self, input_ids, positions, block_tables) -> list[int]:
         """Decode one token for each scheduler-selected sequence.
 
-        Uses the WMMA tensor-core batch kernel when
-        ``config.megakernel_batch_kernel == "wmma"`` (A/B switch); otherwise the
-        scalar batch kernel.
+        The task-graph decoder has a single whole-batch entry point; the frozen
+        decoder selects between the WMMA tensor-core batch kernel
+        (``config.megakernel_batch_kernel == "wmma"``) and the scalar one.
         """
 
         self._ensure_decoder()
+        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
+            return self.decoder.decode_rows(input_ids, positions, block_tables)
         if (
             getattr(self.config, "megakernel_batch_kernel", "scalar") == "wmma"
         ):
@@ -318,7 +411,18 @@ class MegakernelBackend:
 
         Hybrid dispatch: batch=1 uses the persistent single-seq kernel
         (faster — no WMMA tile padding), batch>1 uses the WMMA batch kernel.
+
+        The task-graph path has no no-sync burst: its persistent kernel runs
+        exactly one decode step per cooperative launch (docs/11 §10.5), so the
+        scheduler's burst path must stay on ``decode_backend="megakernel"``.
         """
+
+        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
+            raise NotImplementedError(
+                "decode_backend='megakernel-tg' has no no-sync burst path; its "
+                "kernel decodes exactly one step per launch. Use "
+                "decode_backend='megakernel' for the burst comparison."
+            )
         self._ensure_decoder()
         import torch
 
