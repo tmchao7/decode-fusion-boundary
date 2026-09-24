@@ -97,3 +97,6 @@ credentials.*
 .Trashes
 Thumbs.db
 desktop.ini
+
+# Local git worktrees
+.worktrees/
