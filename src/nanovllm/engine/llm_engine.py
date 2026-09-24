@@ -10,8 +10,6 @@ import torch.multiprocessing as mp
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.burst_policy import burst_batch_eligibility, clamp_burst_batch
-from nanovllm.backends.megakernel.backend import supports_no_sync_burst
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.metrics import CudaEventTimer, MetricsCollector, nvtx_range
@@ -32,7 +30,7 @@ class LLMEngine:
         # sets a megakernel decode_backend but leaves the 4096 default gets a
         # silent full fallback.  Say it once, loudly.
         if (
-            config.decode_backend in ("megakernel", "megakernel-tg")
+            config.decode_backend == "megakernel"
             and config.max_model_len > 2048
         ):
             warnings.warn(
@@ -44,12 +42,6 @@ class LLMEngine:
                 RuntimeWarning,
             )
         self._exited = False
-        # Burst path guards (see _step_burst): a burst that makes no progress
-        # must not spin the caller's while-loop, and the burst selection must
-        # respect the batch kernel's real launch limit.  The limit is queried
-        # once and cached -- it costs CUDA driver calls.
-        self._burst_disabled = False
-        self._burst_batch_limit_cache: int | None = None
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -97,132 +89,6 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
-    def _should_burst(self) -> bool:
-        """Whether the next ``step`` can use the no-sync megakernel burst path.
-
-        Runtime preconditions (extension healthy, nothing waiting) plus the
-        pure batch-shape policy in :func:`burst_batch_eligibility`.
-        """
-        mr = self.model_runner
-        if mr.megakernel is None or mr.megakernel.disabled_reason:
-            return False
-        if mr._cuda_poisoned:
-            return False
-        if self._burst_disabled:
-            return False
-        # Only the frozen kernel.cu path has a no-sync burst (its persistent
-        # kernel loops N steps on device). The task-graph kernel decodes exactly
-        # one step per cooperative launch, so this must stay False rather than
-        # let run_burst() return the fallback sentinel on every step.
-        if not supports_no_sync_burst(getattr(self.config, "decode_backend", None)):
-            return False
-        if self.scheduler.waiting:
-            return False
-        eligible, _ = burst_batch_eligibility(
-            self.config, self.scheduler.running
-        )
-        return eligible
-
-    def _burst_batch_limit(self) -> int:
-        """Cached burst batch limit, clamped to the batch kernel's real limit.
-
-        ``burst_batch_eligibility`` is torch-free and cannot see the kernel's
-        occupancy limit, so the clamp happens here.  Queried once: the limit
-        costs CUDA driver calls and does not change for a given extension.
-        """
-
-        if self._burst_batch_limit_cache is None:
-            configured = int(getattr(self.config, "megakernel_burst_batch", 8))
-            kernel_limit: int | None = None
-            try:
-                from nanovllm.backends.megakernel.backend import wmma_batch_limit
-
-                kernel_limit = int(wmma_batch_limit(configured))
-            except Exception:
-                kernel_limit = None
-            self._burst_batch_limit_cache = clamp_burst_batch(
-                configured, kernel_limit
-            )
-        return self._burst_batch_limit_cache
-
-    def _step_burst(self, metrics: MetricsCollector | None):
-        """Execute one no-sync burst and return ``(outputs, num_tokens)``."""
-        seqs, max_steps = self.scheduler.schedule_burst(
-            burst_cap=getattr(self.config, "megakernel_burst_cap", 64),
-            max_batch=self._burst_batch_limit(),
-        )
-        if not seqs or max_steps <= 0:
-            return self._step_normal(metrics)
-
-        before_completion = {
-            seq.seq_id: len(seq.completion_token_ids) for seq in seqs
-        }
-        model_start = perf_counter()
-        cuda_timer = CudaEventTimer() if metrics is not None else None
-        if cuda_timer is not None:
-            cuda_timer.start()
-        with nvtx_range("nano_vllm_burst"):
-            token_logs = self.model_runner.call("run_burst", seqs, max_steps)
-        if cuda_timer is not None:
-            cuda_timer.stop()
-        model_duration = perf_counter() - model_start
-
-        if token_logs is None:
-            # Burst failed before the kernel ran. Undo the burst block
-            # allocations so the step-wise fallback's may_append / prepare_decode
-            # see a table matching num_blocks (no double-allocate, no stale
-            # block_table[-1]).
-            for seq in seqs:
-                self.scheduler.block_manager.trim_burst(seq)
-            return self._step_normal(metrics)
-
-        self.scheduler.postprocess_burst(seqs, token_logs)
-        token_timestamp = perf_counter()
-        total_new = 0
-        if metrics is not None:
-            metrics.record_step(
-                seqs,
-                False,
-                model_duration,
-                self.model_runner.last_backend_used,
-                self.model_runner.last_fallback_reason,
-                cuda_timer=cuda_timer,
-            )
-            for seq in seqs:
-                new_tokens = (
-                    len(seq.completion_token_ids) - before_completion[seq.seq_id]
-                )
-                total_new += max(0, new_tokens)
-                for _ in range(max(0, new_tokens)):
-                    metrics.record_token(seq.seq_id, token_timestamp)
-        else:
-            for seq in seqs:
-                new_tokens = (
-                    len(seq.completion_token_ids) - before_completion[seq.seq_id]
-                )
-                total_new += max(0, new_tokens)
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids)
-            for seq in seqs
-            if seq.is_finished
-        ]
-        if total_new == 0:
-            # A burst that appended nothing would spin the caller's
-            # ``while not is_finished()`` loop forever: no sequence finished,
-            # no token was produced, and _should_burst() would stay true.  This
-            # happens when the launch aborts (all rows come back -1) rather
-            # than raising.  postprocess_burst has already trimmed the burst
-            # allocations, so rerun this step through the step-wise path and
-            # stop using burst for this engine.
-            self._burst_disabled = True
-            warnings.warn(
-                "Megakernel burst produced no tokens; disabling the burst path "
-                "and falling back to the step-wise schedule for this engine.",
-                RuntimeWarning,
-            )
-            return self._step_normal(metrics)
-        return outputs, -total_new
-
     def _step_normal(self, metrics: MetricsCollector | None):
         """Execute one normal (step-wise) schedule/run/postprocess cycle."""
         seqs, is_prefill = self.scheduler.schedule()
@@ -261,8 +127,6 @@ class LLMEngine:
         return outputs, num_tokens
 
     def step(self, metrics: MetricsCollector | None = None):
-        if self._should_burst():
-            return self._step_burst(metrics)
         return self._step_normal(metrics)
 
     def is_finished(self):

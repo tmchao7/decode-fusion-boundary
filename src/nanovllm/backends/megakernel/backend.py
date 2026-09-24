@@ -1,22 +1,11 @@
-"""Optional Qwen3 Megakernel decode backend.
+"""Optional Qwen3 task-graph Megakernel decode backend.
 
 The CUDA extension is imported lazily so the regular nano-vLLM backend remains
 usable on machines without CUDA, and so importing the package never triggers a
-CUDA build. The initial paged implementation supports Qwen3-0.6B greedy decode
-with a conservative batch limit; callers should use :meth:`compatibility`
-before invoking :meth:`decode` or :meth:`decode_batch`.
-
-Two decode kernels live behind this class, selected by
-``config.decode_backend``:
-
-* ``"megakernel"`` — the frozen ``kernel.cu`` persistent/WMMA path. batch=1
-  wins by removing host launch overhead; batch>1 is bounded by the cooperative
-  grid partitioning (``LDG_ATTN_BLOCKS``) and defaults to the torch fallback
-  (docs/07).
-* ``"megakernel-tg"`` — the persistent task-graph kernel
-  (``csrc/taskgraph_kernel.cu``, docs/11-13). One whole-batch cooperative
-  launch, so no per-sequence grid ceiling; the batch limit is the compile-time
-  ``TG_MAX_BATCH`` (8). See :mod:`nanovllm.backends.megakernel.taskgraph`.
+CUDA build. The mainline backend is the persistent task-graph kernel in
+``csrc/taskgraph_kernel.cu``. It supports Qwen3-0.6B greedy decode with a
+compile-time batch ceiling; callers should use :meth:`compatibility` before
+invoking :meth:`decode` or :meth:`decode_batch`.
 """
 
 from dataclasses import dataclass
@@ -26,10 +15,10 @@ from nanovllm.backends.megakernel.taskgraph import taskgraph_compatibility
 
 
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
-MAX_BATCH_SIZE = 32
+MAX_BATCH_SIZE = 8
 
-# decode_backend values that this class serves.
-MEGAKERNEL_BACKENDS = ("megakernel", "megakernel-tg")
+# The public Megakernel name intentionally maps to one implementation only.
+MEGAKERNEL_BACKENDS = ("megakernel",)
 
 
 def is_megakernel_backend(value: Any) -> bool:
@@ -38,23 +27,10 @@ def is_megakernel_backend(value: Any) -> bool:
     return value in MEGAKERNEL_BACKENDS
 
 
-def supports_no_sync_burst(value: Any) -> bool:
-    """Whether ``value`` selects a decode backend with a no-sync burst path.
 
-    Only the frozen ``kernel.cu`` path qualifies: its persistent kernel loops
-    ``max_steps`` decode steps on device with a device-side EOS flag. The
-    task-graph kernel decodes exactly one step per cooperative launch
-    (docs/11 §10.5), so it has no burst.
-    """
-
-    return value == "megakernel"
-
-
-# Fixed-shape contract baked into the fused CUDA kernel (kernel.cu). This is
-# the single Python-side source of truth for what the kernel was compiled for;
-# compatibility() guards that the loaded nano-vLLM model matches it. If these
-# ever change, kernel.cu's constexpr block (HIDDEN_SIZE, NUM_*_HEADS, HEAD_DIM,
-# NUM_LAYERS at the launch site, LDG_VOCAB_SIZE) must change in lockstep.
+# Fixed-shape contract baked into the fused task-graph CUDA kernel. This is the
+# Python-side source of truth for what the active backend was compiled for;
+# compatibility() guards that the loaded nano-vLLM model matches it.
 QWEN3_CONTRACT = {
     "model_type": "qwen3",
     "hidden_size": 1024,
@@ -92,38 +68,6 @@ def qwen3_contract_mismatch(config) -> str | None:
             return name
     return None
 
-
-def wmma_batch_limit(default: int = MAX_BATCH_SIZE) -> int:
-    """Real batch limit of the WMMA batch kernel, or ``default`` if unknown.
-
-    ``MAX_BATCH_SIZE`` is the *compile-time* ceiling (``-DLDG_MAX_BATCH``) and
-    the binding's ``TORCH_CHECK`` accepts 1-32, but the kernel partitions its
-    resident cooperative grid across sequences and aborts the launch unless each
-    sequence gets ``LDG_ATTN_BLOCKS`` blocks.  With the default 80-block grid
-    and ``LDG_ATTN_BLOCKS=8`` that is batch <= 10.  Querying the kernel keeps
-    this guard in sync with the real occupancy instead of hard-coding 10.
-
-    The scalar batch kernel shares the same grid-partitioning constraint, so
-    this limit is used as a conservative bound for both paths (WMMA is more
-    register-heavy, so its occupancy is at most the scalar kernel's).
-
-    Returns ``default`` when the extension or CUDA is unavailable, which keeps
-    the compatibility check usable on the CPU-only test path; the binding still
-    rejects an unsupported batch with a clear error at execution time.
-    """
-
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return default
-        from .build import get_extension
-
-        extension = get_extension()
-        limit = int(extension.wmma_max_supported_batch())
-    except Exception:
-        return default
-    return limit if 0 < limit <= default else default
 
 
 @dataclass(frozen=True)
@@ -164,89 +108,6 @@ class MegakernelBackend:
 
     @staticmethod
     def compatibility(config, seqs, is_prefill: bool) -> Compatibility:
-        if _get_attr(config, "decode_backend") == "megakernel-tg":
-            return MegakernelBackend._taskgraph_compatibility(
-                config, seqs, is_prefill
-            )
-        if is_prefill:
-            return Compatibility(False, "Megakernel is decode-only; use the prefill backend")
-        max_batch_size = min(
-            _get_attr(config, "max_num_seqs", MAX_BATCH_SIZE), MAX_BATCH_SIZE
-        )
-        if not 1 <= len(seqs) <= max_batch_size:
-            return Compatibility(
-                False,
-                f"Megakernel v1 supports batch sizes from 1 to {max_batch_size}",
-            )
-        # Both the scalar and WMMA batch kernels partition the cooperative
-        # grid per sequence and need LDG_ATTN_BLOCKS blocks each, so they
-        # support far fewer sequences than MAX_BATCH_SIZE.  The WMMA limit is
-        # a conservative bound for the scalar kernel too (WMMA is more
-        # register-heavy, so its occupancy is at most the scalar kernel's).
-        # Reject here so the batch falls back to torch-cudagraph with a clear
-        # reason instead of the launch aborting and the caller reading the
-        # previous step's tokens.
-        #
-        # Query the limit only when the batch could exceed it.  The limit is
-        # >= 1 for any launchable grid, so batch=1 always fits and the check is
-        # vacuous there; meanwhile wmma_batch_limit() issues CUDA driver calls
-        # (cudaGetDeviceProperties + cudaOccupancyMaxActiveBlocksPerMultiprocessor)
-        # and compatibility() runs on every decode step.  Batch=1 is the path
-        # that wins by removing per-step host work, so an unconditional query
-        # would tax exactly the path this project optimized.
-        if len(seqs) > 1:
-            batch_limit = min(max_batch_size, wmma_batch_limit(max_batch_size))
-            if len(seqs) > batch_limit:
-                return Compatibility(
-                    False,
-                    f"Megakernel batch decode supports at most {batch_limit} "
-                    "sequences (grid partitioned per sequence with "
-                    "LDG_ATTN_BLOCKS=8 per sequence); use torch-cudagraph for "
-                    "larger batches",
-                )
-        if _get_attr(config, "tensor_parallel_size", 1) != 1:
-            return Compatibility(False, "Megakernel v1 requires tensor_parallel_size=1")
-
-        for seq in seqs:
-            if bool(_get_attr(seq, "is_greedy", False)):
-                continue
-            temperature = _get_attr(seq, "temperature", None)
-            if temperature is None or temperature > 1e-10:
-                return Compatibility(False, "Megakernel v1 supports greedy sampling only")
-
-        # Hybrid architecture (docs/07 §9.6): megakernel wins batch=1 by
-        # eliminating host launch overhead, but loses batch>=2 because the
-        # fixed cooperative grid cannot saturate SMs for batched GEMMs
-        # (§2/§3.5). Default: batch>1 falls back to cudagraph. Set
-        # megakernel_batch_decode=True to force the megakernel batch path
-        # (used by correctness research tools).
-        if len(seqs) > 1 and not _get_attr(config, "megakernel_batch_decode", False):
-            return Compatibility(
-                False,
-                "batch>1 falls back to the torch path unless "
-                "megakernel_batch_decode is set. In this engine that fallback "
-                "is eager (decode_backend='megakernel' disables CUDA-graph "
-                "capture); the A/B comparison runs torch-cudagraph in a "
-                "separate engine. Set megakernel_batch_decode=True to force "
-                "the megakernel batch kernel.",
-            )
-
-        mismatch = qwen3_contract_mismatch(config)
-        if mismatch is not None:
-            return Compatibility(False, f"unsupported Qwen config: {mismatch}")
-        return Compatibility(True)
-
-    @staticmethod
-    def _taskgraph_compatibility(config, seqs, is_prefill: bool) -> Compatibility:
-        """Bridge the torch-free task-graph policy to :class:`Compatibility`.
-
-        The task-graph path is a whole-batch cooperative launch, so it has no
-        ``LDG_ATTN_BLOCKS`` grid-partition ceiling and no
-        ``megakernel_batch_decode`` opt-in: batch 1..``TG_MAX_BATCH`` is the
-        supported range by construction. The Qwen3 shape contract is shared with
-        the frozen path (both kernels are compiled for the same model).
-        """
-
         decision = taskgraph_compatibility(config, seqs, is_prefill)
         if not decision.supported:
             return Compatibility(False, decision.reason)
@@ -348,116 +209,26 @@ class MegakernelBackend:
         from .build import get_extension
 
         get_extension()
-        from .model import Decoder, weights_from_nano_model
+        from .taskgraph import TaskGraphDecoder
+        from .weights import weights_from_nano_model
 
         weights = weights_from_nano_model(self.model, self.config.hf_config)
-        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
-            from .taskgraph import TaskGraphDecoder
-
-            self.decoder = TaskGraphDecoder(
-                weights,
-                k_cache=self.kv_cache[0],
-                v_cache=self.kv_cache[1],
-                block_size=self.config.kvcache_block_size,
-                num_cache_blocks=self.kv_cache.shape[2],
-                max_model_len=_get_attr(self.config, "max_model_len", 2048),
-                attn_splits=int(
-                    _get_attr(self.config, "megakernel_tg_attn_splits", 1)
-                ),
-                verbose=bool(_get_attr(self.config, "megakernel_tg_verbose", False)),
-            )
-            return
-        self.decoder = Decoder(
-            weights=weights,
-            tokenizer=None,
-            verbose=False,
+        self.decoder = TaskGraphDecoder(
+            weights,
             k_cache=self.kv_cache[0],
             v_cache=self.kv_cache[1],
             block_size=self.config.kvcache_block_size,
             num_cache_blocks=self.kv_cache.shape[2],
-            max_batch_size=min(
-                _get_attr(self.config, "max_num_seqs", 1), MAX_BATCH_SIZE
-            ),
+            max_model_len=_get_attr(self.config, "max_model_len", 2048),
+            attn_splits=int(_get_attr(self.config, "megakernel_attn_splits", 1)),
+            verbose=bool(_get_attr(self.config, "megakernel_verbose", False)),
         )
 
     def decode_batch(self, input_ids, positions, block_tables) -> list[int]:
-        """Decode one token for each scheduler-selected sequence.
-
-        The task-graph decoder has a single whole-batch entry point; the frozen
-        decoder selects between the WMMA tensor-core batch kernel
-        (``config.megakernel_batch_kernel == "wmma"``) and the scalar one.
-        """
+        """Decode one token for each scheduler-selected sequence."""
 
         self._ensure_decoder()
-        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
-            return self.decoder.decode_rows(input_ids, positions, block_tables)
-        if (
-            getattr(self.config, "megakernel_batch_kernel", "scalar") == "wmma"
-        ):
-            return self.decoder.decode_paged_batch_wmma(
-                input_ids, positions, block_tables
-            )
-        return self.decoder.step_batch(input_ids, positions, block_tables)
-
-    def generate_paged_batch(
-        self, seqs, block_tables, max_steps: int, eos_token: int
-    ) -> list[list[int]]:
-        """Run a no-sync burst for a batch of sequences.
-
-        ``block_tables`` is a device int32 tensor built by
-        ``ModelRunner.prepare_block_tables``. Returns the raw ``[batch][max_steps]``
-        token log (entries past per-seq EOS are -1). The caller (scheduler
-        ``postprocess_burst``) handles EOS / max_tokens truncation.
-
-        Hybrid dispatch: batch=1 uses the persistent single-seq kernel
-        (faster — no WMMA tile padding), batch>1 uses the WMMA batch kernel.
-
-        The task-graph path has no no-sync burst: its persistent kernel runs
-        exactly one decode step per cooperative launch (docs/11 §10.5), so the
-        scheduler's burst path must stay on ``decode_backend="megakernel"``.
-        """
-
-        if _get_attr(self.config, "decode_backend") == "megakernel-tg":
-            raise NotImplementedError(
-                "decode_backend='megakernel-tg' has no no-sync burst path; its "
-                "kernel decodes exactly one step per launch. Use "
-                "decode_backend='megakernel' for the burst comparison."
-            )
-        self._ensure_decoder()
-        import torch
-
-        batch_size = len(seqs)
-        if batch_size == 1:
-            # Persistent single-seq kernel: extract the 1D block table and
-            # call generate_paged with device-side EOS.
-            seq = seqs[0]
-            block_table_1d = block_tables[0][: len(seq.block_table)]
-            raw = self.decoder.generate_paged(
-                seq.last_token,
-                len(seq) - 1,
-                block_table_1d,
-                max_steps,
-                eos_token,
-            )
-            return [raw]
-
-        input_ids = torch.tensor(
-            [seq.last_token for seq in seqs],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        positions = torch.tensor(
-            [len(seq) - 1 for seq in seqs],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        return self.decoder.generate_paged_batch(
-            input_ids,
-            positions,
-            block_tables,
-            max_steps,
-            eos_token,
-        )
+        return self.decoder.decode_rows(input_ids, positions, block_tables)
 
     def decode(self, seq, block_table) -> list[int]:
         """Decode one token and return a one-element Python token-id list.
@@ -469,9 +240,12 @@ class MegakernelBackend:
         """
 
         self._ensure_decoder()
-        token_id = self.decoder.step(
-            seq.last_token,
-            position=len(seq) - 1,
-            block_table=block_table,
-        )
-        return [int(token_id)]
+        return [
+            int(
+                self.decoder.step(
+                    seq.last_token,
+                    position=len(seq) - 1,
+                    block_table=block_table,
+                )
+            )
+        ]

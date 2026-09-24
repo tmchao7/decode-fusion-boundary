@@ -33,7 +33,7 @@ class CorrectnessSmokeProcessTests(unittest.TestCase):
 class ClassifyComparisonTests(unittest.TestCase):
     """Tests for the PASS / CASCADE / FAIL classification.
 
-    Mirrors the logic in ``correctness_wmma_vs_scalar.py``: token 0 is the
+    Exercises the mainline Megakernel correctness classification: token 0 is the
     prefill output and must always match; divergences at decode tokens
     (>= 1) are the documented ~1-ulp cascade and are tolerated.
     """

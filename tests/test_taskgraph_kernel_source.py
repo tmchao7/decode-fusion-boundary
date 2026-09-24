@@ -14,15 +14,15 @@ class TaskGraphKernelSourceTests(unittest.TestCase):
         self.assertIn("tg_decode_kernel", kernel)
         self.assertIn("cudaLaunchCooperativeKernel", kernel)
         self.assertIn("TG_MAX_BATCH", kernel)
-        self.assertIn('ops.def("tg_decode_step"', bindings)
+        self.assertIn('"tg_decode_step(', bindings)
         self.assertIn('ops.impl("tg_decode_step"', bindings)
 
     def test_active_backend_has_no_legacy_kernel_source(self):
         self.assertFalse(
             (ROOT / "src/nanovllm/backends/megakernel/csrc/kernel.cu").exists()
         )
-        self.assertFalse(
-            (ROOT / "src/nanovllm/backends/megakernel/model.py").exists()
+        self.assertTrue(
+            (ROOT / "src/nanovllm/backends/megakernel/weights.py").exists()
         )
 
 

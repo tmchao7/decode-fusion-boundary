@@ -11,9 +11,7 @@ from nanovllm.config import Config
 from nanovllm.backends.megakernel import MegakernelBackend
 from nanovllm.backends.megakernel.backend import (
     is_megakernel_backend,
-    supports_no_sync_burst,
 )
-from nanovllm.engine.burst_policy import burst_eos_token
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -357,10 +355,7 @@ class ModelRunner:
                         stacklevel=2,
                     )
                 else:
-                    # Report the concrete path so the benchmark can attribute
-                    # rows: "megakernel" (frozen kernel.cu) or "megakernel-tg"
-                    # (task-graph). compare.py keys its correctness/fallback
-                    # gates off the ``megakernel`` prefix.
+                    # Report the concrete active backend for benchmark attribution.
                     self.last_backend_used = self.config.decode_backend
                     return token_ids
                 finally:
@@ -373,68 +368,6 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
-
-    def run_burst(
-        self, seqs: list[Sequence], max_steps: int
-    ) -> list[list[int]]:
-        """Run a no-sync megakernel burst for a batch of decode sequences.
-
-        The scheduler has already pre-allocated burst blocks (R4) so the block
-        table is fixed for the whole span. Returns ``[seq][max_steps]`` raw
-        token log; the scheduler ``postprocess_burst`` truncates at EOS /
-        max_tokens.
-
-        When every selected sequence ignores EOS, pass the -1 sentinel so the
-        device-side update never deactivates and the burst runs the full
-        ``max_steps``. ``_should_burst`` only selects such a batch when *all*
-        sequences ignore EOS, so a single batch-wide flag is sufficient.
-        """
-        self.last_backend_used = "torch"
-        self.last_fallback_reason = None
-        if not supports_no_sync_burst(self.config.decode_backend):
-            # Only the frozen kernel.cu path has a no-sync burst; the task-graph
-            # kernel decodes exactly one step per cooperative launch. Return the
-            # "failed before the kernel ran" sentinel so _step_burst falls back
-            # to the step-wise schedule instead of poisoning CUDA (the except
-            # block below would misread this as a mid-kernel fault).
-            self.last_fallback_reason = (
-                f"decode_backend={self.config.decode_backend!r} has no no-sync "
-                "burst; use the step-wise schedule"
-            )
-            return None
-        eos_token = burst_eos_token(self.config, seqs)
-        try:
-            with nvtx_range("megakernel_burst"):
-                block_tables = self.prepare_block_tables(seqs)
-                token_logs = self.megakernel.generate_paged_batch(
-                    seqs,
-                    block_tables,
-                    max_steps,
-                    eos_token,
-                )
-        except Exception as exc:
-            # The kernel has already started (and may have written to the
-            # shared paged cache), so a silent fallback would corrupt state.
-            if self.megakernel.decoder is not None:
-                self._cuda_poisoned = True
-                raise RuntimeError(
-                    "Megakernel burst failed after initialization: "
-                    f"{exc}; restart with decode_backend=\"torch\""
-                ) from exc
-            self.megakernel.disable(str(exc))
-            self.last_fallback_reason = str(exc)
-            warnings.warn(
-                "Megakernel burst unavailable; falling back to step-wise: "
-                f"{exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return None
-        else:
-            self.last_backend_used = "megakernel"
-            return token_logs
-        finally:
-            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):

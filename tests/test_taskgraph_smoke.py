@@ -5,7 +5,7 @@ produces an output token without crashing or hanging. Uses the actual
 Qwen3-0.6B model weights for a meaningful forward pass.
 
 Phase 1 goal: the task-graph kernel produces the same next-token logits as
-the frozen batch=1 kernel.cu path (or close to it, allowing for minor
+the exact PyTorch reference (or close to it, allowing for minor
 numerical differences from the different compute ordering).
 """
 
@@ -54,11 +54,11 @@ def _resolve_model_path() -> str:
     return "Qwen/Qwen3-0.6B"
 
 
-# Load the extension FIRST — model.py accesses torch.ops at import time
+# Load the extension FIRST — weights.py provides task-graph weight helpers
 from nanovllm.backends.megakernel.build import get_extension
 get_extension()
 
-from nanovllm.backends.megakernel.model import (
+from nanovllm.backends.megakernel.weights import (
     load_weights, _pack_layer_weights, _rope_tables,
     NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
     NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE,
@@ -114,7 +114,7 @@ class TaskGraphSmokeTests(unittest.TestCase):
         s["inst_buf"] = torch.tensor(self.sched.flat_inst_buf, dtype=torch.uint32).cuda().view(torch.int32)
         s["num_inst_per_sm"] = torch.tensor(self.sched.num_inst_per_sm, dtype=torch.int32).cuda()
 
-        # Scratch (float intermediates matching kernel.cu)
+        # Scratch (float intermediates matching the task-graph kernel)
         # GEMM output buffers are padded to 16 rows (TG_WMMA_TILE) because
         # wmma::store_matrix_sync always writes a full 16x16 tile even when
         # M=BS<16.  Non-GEMM buffers keep BS rows.

@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from nanovllm.backends.megakernel.build import get_extension
 get_extension()
 
-from nanovllm.backends.megakernel.model import (
+from nanovllm.backends.megakernel.weights import (
     load_weights, _pack_layer_weights, _rope_tables,
     NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
     NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE, MAX_SEQ_LEN,
@@ -60,7 +60,7 @@ def _resolve_model_path() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Full PyTorch reference (matches kernel.cu / TG kernel computation order)
+# Full PyTorch reference (matches the task-graph kernel computation order)
 # ---------------------------------------------------------------------------
 
 def pytorch_full_reference(layer_weights, embed_weight, final_norm_weight,

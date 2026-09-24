@@ -119,7 +119,7 @@ class RopeWiringTests(unittest.TestCase):
             / "nanovllm"
             / "backends"
             / "megakernel"
-            / "model.py"
+            / "weights.py"
         ).read_text(encoding="utf-8")
         self.assertIn("resolve_rope_theta", text)
         self.assertIn("assert_supported_rope_type", text)

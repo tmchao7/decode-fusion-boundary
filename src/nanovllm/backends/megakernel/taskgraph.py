@@ -1,9 +1,7 @@
-"""Task-graph megakernel decode backend (``decode_backend="megakernel-tg"``).
+"""Task-graph Megakernel decode backend (``decode_backend="megakernel"``).
 
-Wraps the persistent task-graph kernel (``csrc/taskgraph_kernel.cu``) behind the
-same ``decode`` / ``decode_batch`` interface the frozen ``kernel.cu`` decoder
-exposes, so :class:`MegakernelBackend` can dispatch to either path and
-``benchmarks/compare.py`` can A/B them in separate engines.
+Wraps the persistent task-graph kernel (``csrc/taskgraph_kernel.cu``) behind
+the engine's one-step decode interface.
 
 Differences from the frozen path that matter for integration (docs/13 §2):
 
@@ -19,8 +17,7 @@ Differences from the frozen path that matter for integration (docs/13 §2):
   ``tools/bench_taskgraph.py`` / ``tools/generate_taskgraph.py``).
 
 This module deliberately imports ``torch`` lazily so the pure compatibility
-policy below stays unit-testable on a CUDA-less checkout (the same reason
-``engine/burst_policy.py`` exists).
+policy below stays unit-testable on a CUDA-less checkout.
 """
 
 from __future__ import annotations
@@ -159,7 +156,7 @@ class TaskGraphDecoder:
         import torch
 
         from nanovllm.backends.megakernel import schedule as tg_schedule
-        from nanovllm.backends.megakernel.model import _pack_layer_weights
+        from nanovllm.backends.megakernel.weights import _pack_layer_weights
 
         self._torch = torch
         self._tg_schedule = tg_schedule
@@ -407,7 +404,7 @@ class TaskGraphDecoder:
             self.decode_rows(self._row_input, self._row_pos, self._row_table)[0]
         )
 
-    # -- frozen-Decoder-compatible aliases --------------------------------
+# -- one-step decoder interface ----------------------------------------
     # ``MegakernelBackend.decode``/``decode_batch`` call these names, so the
     # task-graph decoder can be swapped in without branching at every call.
 

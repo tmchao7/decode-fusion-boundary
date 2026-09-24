@@ -1,6 +1,7 @@
-"""JIT compilation of the Qwen Megakernel CUDA extension."""
+"""JIT compilation of the Qwen task-graph Megakernel CUDA extension."""
 
 import os
+
 from torch.utils.cpp_extension import load
 
 _module = None
@@ -15,14 +16,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def cuda_arch_for_device() -> str:
-    """Resolve the target architecture on the CUDA host.
-
-    ``NANOVLLM_CUDA_ARCH`` is useful on build/login nodes where the visible
-    device is not the eventual execution device. Otherwise use the current
-    CUDA device capability. A100 is the primary target; V100 is a best-effort
-    build target while the runtime adapter remains conservative and gates
-    execution based on precision support.
-    """
+    """Resolve the target architecture on the CUDA host."""
 
     override = os.getenv("NANOVLLM_CUDA_ARCH")
     if override:
@@ -45,58 +39,11 @@ def cuda_arch_for_device() -> str:
     return arch
 
 
-def kernel_flags() -> list[str]:
-    """Return tunable kernel flags for the selected GPU family."""
-
-    return [
-        f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 80)}",
-        f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
-        f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
-        f"-DLDG_LM_BLOCK_SIZE={_env_int('LDG_LM_BLOCK_SIZE', 384)}",
-        f"-DLDG_LM_ROWS_PER_WARP={_env_int('LDG_LM_ROWS_PER_WARP', 2)}",
-        f"-DLDG_ATTN_BLOCKS={_env_int('LDG_ATTN_BLOCKS', 8)}",
-        f"-DLDG_PREFETCH_QK={_env_int('LDG_PREFETCH_QK', 0)}",
-        f"-DLDG_PREFETCH_THREAD_STRIDE={_env_int('LDG_PREFETCH_THREAD_STRIDE', 10)}",
-        f"-DLDG_PREFETCH_DOWN={_env_int('LDG_PREFETCH_DOWN', 1)}",
-        f"-DLDG_PREFETCH_ELEM_STRIDE={_env_int('LDG_PREFETCH_ELEM_STRIDE', 1)}",
-        f"-DLDG_PREFETCH_BLOCK_STRIDE={_env_int('LDG_PREFETCH_BLOCK_STRIDE', 1)}",
-        f"-DLDG_PREFETCH_GATE={_env_int('LDG_PREFETCH_GATE', 1)}",
-        f"-DLDG_PREFETCH_UP={_env_int('LDG_PREFETCH_UP', 1)}",
-        "-DLDG_MAX_BATCH=32",
-        "-DLDG_USE_UINT4",
-        "-DLDG_ATTENTION_VEC4",
-        "-DLDG_WEIGHT_LDCS",
-        "-DLDG_MLP_SMEM",
-        *(["-DLDG_FAST_MATH"] if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1" else []),
-    ]
-
-
-def cuda_flags() -> list[str]:
-    flags = [
-        "-O3",
-        "-std=c++17",
-        "--expt-relaxed-constexpr",
-        f"-arch={cuda_arch_for_device()}",
-        f"-I{_CSRC}",
-    ]
-    # Correctness builds use IEEE-oriented libdevice math by default. The
-    # approximate path remains opt-in for later performance experiments.
-    if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1":
-        flags.append("--use_fast_math")
-    # Compute Sanitizer needs line mappings to identify the exact CUDA source
-    # line for an invalid access.
-    if os.getenv("NANOVLLM_CUDA_SANITIZE") == "1":
-        flags.append("-lineinfo")
-    return flags + kernel_flags()
-
-
 def taskgraph_kernel_flags() -> list[str]:
-    """Flags for the task-graph kernel (see docs/11 §5.2).
+    """Flags for the task-graph kernel.
 
-    Independent from the frozen batch=1 kernel's ``kernel_flags()`` so the two
-    paths can be tuned separately. The ``#ifndef`` fallbacks in
-    ``taskgraph_kernel.cu`` MUST equal these defaults; ``test_taskgraph_abi.py``
-    enforces the equality (same pattern as ``test_batch_launch_guards.py``).
+    The ``#ifndef`` fallbacks in ``taskgraph_kernel.cu`` must equal these
+    defaults; ``tests/test_taskgraph_abi.py`` enforces that synchronization.
     """
 
     return [
@@ -108,8 +55,24 @@ def taskgraph_kernel_flags() -> list[str]:
     ]
 
 
+def cuda_flags() -> list[str]:
+    flags = [
+        "-O3",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        f"-arch={cuda_arch_for_device()}",
+        f"-I{_CSRC}",
+    ]
+    if os.getenv("NANOVLLM_CUDA_FAST_MATH") == "1":
+        flags.append("--use_fast_math")
+    if os.getenv("NANOVLLM_CUDA_SANITIZE") == "1":
+        flags.append("-lineinfo")
+    return flags + taskgraph_kernel_flags()
+
+
 def get_extension():
-    """Build (or return cached) the CUDA extension."""
+    """Build (or return cached) the task-graph CUDA extension."""
+
     global _module
     if _module is not None:
         return _module
@@ -118,10 +81,9 @@ def get_extension():
         name="nanovllm_megakernel_C",
         sources=[
             os.path.join(_CSRC, "torch_bindings.cpp"),
-            os.path.join(_CSRC, "kernel.cu"),
             os.path.join(_CSRC, "taskgraph_kernel.cu"),
         ],
-        extra_cuda_cflags=cuda_flags() + taskgraph_kernel_flags(),
+        extra_cuda_cflags=cuda_flags(),
         extra_cflags=[f"-I{_CSRC}"],
         verbose=False,
     )

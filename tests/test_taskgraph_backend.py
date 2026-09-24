@@ -111,28 +111,14 @@ class TaskGraphPolicyTests(unittest.TestCase):
             taskgraph_compatibility(config, [], is_prefill=False).supported
         )
 
-    def test_does_not_require_the_batch_decode_opt_in(self):
-        """The task-graph kernel is a whole-batch cooperative launch, so unlike
-        the frozen WMMA path there is no per-sequence grid-partition ceiling and
-        no ``megakernel_batch_decode`` switch to set. Leaving the flag at its
-        default (False) must still admit a batch."""
+    def test_does_not_require_a_legacy_batch_decode_opt_in(self):
+        """The public Megakernel is task-graph and accepts whole batches."""
 
-        config = make_config(megakernel_batch_decode=False, max_num_seqs=8)
+        config = make_config(max_num_seqs=8)
         decision = taskgraph_compatibility(
             config, [greedy_seq()] * 4, is_prefill=False
         )
         self.assertTrue(decision.supported, decision.reason)
-        # And the frozen path, with the same flag, still refuses.
-        frozen = make_config(
-            decode_backend="megakernel",
-            megakernel_batch_decode=False,
-            max_num_seqs=8,
-        )
-        self.assertFalse(
-            MegakernelBackend.compatibility(
-                frozen, [greedy_seq()] * 4, is_prefill=False
-            ).supported
-        )
 
     def test_batch_limit_is_the_documented_constant(self):
         self.assertEqual(TG_MAX_BATCH, 8)
@@ -157,9 +143,9 @@ class BackendDispatchTests(unittest.TestCase):
         self.assertFalse(decision.supported)
         self.assertIn("unsupported Qwen config", decision.reason)
 
-    def test_is_megakernel_backend_covers_both_paths_only(self):
+    def test_is_megakernel_backend_covers_only_the_mainline_path(self):
         self.assertTrue(is_megakernel_backend("megakernel"))
-        self.assertTrue(is_megakernel_backend("megakernel-tg"))
+        self.assertFalse(is_megakernel_backend("megakernel-tg"))
         self.assertFalse(is_megakernel_backend("torch"))
         self.assertFalse(is_megakernel_backend(None))
 
@@ -195,7 +181,6 @@ class DecoderConstructionTests(unittest.TestCase):
             REPO_ROOT / "src" / "nanovllm" / "backends" / "megakernel" / "backend.py"
         ).read_text(encoding="utf-8")
         self.assertNotIn('== "megakernel-tg"', source)
-        self.assertIn('decode_backend == "megakernel"', source)
         self.assertIn("TaskGraphDecoder", source)
 
 

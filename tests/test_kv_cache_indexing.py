@@ -58,7 +58,7 @@ def ldg_kv_ptr_offset(
     num_kv_heads: int = 8,
     head_dim: int = 128,
 ) -> int:
-    """Python mirror of ``ldg_kv_ptr`` in ``kernel.cu`` (element offset).
+    """Python mirror of ``ldg_kv_ptr`` in the task-graph kernel (element offset).
 
     Kept structurally identical to the CUDA so the arithmetic can be audited on
     a laptop.  ``block_table=None`` selects the contiguous (non-paged) path.

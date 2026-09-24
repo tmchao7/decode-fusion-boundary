@@ -92,14 +92,14 @@ class AbiSyncTests(unittest.TestCase):
         assert m is not None
         count = int(m.group(1) or m.group(2))
         self.assertEqual(count, 11)
-        # Cross-check against kernel.cu's LDGLayerWeights struct field count.
+        # Cross-check against the task-graph weight ABI struct field count.
         kernel = read(TG_KERNEL_CU)
         # The struct has 11 const __nv_bfloat16* fields (one per weight).
         struct_match = re.search(
             r"struct LDGLayerWeights \{(.*?)\};", kernel, re.DOTALL
         )
         # taskgraph_kernel.cu doesn't define LDGLayerWeights (it's in kernel.cu),
-        # so we check the model.py packing order instead. The 11-weight order is
+        # so we check the weights.py packing order instead. The 11-weight order is
         # locked by weights_from_nano_model; we just verify the enum count here.
 
     def test_launch_desc_has_no_holes_in_documented_sections(self) -> None:

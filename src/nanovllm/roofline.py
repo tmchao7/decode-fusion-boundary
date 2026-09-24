@@ -19,8 +19,9 @@ side: both are bounded by the same HBM bandwidth, and the only recoverable cost
 is the per-step host overhead.
 
 Everything here is pure Python (no torch, no CUDA) so it can be unit tested on
-a laptop.  The model dimensions are checked against ``kernel.cu`` at import
-time of :func:`assert_kernel_constants` so the two cannot silently drift.
+a laptop.  The model dimensions are checked against the task-graph CUDA source
+by :func:`assert_kernel_constants` so the analytical model cannot silently
+drift from the active backend.
 """
 
 from __future__ import annotations
@@ -39,13 +40,13 @@ DEFAULT_KERNEL_SOURCE = (
     / "backends"
     / "megakernel"
     / "csrc"
-    / "kernel.cu"
+    / "taskgraph_kernel.cu"
 )
 
 
 @dataclass(frozen=True)
 class ModelDims:
-    """Qwen3-0.6B dimensions, mirroring the ``kernel.cu`` constants."""
+    """Qwen3-0.6B dimensions, mirroring the task-graph constants."""
 
     hidden_size: int = 1024
     intermediate_size: int = 3072
@@ -127,15 +128,15 @@ class HardwareSpec:
 
 
 def parse_kernel_constants(source: str | Path = DEFAULT_KERNEL_SOURCE) -> dict[str, int]:
-    """Extract the model constants a megakernel build uses from ``kernel.cu``."""
+    """Extract the model constants used by the task-graph kernel."""
 
     text = Path(source).read_text(encoding="utf-8")
     wanted = {
-        "hidden_size": "HIDDEN_SIZE",
-        "intermediate_size": "INTERMEDIATE_SIZE",
-        "num_q_heads": "NUM_Q_HEADS",
-        "num_kv_heads": "NUM_KV_HEADS",
-        "head_dim": "HEAD_DIM",
+        "hidden_size": "TG_HIDDEN",
+        "intermediate_size": "TG_INTERMEDIATE",
+        "num_q_heads": "TG_NUM_Q_HEADS",
+        "num_kv_heads": "TG_NUM_KV_HEADS",
+        "head_dim": "TG_HEAD_DIM",
     }
     found: dict[str, int] = {}
     for field, symbol in wanted.items():
@@ -146,7 +147,7 @@ def parse_kernel_constants(source: str | Path = DEFAULT_KERNEL_SOURCE) -> dict[s
             raise ValueError(f"could not find constant {symbol} in {source}")
         found[field] = int(match.group(1))
     vocab = re.search(
-        r"^constexpr int LDG_VOCAB_SIZE\s*=\s*(\d+)\s*;", text, re.MULTILINE
+        r"^constexpr int TG_VOCAB\s*=\s*(\d+)\s*;", text, re.MULTILINE
     )
     if vocab is None:
         raise ValueError(f"could not find LDG_VOCAB_SIZE in {source}")
@@ -640,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check-kernel",
         action="store_true",
-        help="assert ModelDims still matches kernel.cu constants",
+        help="assert ModelDims still matches taskgraph kernel constants",
     )
     parser.add_argument("--json", dest="json_path")
     args = parser.parse_args(argv)
