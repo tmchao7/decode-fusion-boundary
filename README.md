@@ -26,7 +26,7 @@ archival branch `codex/archive/frozen-kernel`; it is intentionally not part of
 the mainline API, build, scheduler, or benchmark surface. Its numbers are the
 evidence base below and are labelled as such.
 
-**文档入口：[docs/README.md](docs/README.md)** —— 19 个文档按"现行 / 历史证据 /
+**文档入口：[docs/README.md](docs/README.md)** —— 21 份文档按"现行 / 历史证据 /
 研究资料"三态分类，含按目的选最短路径、关键命令、以及现行 vs 归档的对照表。
 
 ## Mainline contract
