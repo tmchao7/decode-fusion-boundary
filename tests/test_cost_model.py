@@ -340,3 +340,37 @@ class PackingConsistencyTests(unittest.TestCase):
             if wave.name == name:
                 return wave.instructions
         raise AssertionError(f"no {name} wave in the structure")
+
+
+class DocumentedNumbersTests(unittest.TestCase):
+    """docs/18 quotes the structure this module computes. Keep them equal.
+
+    The repo has been bitten repeatedly by docs drifting from code (a removed
+    RUN_MODE, renamed tools, stale flags), and the structural numbers here are
+    quoted in docs/14 and docs/18 as the basis for the granularity prediction.
+    """
+
+    DOC = _ROOT / "docs" / "18_成本模型.md"
+
+    def test_the_doc_quotes_the_current_structure(self) -> None:
+        step, _ = structure()
+        doc = self.DOC.read_text(encoding="utf-8")
+
+        for label, value in (
+            ("levels", step.levels),
+            ("K steps", step.k_steps),
+            ("instructions", step.instructions),
+        ):
+            with self.subTest(quantity=label):
+                self.assertIn(
+                    str(value), doc, f"docs/18 no longer quotes {label}={value}"
+                )
+
+    def test_the_doc_quotes_the_calibrated_cost_and_the_falsification_bound(self) -> None:
+        step, _ = structure()
+        doc = self.DOC.read_text(encoding="utf-8")
+        k_step_ns = fit_k_step_ns(step, DOCUMENTED_DEVICE_MS_108SM)
+        prediction = preregistered_granularity_prediction(base_device_ms=1.89)
+
+        self.assertIn(str(round(k_step_ns)), doc)
+        self.assertIn(f"{prediction['worst_case_relative_change']:.1%}", doc)

@@ -77,6 +77,10 @@ def prefill_cache_len(num_cached_tokens: int, num_scheduled_tokens: int) -> int:
     FlashAttention varlen attends over the cached prefix plus this chunk.
     """
 
+    if num_cached_tokens < 0:
+        raise ValueError("num_cached_tokens must be non-negative")
+    if num_scheduled_tokens < 0:
+        raise ValueError("num_scheduled_tokens must be non-negative")
     return num_cached_tokens + num_scheduled_tokens
 
 
@@ -142,6 +146,8 @@ def decode_cache_seqlens(num_tokens: int) -> int:
 def decode_cache_len(num_tokens: int) -> int:
     """KV length after the step: ``position + 1``, including the new token."""
 
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be at least 1; got {num_tokens}")
     return num_tokens
 
 

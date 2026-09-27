@@ -344,3 +344,37 @@ class KernelSideOfTheContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractValidationTests(unittest.TestCase):
+    """Every helper in kv_layout rejects the same illegal inputs.
+
+    These three numbers feed ``cu_seqlens_k``, RoPE and the K/V write; a negative
+    or zero value here is a silent wrong answer rather than a crash, which is why
+    the module validates instead of trusting its callers.
+    """
+
+    def test_prefill_helpers_reject_negative_inputs(self) -> None:
+        for call in (
+            lambda: prefill_positions(-1, 4),
+            lambda: prefill_positions(0, -4),
+            lambda: prefill_cache_len(-1, 4),
+            lambda: prefill_cache_len(0, -4),
+        ):
+            with self.subTest(call=call), self.assertRaises(ValueError):
+                call()
+
+    def test_decode_helpers_reject_a_zero_length_sequence(self) -> None:
+        for call in (
+            lambda: decode_position(0),
+            lambda: decode_cache_seqlens(0),
+            lambda: decode_cache_len(0),
+        ):
+            with self.subTest(call=call), self.assertRaises(ValueError):
+                call()
+
+    def test_slot_mapping_rejects_a_negative_block_size(self) -> None:
+        with self.assertRaises(ValueError):
+            decode_slot_mapping([0], 1, 0)
+        with self.assertRaises(ValueError):
+            prefill_slot_mapping([0], 0, 1, 0)
