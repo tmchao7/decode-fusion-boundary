@@ -108,7 +108,14 @@ Benchmarks and server commands:
 
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/benchmarks/compare.py`
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/tools/bench_taskgraph.py`
+- `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/tools/bench_fusion_granularity.py`
 - `/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/SERVER_COMMANDS.txt`
+
+Fusion granularity (`Config.fusion_groups`) is a first-class experimental
+variable: one decode step can be built as `g` contiguous layer segments launched
+`g` times, so "partial fusion" is measured on the same IR as the single
+megakernel instead of confounding granularity with implementation language. See
+`/Users/tmchao7/repos/02_personal/MegaKernel-vLLM/docs/14_融合粒度实验.md`.
 
 ## Prefill/decode scheduling controls
 

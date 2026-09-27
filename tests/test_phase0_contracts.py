@@ -53,5 +53,24 @@ class MegakernelMetadataContracts(unittest.TestCase):
         self.assertIn("non_blocking=True", text)
 
 
+class FusionGranularityWiringContracts(unittest.TestCase):
+    def test_decoder_launches_one_kernel_per_segment(self):
+        """``fusion_groups`` must not become a dead knob.
+
+        ``decode_rows`` needs torch + CUDA to exercise, so the wiring is
+        asserted textually: the per-segment schedule cache (built from
+        ``schedule.split_layers``) feeds a loop that issues one
+        ``tg_decode_step`` per segment. The schedule-side semantics are
+        behaviourally tested in ``test_taskgraph_abi``.
+        """
+
+        text = source("src/nanovllm/backends/megakernel/taskgraph.py")
+        self.assertIn("split_layers(", text)
+        self.assertIn("for geo in geometries:", text)
+        self.assertIn("self._fusion_groups", text)
+        # One launch per segment: exactly one call site, inside the loop.
+        self.assertEqual(text.count("self._ops.tg_decode_step("), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

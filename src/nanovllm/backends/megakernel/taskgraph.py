@@ -129,8 +129,10 @@ def taskgraph_compatibility(config: Any, seqs: list[Any], is_prefill: bool) -> T
 
 @dataclass
 class _Geometry:
-    """One cached schedule plus the launch metadata the binding needs."""
+    """One cached schedule (one layer segment) plus its launch metadata."""
 
+    segment: int
+    layer_range: tuple[int, int]
     BS: int
     attn_splits: int
     schedule: Any
@@ -151,6 +153,7 @@ class TaskGraphDecoder:
         num_cache_blocks: int,
         max_model_len: int,
         attn_splits: int = 1,
+        fusion_groups: int = 1,
         verbose: bool = False,
     ):
         import torch
@@ -185,6 +188,15 @@ class TaskGraphDecoder:
                 f"attn_splits must be 1..{MAX_ATTN_SPLITS} "
                 f"(o_partial/lse_partial capacity); got {self._attn_splits}"
             )
+        # Fusion granularity. ``fusion_groups == 1`` is the single cooperative
+        # launch per step; each additional group is another launch covering one
+        # contiguous layer segment, sharing the same scratch, bars, page table
+        # and cache_seqlens. ``split_layers`` validates 1..NUM_LAYERS and the
+        # layer-contiguous property that makes the segmentation free (bar slots
+        # are global-layer-indexed; the only cross-segment edge is the
+        # bar_layer handoff, which a launch boundary already satisfies).
+        self._fusion_groups = int(fusion_groups)
+        self._segments = tg_schedule.split_layers(NUM_LAYERS, self._fusion_groups)
         self._verbose = verbose
 
         self._num_sms = resolve_num_sms(
@@ -241,9 +253,10 @@ class TaskGraphDecoder:
             "bar_qkv", "bar_attn", "bar_oproj", "bar_silu",
             "bar_ffn_down", "bar_layer", "bar_combine", "bar_lm_head",
         )
-        self._schedules: dict[tuple[int, int], _Geometry] = {}
-        for bucket_bs in (1, 2, 4, 8):
-            self._build_geometry(bucket_bs, self._attn_splits)
+        self._schedules: dict[tuple[int, int, int], _Geometry] = {}
+        for segment in range(self._fusion_groups):
+            for bucket_bs in (1, 2, 4, 8):
+                self._build_geometry(segment, bucket_bs, self._attn_splits)
 
         # ---- bars: allocate the element-wise max over the cached geometries
         dims = {
@@ -272,24 +285,30 @@ class TaskGraphDecoder:
         if self._verbose:
             print(
                 f"taskgraph decoder: num_sms={self._num_sms} "
-                f"attn_splits={self._attn_splits} max_pages={self._max_pages} "
+                f"attn_splits={self._attn_splits} "
+                f"fusion_groups={self._fusion_groups} "
+                f"segments={self._segments} max_pages={self._max_pages} "
                 f"max_inst={max(g.schedule.max_inst for g in self._schedules.values())}"
             )
 
     # -- schedule cache ----------------------------------------------------
 
-    def _build_geometry(self, batch_size: int, attn_splits: int) -> _Geometry:
+    def _build_geometry(self, segment: int, batch_size: int,
+                        attn_splits: int) -> _Geometry:
         if batch_size < 1 or batch_size > TG_MAX_BATCH:
             raise ValueError(
                 f"task-graph batch must be 1..{TG_MAX_BATCH}; got {batch_size}"
             )
-        key = (batch_size, attn_splits)
+        layer_range = self._segments[segment]
+        key = (segment, batch_size, attn_splits)
         cached = self._schedules.get(key)
         if cached is not None:
             return cached
 
         geo = self._tg_schedule.default_geometry(BS=batch_size, attn_splits=attn_splits)
-        sched = self._tg_schedule.build_schedule(geo, num_sms=self._num_sms)
+        sched = self._tg_schedule.build_schedule(
+            geo, num_sms=self._num_sms, layer_range=layer_range
+        )
         # Bars were allocated from the bucket geometries. Anything wider would
         # index past the allocation and silently corrupt a neighbouring bar.
         for name in self._bar_names:
@@ -298,9 +317,12 @@ class TaskGraphDecoder:
             if allocated is not None and needed > allocated:
                 raise RuntimeError(
                     f"bar {name} needs {needed} slots but only {allocated} were "
-                    f"allocated for BS={batch_size}, attn_splits={attn_splits}"
+                    f"allocated for segment={segment}, BS={batch_size}, "
+                    f"attn_splits={attn_splits}"
                 )
         entry = _Geometry(
+            segment=segment,
+            layer_range=layer_range,
             BS=batch_size,
             attn_splits=attn_splits,
             schedule=sched,
@@ -322,6 +344,12 @@ class TaskGraphDecoder:
         ``input_ids``/``positions`` are 1-D int64 CUDA tensors; ``block_tables``
         is the padded ``[rows, <= max_pages]`` int32 CUDA tensor from
         ``ModelRunner.prepare_block_tables``. Returns one token id per row.
+
+        With ``fusion_groups > 1`` the step is executed as that many
+        back-to-back cooperative launches, one per layer segment. Everything
+        else — the once-per-step zeroing, the staging of the embedding /
+        cache_seqlens / page table, and the single final D2H — is unchanged, so
+        the only measured difference is the launch/segment boundary itself.
         """
 
         import torch
@@ -329,8 +357,10 @@ class TaskGraphDecoder:
         rows = int(input_ids.numel())
         if rows == 0:
             return []
-        geo = self._build_geometry(rows, self._attn_splits)
-        sched = geo.schedule
+        geometries = [
+            self._build_geometry(segment, rows, self._attn_splits)
+            for segment in range(self._fusion_groups)
+        ]
 
         # Zero every scratch buffer and bar counter before the launch. This must
         # happen BEFORE the embedding is staged: x_resid is part of the scratch
@@ -356,19 +386,25 @@ class TaskGraphDecoder:
             )
         self._page_table[:rows, :cols] = block_tables
 
-        self._ops.tg_decode_step(
-            geo.inst_buf, geo.num_inst_per_sm, sched.max_inst, self._num_sms,
-            self._layer_weights_packed, self._embed_weight, self._final_norm_weight,
-            self._cos_table, self._sin_table,
-            self._k_cache, self._v_cache, self._page_table,
-            self._cache_seqlens, self._row_active,
-            self._num_cache_blocks, self._max_pages, self._block_size,
-            self._kv_layer_stride,
-            *self._scratch, *self._bars.values(),
-            NUM_LAYERS, rows, HIDDEN_SIZE, INTERMEDIATE_SIZE,
-            Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
-            HEAD_DIM, VOCAB_SIZE, 1, 1, MAX_ATTN_SPLITS,
-        )
+        # One launch per layer segment, in layer order. Bars are zeroed once
+        # above and the segments use disjoint global-layer-indexed slots, so the
+        # only cross-segment dependency is the bar_layer handoff that the launch
+        # boundary itself satisfies (see schedule.build_schedule).
+        for geo in geometries:
+            self._ops.tg_decode_step(
+                geo.inst_buf, geo.num_inst_per_sm, geo.schedule.max_inst,
+                self._num_sms,
+                self._layer_weights_packed, self._embed_weight, self._final_norm_weight,
+                self._cos_table, self._sin_table,
+                self._k_cache, self._v_cache, self._page_table,
+                self._cache_seqlens, self._row_active,
+                self._num_cache_blocks, self._max_pages, self._block_size,
+                self._kv_layer_stride,
+                *self._scratch, *self._bars.values(),
+                NUM_LAYERS, rows, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
+                HEAD_DIM, VOCAB_SIZE, 1, 1, MAX_ATTN_SPLITS,
+            )
         # One sync for the whole batch. ``.item()`` per row would serialize a
         # D2H per row; the sampled ids are contiguous in the int32 alias.
         return self._lm_logits_i32[:rows, 0].cpu().tolist()

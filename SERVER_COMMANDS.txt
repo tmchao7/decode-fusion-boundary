@@ -9,6 +9,7 @@
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # torch eager/graph/Megakernel A/B
 #   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt       # kernel microbench + ABI tests
 #   RUN_MODE=taskgraph-baseline bash SERVER_COMMANDS.txt  # correctness + A/B + accounting
+#   RUN_MODE=taskgraph-fusion bash SERVER_COMMANDS.txt    # fusion-granularity sweep
 #   RUN_MODE=all bash SERVER_COMMANDS.txt             # build, correctness, benchmark
 #
 # The archived kernel.cu/burst line is intentionally not exposed here. See
@@ -188,6 +189,24 @@ run_taskgraph_baseline() {
     2>&1 | tee results/taskgraph_baseline_breakdown.md
 }
 
+run_taskgraph_fusion() {
+  require_model
+  select_gpu
+  run_build
+  # Same (batch, context) grid as the main table, megakernel arm only, one row
+  # per fusion granularity. FUSION_GROUPS overrides the sweep points.
+  python -m tools.bench_fusion_granularity \
+    --model "$MODEL" \
+    --fusion-groups "${FUSION_GROUPS:-1,2,4,7,14,28}" \
+    --batch-sizes 1,2,4,8 \
+    --prompt-lengths 32,512,1920 \
+    --max-tokens 128 \
+    --warmup 2 \
+    --runs 3 \
+    --json results/fusion_granularity.json \
+    2>&1 | tee results/fusion_granularity.log
+}
+
 case "$RUN_MODE" in
   model) run_model ;;
   verify) run_verify ;;
@@ -196,6 +215,7 @@ case "$RUN_MODE" in
   benchmark) run_benchmark ;;
   taskgraph) run_taskgraph ;;
   taskgraph-baseline) run_taskgraph_baseline ;;
+  taskgraph-fusion) run_taskgraph_fusion ;;
   all) run_build; run_correctness; run_benchmark ;;
   *) echo "Unknown RUN_MODE=$RUN_MODE" >&2; exit 2 ;;
 esac

@@ -42,6 +42,12 @@ class Config:
     # baked into the schedule; 1 is the validated default (docs/12 §3.4 wants
     # vectorization before more splits).
     megakernel_attn_splits: int = 1
+    # Fusion granularity for the task-graph decoder: the step's instruction
+    # stream is built as this many contiguous layer segments and each segment is
+    # one cooperative launch. 1 = the single-megakernel baseline; its upper bound
+    # is the model's layer count, so it is validated where the model is known
+    # (TaskGraphDecoder), not here.
+    fusion_groups: int = 1
     megakernel_verbose: bool = False
     hf_config: Any | None = None
     eos: int = -1
@@ -64,6 +70,10 @@ class Config:
             raise ValueError(
                 "megakernel_attn_splits must be >= 1; got "
                 f"{self.megakernel_attn_splits}"
+            )
+        if self.fusion_groups < 1:
+            raise ValueError(
+                f"fusion_groups must be >= 1; got {self.fusion_groups}"
             )
         if not os.path.isdir(self.model):
             raise ValueError(f"model directory does not exist: {self.model}")

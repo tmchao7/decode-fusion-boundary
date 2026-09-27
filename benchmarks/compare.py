@@ -163,6 +163,12 @@ def run_case(
     runs: int,
     seed: int,
     ignore_eos: bool,
+    # Fusion granularity for the megakernel arm: the step's instruction stream
+    # is built as this many layer segments and launched once per segment.
+    # 1 = the single-megakernel baseline. Keyword-only with a default so the
+    # positional callers (and run_case_safe's index-based error reporting) are
+    # unaffected.
+    fusion_groups: int = 1,
 ) -> dict[str, Any]:
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"unknown backend: {backend_name}")
@@ -175,6 +181,18 @@ def run_case(
         )
 
     backend_config = BACKEND_CONFIGS[backend_name]
+    if fusion_groups != 1:
+        # Only the task-graph decoder consumes this knob; silently ignoring it
+        # for another backend would produce a row labelled with a granularity it
+        # never used.
+        if backend_name != "megakernel":
+            raise ValueError(
+                f"fusion_groups={fusion_groups} applies to the megakernel "
+                f"backend only; got backend {backend_name!r}"
+            )
+        if fusion_groups < 1:
+            raise ValueError(f"fusion_groups must be >= 1; got {fusion_groups}")
+        backend_config = {**backend_config, "fusion_groups": fusion_groups}
     llm = LLM(
         model_path,
         **backend_config,

@@ -978,12 +978,27 @@ class TgSchedule:
     total_instructions: int
 
 
-def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
-    """Build the full per-SM instruction stream for one decode step.
+def build_schedule(geo: TgGeometry, num_sms: int,
+                   layer_range: tuple[int, int] | None = None) -> TgSchedule:
+    """Build the per-SM instruction stream for one decode step.
 
     Assembles 28 layers × 7 waves + LM_HEAD + LM_ARGMAX, places them
-    round-robin, and serializes. Pure function of (geo, num_sms) — no GPU
-    state, fully testable.
+    round-robin, and serializes. Pure function of (geo, num_sms, layer_range) —
+    no GPU state, fully testable.
+
+    ``layer_range=(start, end)`` builds one **segment** of the same step: the
+    identical stream restricted to layers ``[start, end)``, plus the LM head
+    when the segment owns the final layer. Launching the segments back-to-back
+    with one cooperative launch each is the "partial fusion" arm of the fusion
+    granularity experiment; ``layer_range=None`` is the current single
+    megakernel and stays behaviourally identical to the previous code.
+
+    Bar dims are always sized for the **full** layer count, because bar slots
+    are indexed by global layer and every segment shares the one bar array that
+    is zeroed once per step. The only cross-segment dependency is
+    ``bar_layer[end]``: this segment's last ADD_RMSNORM produces it and the next
+    segment's first QKV waits on it with target ``BS`` — the same slot, already
+    satisfied because a kernel launch is an implicit full barrier.
     """
     if geo.tiling.oproj_splits != 1 or geo.tiling.down_splits != 1:
         raise NotImplementedError(
@@ -992,11 +1007,19 @@ def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
             "emit every tile once per split (duplicated work + double bar "
             "arrivals). Keep both at 1 until split-K accumulation lands."
         )
+    start_layer, end_layer = (
+        layer_range if layer_range is not None else (0, geo.num_layers)
+    )
+    if not 0 <= start_layer < end_layer <= geo.num_layers:
+        raise ValueError(
+            f"invalid layer_range {layer_range} for {geo.num_layers} layers"
+        )
     waves: list[list[list[int]]] = []
-    for layer in range(geo.num_layers):
+    for layer in range(start_layer, end_layer):
         waves.extend(build_layer_waves(geo, layer, num_sms))
-    waves.append(_pack_tiles(build_lm_head_wave(geo),
-                             _max_per_inst(_lm_head_tile_count(geo), num_sms)))
+    if end_layer == geo.num_layers:
+        waves.append(_pack_tiles(build_lm_head_wave(geo),
+                                 _max_per_inst(_lm_head_tile_count(geo), num_sms)))
 
     per_sm = place_round_robin(waves, num_sms)
     flat, counts, max_inst = serialize_inst_buf(per_sm, num_sms)
@@ -1019,6 +1042,36 @@ def build_schedule(geo: TgGeometry, num_sms: int) -> TgSchedule:
         num_sms=num_sms,
         total_instructions=total,
     )
+
+
+def split_layers(num_layers: int, groups: int) -> list[tuple[int, int]]:
+    """Split ``num_layers`` into ``groups`` contiguous, near-equal segments.
+
+    The fusion granularity knob: one segment = one cooperative launch per decode
+    step, so ``groups == 1`` is the current single megakernel and
+    ``groups == num_layers`` is one launch per layer.
+
+    Layer-contiguous by construction, which is what makes segmentation
+    semantically cheap: bar slots are global-layer-indexed (two segments never
+    share a slot, so the once-per-step zeroing stays valid) and the only
+    cross-segment edge is the ``bar_layer`` handoff described in
+    :func:`build_schedule`.
+    """
+    if groups < 1:
+        raise ValueError(f"fusion groups must be >= 1; got {groups}")
+    if groups > num_layers:
+        raise ValueError(
+            f"fusion groups ({groups}) cannot exceed the layer count "
+            f"({num_layers})"
+        )
+    base, extra = divmod(num_layers, groups)
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for index in range(groups):
+        size = base + (1 if index < extra else 0)
+        segments.append((start, start + size))
+        start += size
+    return segments
 
 
 # =============================================================================

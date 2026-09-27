@@ -157,7 +157,7 @@ class ServerCommandReferenceTests(unittest.TestCase):
                         self.assertIn(token, allowed)
 
     def test_new_run_modes_are_dispatched(self) -> None:
-        for mode in ("taskgraph", "taskgraph-baseline"):
+        for mode in ("taskgraph", "taskgraph-baseline", "taskgraph-fusion"):
             with self.subTest(mode=mode):
                 self.assertTrue(
                     re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE),

@@ -46,6 +46,7 @@ class ConfigRejectionTests(unittest.TestCase):
             ({"tensor_parallel_size": 0}, "tensor_parallel_size"),
             ({"tensor_parallel_size": 9}, "tensor_parallel_size"),
             ({"max_prefill_tokens_per_step": -1}, "max_prefill_tokens_per_step"),
+            ({"fusion_groups": 0}, "fusion_groups"),
             ({"prefill_decode_ratio": 0}, "prefill_decode_ratio"),
             ({"megakernel_attn_splits": 0}, "megakernel_attn_splits"),
             ({"decode_backend": "cuda_graph"}, "decode_backend"),

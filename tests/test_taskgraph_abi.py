@@ -841,7 +841,7 @@ class DependencyGraphTests(unittest.TestCase):
 # =============================================================================
 
 
-def simulate_execution(sched, num_sms):
+def simulate_execution(sched, num_sms, bars=None):
     """Execute the per-SM instruction streams under the bar semantics.
 
     Models each SM as a program counter that advances when its next
@@ -855,9 +855,16 @@ def simulate_execution(sched, num_sms):
     consumer waits on must sit earlier in the global order (and hence be
     reachable by its SM before that consumer's SM stalls).
 
+    ``bars`` may be pre-seeded and is carried across calls: the
+    fusion-granularity tests run one bar dict through every segment of a single
+    decode step (see :func:`simulate_segmented_execution`).
+
     Returns (completed, total, bars, pc).
     """
     from collections import defaultdict
+
+    if bars is None:
+        bars = defaultdict(int)
 
     W = tg.TG_INST_WIDTH
     per_sm = []
@@ -868,7 +875,6 @@ def simulate_execution(sched, num_sms):
             for i in range(sched.num_inst_per_sm[sm])
         ])
     total = sum(len(x) for x in per_sm)
-    bars = defaultdict(int)
     pc = [0] * num_sms
     done = 0
 
@@ -932,6 +938,46 @@ def simulate_execution(sched, num_sms):
     return done, total, bars, pc
 
 
+def simulate_segmented_execution(segments, num_sms):
+    """Execute back-to-back layer segments as one decode step.
+
+    Segments are launched in order, so each starts only after the previous has
+    fully completed (a kernel launch is an implicit barrier) and one bar dict is
+    carried through all of them -- exactly the property the layer-contiguous
+    split relies on: segment k+1's first QKV waits on ``bar_layer[first]``,
+    which segment k's last ADD_RMSNORM already produced.
+
+    Returns ``(done, total, bars)`` summed over the segments.
+    """
+    from collections import defaultdict
+
+    bars = defaultdict(int)
+    done = total = 0
+    for sched in segments:
+        seg_done, seg_total, bars, _ = simulate_execution(sched, num_sms, bars)
+        done += seg_done
+        total += seg_total
+        if seg_done != seg_total:
+            break
+    return done, total, bars
+
+
+def instructions(sched):
+    """Every instruction (``TG_INST_WIDTH`` ints) in a schedule's flat buffer."""
+
+    width = tg.TG_INST_WIDTH
+    return [
+        sched.flat_inst_buf[i:i + width]
+        for i in range(0, len(sched.flat_inst_buf), width)
+    ]
+
+
+def opcodes(sched):
+    """Every instruction opcode in a schedule's flat buffer."""
+
+    return sched.flat_inst_buf[0::tg.TG_INST_WIDTH]
+
+
 class ScheduleExecutionTests(unittest.TestCase):
     """The schedule must be deadlock-free for any grid size.
 
@@ -969,6 +1015,150 @@ class ScheduleExecutionTests(unittest.TestCase):
 # =============================================================================
 # Multi-batch geometry sanity
 # =============================================================================
+
+
+class FusionGranularityScheduleTests(unittest.TestCase):
+    """The fusion-granularity knob must not change the dependency graph.
+
+    ``build_schedule(..., layer_range=...)`` emits one *segment* of a decode
+    step (a contiguous layer range) and the decoder launches the segments
+    back-to-back. Segmenting is only safe if the segments partition the layers,
+    every instruction still ships exactly once, and the one cross-segment edge
+    (the ``bar_layer`` handoff) is already satisfied by the launch boundary.
+    These tests prove all three on the CPU, for every split and grid size,
+    before any GPU time is spent on the comparison.
+    """
+
+    def test_segments_partition_the_layers(self):
+        for groups in (1, 2, 3, 4, 7, 14, 28):
+            with self.subTest(groups=groups):
+                segments = tg.split_layers(28, groups)
+                self.assertEqual(len(segments), groups)
+                self.assertEqual(segments[0][0], 0)
+                self.assertEqual(segments[-1][1], 28)
+                sizes = []
+                for index, (start, end) in enumerate(segments):
+                    self.assertLess(start, end)
+                    if index:
+                        self.assertEqual(
+                            start,
+                            segments[index - 1][1],
+                            "segments must be contiguous",
+                        )
+                    sizes.append(end - start)
+                self.assertLessEqual(max(sizes) - min(sizes), 1)
+
+    def test_split_layers_rejects_invalid_group_counts(self):
+        with self.assertRaisesRegex(ValueError, ">= 1"):
+            tg.split_layers(28, 0)
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            tg.split_layers(28, 29)
+
+    def test_build_schedule_rejects_an_invalid_layer_range(self):
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        for layer_range in ((0, 0), (5, 5), (4, 3), (-1, 4), (0, 29)):
+            with self.subTest(layer_range=layer_range):
+                with self.assertRaisesRegex(ValueError, "layer_range"):
+                    tg.build_schedule(geo, 1, layer_range=layer_range)
+
+    def test_one_segment_is_identical_to_the_full_schedule(self):
+        """``fusion_groups=1`` must be byte-identical to the old behaviour."""
+
+        for BS in (1, 2, 4, 8):
+            with self.subTest(BS=BS):
+                geo = tg.default_geometry(BS=BS, attn_splits=1)
+                full = tg.build_schedule(geo, 108)
+                only = tg.build_schedule(geo, 108, layer_range=(0, 28))
+                self.assertEqual(only.flat_inst_buf, full.flat_inst_buf)
+                self.assertEqual(only.num_inst_per_sm, full.num_inst_per_sm)
+                self.assertEqual(only.max_inst, full.max_inst)
+
+    def test_segments_cover_every_instruction_exactly_once(self):
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        full = tg.build_schedule(geo, 4)
+        for groups in (2, 4, 7, 14, 28):
+            with self.subTest(groups=groups):
+                segments = [
+                    tg.build_schedule(geo, 4, layer_range=layer_range)
+                    for layer_range in tg.split_layers(28, groups)
+                ]
+                self.assertEqual(
+                    sum(sched.total_instructions for sched in segments),
+                    full.total_instructions,
+                )
+                for sched in segments:
+                    # Bar slots are global-layer-indexed and the array is
+                    # shared, so every segment must size the bars the same way.
+                    self.assertEqual(sched.bar_dims, full.bar_dims)
+                for index, sched in enumerate(segments):
+                    with self.subTest(groups=groups, segment=index):
+                        final = index == len(segments) - 1
+                        self.assertEqual(tg.TgOp.LM_HEAD in opcodes(sched), final)
+                        self.assertEqual(
+                            tg.TgOp.LM_ARGMAX in opcodes(sched), final
+                        )
+
+    def test_cross_segment_bar_layer_handoff_uses_the_same_slot(self):
+        """Lock the one edge segmentation depends on.
+
+        Segment k's last ADD_RMSNORM produces ``bar_layer[boundary]``; segment
+        k+1's first QKV waits on exactly that slot. If a future change moved
+        either index, segmentation would deadlock while the full schedule still
+        passed every pre-existing test.
+        """
+
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        boundary = tg.split_layers(28, 2)[1][0]
+        first, second = [
+            tg.build_schedule(geo, 1, layer_range=layer_range)
+            for layer_range in tg.split_layers(28, 2)
+        ]
+
+        produced = {
+            inst[7]
+            for inst in instructions(first)
+            if inst[0] == tg.TgOp.ADD_RMSNORM
+        }
+        waited = {
+            inst[5]
+            for inst in instructions(second)
+            if inst[0] == tg.TgOp.QKV_PROJ
+        }
+
+        self.assertIn(tg.TgBarIndex.layer(boundary), produced)
+        self.assertIn(tg.TgBarIndex.layer(boundary), waited)
+
+    def test_segmented_step_is_deadlock_free_per_group_count(self):
+        geo = tg.default_geometry(BS=1, attn_splits=1)
+        full = tg.build_schedule(geo, 1)
+        for groups in (1, 2, 4, 7, 14, 28):
+            with self.subTest(groups=groups):
+                segments = [
+                    tg.build_schedule(geo, 1, layer_range=layer_range)
+                    for layer_range in tg.split_layers(28, groups)
+                ]
+                done, total, _ = simulate_segmented_execution(segments, 1)
+                self.assertEqual(done, total, f"{groups} segments deadlock")
+                self.assertEqual(
+                    total,
+                    full.total_instructions,
+                    "segmenting must not add or drop instructions",
+                )
+
+    def test_segmented_step_is_deadlock_free_across_grid_sizes(self):
+        for attn_splits, BS in ((1, 1), (1, 8), (2, 1)):
+            for num_sms in (1, 108):
+                with self.subTest(attn_splits=attn_splits, BS=BS,
+                                  num_sms=num_sms):
+                    geo = tg.default_geometry(BS=BS, attn_splits=attn_splits)
+                    segments = [
+                        tg.build_schedule(geo, num_sms, layer_range=layer_range)
+                        for layer_range in tg.split_layers(28, 4)
+                    ]
+                    done, total, _ = simulate_segmented_execution(
+                        segments, num_sms
+                    )
+                    self.assertEqual(done, total, "4 segments deadlock")
 
 
 class MultiBatchGeometryTests(unittest.TestCase):

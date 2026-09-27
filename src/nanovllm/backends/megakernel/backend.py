@@ -226,6 +226,7 @@ class MegakernelBackend:
             num_cache_blocks=self.kv_cache.shape[2],
             max_model_len=_get_attr(self.config, "max_model_len", 2048),
             attn_splits=int(_get_attr(self.config, "megakernel_attn_splits", 1)),
+            fusion_groups=int(_get_attr(self.config, "fusion_groups", 1)),
             verbose=bool(_get_attr(self.config, "megakernel_verbose", False)),
         )
 
