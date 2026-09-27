@@ -92,13 +92,19 @@ class DecodedInstruction:
 
     @property
     def name(self) -> str:
-        return _OPCODE_NAMES.get(self.opcode, f"op{self.opcode}")
+        return opcode_name(self.opcode)
 
     @property
     def describe(self) -> str:
         produced = ", ".join(f"{k.kind}[{k.index}]+={n}" for k, n in self.arrivals)
         consumed = ", ".join(f"{c.key.kind}[{c.key.index}]>={c.threshold}" for c in self.waits)
         return f"{self.name}(wait: {consumed or '-'}; arrive: {produced or '-'})"
+
+
+def opcode_name(opcode: int) -> str:
+    """Public opcode -> name lookup (``op<N>`` for unknown opcodes)."""
+
+    return _OPCODE_NAMES.get(opcode, f"op{opcode}")
 
 
 _OPCODE_NAMES = {

@@ -95,6 +95,27 @@ def validate_lengths(
             )
 
 
+#: Archived, documented device time per decode step at batch=1 (docs/06/07).
+BASE_DEVICE_MS = 1.89
+
+
+def fused_prediction(group_counts, batch_sizes) -> dict[str, object]:
+    """The pre-registered granularity prediction, computed without a GPU.
+
+    Kept torch-free so ``--help``/validation paths and the CPU test suite can call
+    it; see ``docs/18`` for the model and what would refute it.
+    """
+
+    from nanovllm.cost_model import preregistered_granularity_prediction
+
+    return {
+        **preregistered_granularity_prediction(
+            base_device_ms=BASE_DEVICE_MS, groups=group_counts
+        ),
+        "batch_sizes": list(batch_sizes),
+    }
+
+
 def sweep_plan(
     group_counts: list[int],
     batch_sizes: list[int],
@@ -136,6 +157,27 @@ def main() -> int:
     validate_groups(group_counts)
     validate_lengths(prompt_lengths, args.max_tokens)
     plan = sweep_plan(group_counts, batch_sizes, prompt_lengths)
+    prediction = fused_prediction(group_counts, batch_sizes)
+
+    # Printed before any measurement exists: the whole point of pre-registering is
+    # that the expectation is on the record first (docs/18).
+    print("pre-registered prediction (docs/18):")
+    print(
+        f"  device ms/step at g=1: {prediction['base_device_ms']} "
+        f"(documented archived value)"
+    )
+    for fraction in ("device_ms_lower_bound", "device_ms_upper_bound"):
+        curve = prediction[fraction]
+        label = "lower" if "lower" in fraction else "upper"
+        print(f"  {label} bound: " + ", ".join(f"g={g}:{ms:.3f}" for g, ms in curve.items()))
+    print(
+        f"  refuted if the measured g={max(group_counts)} device delta exceeds "
+        f"{prediction['refuted_if_measured_delta_exceeds']:.1%}"
+    )
+    print(
+        "  structure is invariant in g (verifier), so a bigger effect means "
+        "launch/drain cost or lost L2 reuse, not granularity"
+    )
 
     # Imported lazily: benchmarks.compare pulls in torch/transformers, which the
     # plan/validation logic above must not require.
@@ -176,6 +218,7 @@ def main() -> int:
         "warmup": args.warmup,
         "runs": args.runs,
         "plan": plan,
+        "pre_registered_prediction": prediction,
         "rows": rows,
     }
     dump_json(args.json, payload)
