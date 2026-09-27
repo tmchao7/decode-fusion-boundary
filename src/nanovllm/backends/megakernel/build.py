@@ -44,13 +44,15 @@ def taskgraph_kernel_flags() -> list[str]:
 
     The ``#ifndef`` fallbacks in ``taskgraph_kernel.cu`` must equal these
     defaults; ``tests/test_taskgraph_abi.py`` enforces that synchronization.
+
+    The grid size and the batch size are runtime launch-descriptor fields
+    (``desc.num_sms`` / ``desc.BS``), so there is no ``-DTG_NUM_BLOCKS`` or
+    ``-DTG_MAX_BATCH`` here: they were passed while the kernel ignored them.
     """
 
     return [
-        f"-DTG_NUM_BLOCKS={_env_int('TG_NUM_BLOCKS', 108)}",
         f"-DTG_BLOCK_SIZE={_env_int('TG_BLOCK_SIZE', 256)}",
         f"-DTG_B_STAGES={_env_int('TG_B_STAGES', 8)}",
-        "-DTG_MAX_BATCH=8",
     ]
 
 

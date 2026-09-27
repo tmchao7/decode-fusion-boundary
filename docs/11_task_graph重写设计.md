@@ -683,12 +683,12 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 
 ---
 
-## 10. 实现状态（2026-09-22，服务器实测前）
+## 11. 实现状态（2026-09-22，服务器实测前）
 
 > 本节记录代码实际落地到哪、哪些已静态验证、哪些还没做。设计与实现的偏差都列在
-> §10.2。服务器实测后回填 §10.4。
+> §11.2。服务器实测后回填 §11.4。
 
-### 10.1 已完成并验证
+### 11.1 已完成并验证
 
 | 模块 | 状态 | 验证方式 |
 |---|---|---|
@@ -711,7 +711,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 | 多 position / 跨 KV block / 自回归 greedy | ✅ | A100 真机对拍 causal PyTorch 参考；`generate_taskgraph` 文本连贯 |
 | 跨 warp global memory fence（确定性） | ✅ | A100 真机 30/30 次确定性；3 处 race 已修复 |
 
-### 10.2 与设计稿的偏差
+### 11.2 与设计稿的偏差
 
 1. **bar 等待**：不是所有线程自旋，而是 **worker warp 0 轮询 + worker barrier 广播**
    （108 CTA × 224 线程全自旋会打爆 L2 计数器行）。`tg_arrive` 必须 **单线程**
@@ -726,20 +726,32 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
    （否则多 SM 下每个 tile 指令扫全 vocab 会读到别的 SM 还没写的 logits）。
 6. **x_attn**：FFN_UPGATE 在 shared `s_norm` 里就地 staging + 就地 RMSNorm，
    只有 `tile_n0==0` 的指令发布给 ADD_RMSNORM（消除跨 CTA 同值写）。
-7. **ring buffer**：仍是死代码；实测显示 dispatch 的 `__syncthreads` 开销 ~2µs/SM
-   （vs 权重 800µs），暂不值得启用。
+7. **ring buffer**：**不在当前实现里**。未接入的 ring scaffold
+   （`tg_controller_loop` / `tg_worker_loop` / `tg_ring_init` / `tg_ring_wait`）和
+   `TG_INST_RING` build flag 都已删除（§5.1），主循环是 `inst_shared` 单 buffer +
+   两次 `__syncthreads`。实测 dispatch 开销 ~2µs/SM（vs 权重 800µs），不值得启用；
+   未来若重新引入，必须单独做 ABI/死锁/性能 A/B，不能把未接入的代码当现有能力。
 
-### 10.3 未实现（明确不可用）
+### 11.3 未实现（明确不可用）
 
 - ~~`attn_splits > 1`~~：已实现（ATTN_DECODE 写 unnormalized partial + LSE，
   ATTN_COMBINE 按 `exp(lse - max_lse)` 重标定并归一化）。有对拍参考的测试 + 死锁模拟覆盖。
   注：attention 已按 SM×warp 并行，短/中 context 不缺这个 split。
 - `oproj_splits / down_splits > 1`：`build_schedule` 直接 `NotImplementedError`。
 - 连续批处理：kernel 侧已支持 `row_active`（inactive 行不写 KV，避免复用页被污染；
-  其余计算照跑、bar 照到达）；但缺 `runtime.cu`/scheduler/session，`backend.py` 未接 taskgraph。
+  其余计算照跑、bar 照到达），且 **Phase 0 已由 nano-vLLM 的 `Scheduler` +
+  `backends/megakernel/backend.py` 每步接入**（scheduler 选 batch/geometry，
+  `TaskGraphDecoder` 按行 launch）。仍未实现的是本设计稿 §7 那套设备侧常驻
+  `runtime.cu` / `session.py` 调度，不要把当前的每步调度当成它。
 - sampling：只有 greedy argmax，无 temperature/top-p。
 
-### 10.4 服务器实测结果（2026-09-23，A100-SXM4-80GB）
+### 11.4 服务器实测结果（2026-09-23，A100-SXM4-80GB）
+
+> ⚠️ **本节的 ms/step 早于 `docs/12` 的优化**（`TG_B_STAGES` 4→8、A staging
+> 向量化并移出 `cp.async` 等待、tile 打包 6→7）。`docs/12 §2.6` 估计 10.8 ms →
+> 4.7~7 ms，但**尚未在 GPU 上验证**。所以这些数字只能当"改动前基线"，不是当前
+> task-graph 实现的能力；当前基线的唯一来源是服务器上的
+> `RUN_MODE=taskgraph-baseline`（`docs/13`）。
 
 #### 硬件 / 环境
 
@@ -768,7 +780,7 @@ shared memory 可见性，global store 需要 `fence.acq_rel.gpu` 才能跨 warp
 | `test_taskgraph_smoke.py` | ✅ 3 passed |
 | `test_taskgraph_abi.py` (attn_splits=1) | ✅ 37 passed, 5011 subtests |
 | `test_taskgraph_positions.py` (attn_splits=1) | ✅ 3 passed (max logit diff 0.21) |
-| `test_taskgraph_positions.py` (attn_splits=2) | ❌ schedule deadlock（预存问题，非确定性修复引入） |
+| `test_taskgraph_positions.py` (attn_splits=2) | ⚠️ 当时记为 schedule deadlock；**该记录已失效**（见 §11.4 已知问题）。ABI 模拟器现覆盖 `attn_splits∈{1,2}` 无死锁，数值侧仍需服务器 |
 | `test_taskgraph_bs2.py` | ✅ 4 passed (BS=2 与独立 BS=1 结果一致) |
 | `test_taskgraph_multi_sm.py` | ✅ passed |
 | `compute-sanitizer --tool memcheck` | ✅ 无内核内存错误 |
@@ -812,7 +824,11 @@ output: Hello, how are you? I am a student, and I am studying for the final exam
 
 #### 已知问题
 
-- `attn_splits=2` schedule deadlock：ABI 模拟器显示 184/10264 指令可执行，
-  调度器逻辑问题，与确定性修复无关
-- 性能远未优化：当前用 `__syncthreads` dispatch（~2µs/SM 开销），ring buffer
-  仍是死代码；scalar attention 未向量化；权重带宽利用率低
+- `attn_splits=2` schedule deadlock 的**记录已失效**：该结论出自 `f6cd3a8`
+  （184/10264 指令可执行），但用同一份 `simulate_execution` 在 `f6cd3a8` /
+  `1a7539b` 上复现不出来（10264/10264 全部可执行）。`f3d8114` 之后 ABI 测试覆盖
+  `attn_splits∈{1,2}` × `BS∈{1..8}` × `num_sms∈{1,4,8,108}` 全部无死锁；
+  数值侧仍需服务器。详见 `docs/taskgraph_progress.md §4.1`。
+- 性能远未优化（且本节数字早于 `docs/12` 的改动）：`__syncthreads` dispatch
+  ~2µs/SM（占每步 <0.1%）、scalar attention 未向量化、权重带宽利用率低
+  （111 GB/s vs A100 HBM 峰值 1.5 TB/s）。ring buffer 不在当前实现里（§11.2）。

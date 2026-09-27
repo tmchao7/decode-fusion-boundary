@@ -166,8 +166,13 @@ class ServerCommandReferenceTests(unittest.TestCase):
                 self.assertIn(f"run_{mode.replace('-', '_')}()", self.text)
 
     def test_documented_run_modes_are_all_dispatched(self) -> None:
+        # Mode names may contain hyphens. The old ``[a-z]+`` pattern stopped at
+        # the hyphen, so ``RUN_MODE=taskgraph-perf`` never entered this check and
+        # a stale docs reference survived the removal of that mode.
         advertised = set(
-            re.findall(r"RUN_MODE=([a-z]+)\s+bash SERVER_COMMANDS", self.text)
+            re.findall(
+                r"RUN_MODE=([a-z][a-z-]*)\s+bash SERVER_COMMANDS", self.text
+            )
         )
         self.assertTrue(advertised)
         for mode in advertised:
@@ -176,6 +181,34 @@ class ServerCommandReferenceTests(unittest.TestCase):
                     re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE),
                     f"advertised RUN_MODE={mode} has no dispatch branch",
                 )
+
+    # README.md declares these two as historical: they document the archived
+    # ``kernel.cu`` line, including a command surface that no longer exists.
+    # They are excluded from the "current docs" scan below on purpose.
+    HISTORICAL_DOCS = {
+        "06_实际运行数据.md",
+        "07_架构结论_megakernel为何打不过cudagraph.md",
+    }
+
+    def test_current_docs_only_advertise_existing_run_modes(self) -> None:
+        """A stale ``RUN_MODE=...`` in a doc costs a whole server session."""
+
+        stale: list[str] = []
+        docs = [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").glob("*.md"))]
+        for path in docs:
+            if path.name in self.HISTORICAL_DOCS:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for mode in re.findall(
+                r"RUN_MODE=([a-z][a-z-]*)\s+bash SERVER_COMMANDS", text
+            ):
+                if not re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE):
+                    stale.append(f"{path.name}: RUN_MODE={mode}")
+        self.assertFalse(
+            stale,
+            "documented RUN_MODE(s) have no dispatch branch in "
+            f"SERVER_COMMANDS.txt: {stale}",
+        )
 
     def test_mainline_commands_do_not_reference_archived_backends(self) -> None:
         for name in (

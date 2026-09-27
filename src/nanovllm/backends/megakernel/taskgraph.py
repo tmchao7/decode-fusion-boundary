@@ -342,9 +342,11 @@ class TaskGraphDecoder:
         # kernel starts from x_resid, not from a token id.
         self._x_resid[:rows] = self._embed_weight[input_ids]
         # cache_seqlens is the *pre-decode* length; the kernel writes the new
-        # token at position cache_seqlens[row]. ``positions`` is int64 (the
-        # ModelRunner convention) and this is a copy_, which casts in place --
-        # no per-step allocation.
+        # token at position cache_seqlens[row] and derives
+        # ``cache_len = cache_seqlens + 1`` as the attention loop bound
+        # (identity: position == cache_len - 1, see engine/kv_layout.py).
+        # ``positions`` is int64 (the ModelRunner convention) and this is a
+        # copy_, which casts in place -- no per-step allocation.
         self._cache_seqlens[:rows] = positions
         cols = int(block_tables.size(1))
         if cols > self._max_pages:

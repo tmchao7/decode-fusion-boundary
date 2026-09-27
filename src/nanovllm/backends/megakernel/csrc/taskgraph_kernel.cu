@@ -49,16 +49,18 @@ constexpr float TG_RMS_EPS = 1e-6f;
 // kernel. build.py passes them as -D. The #ifndef fallbacks MUST equal the
 // build.py defaults; test_taskgraph_abi.py enforces this (same pattern as
 // test_batch_launch_guards.py).
+//
+// The grid size and the batch are **runtime** values (``desc.num_sms`` and
+// ``desc.BS``), so there is deliberately no compile-time SM-count or batch
+// ceiling here. ``TG_NUM_BLOCKS`` / ``TG_MAX_BATCH`` used to be defined and
+// passed by build.py while nothing read them; a build flag that looks like it
+// configures the launch geometry is worse than no flag. The Python-side batch
+// ceiling (scratch/bar sizing) is ``TG_MAX_BATCH`` in
+// ``backends/megakernel/taskgraph.py``.
 // =============================================================================
 
-#ifndef TG_NUM_BLOCKS
-#define TG_NUM_BLOCKS 108  // A100 has 108 SMs; use them all (no artificial cap)
-#endif
 #ifndef TG_BLOCK_SIZE
 #define TG_BLOCK_SIZE 256  // 8 warps/CTA; occupancy=1 block/SM via __launch_bounds__
-#endif
-#ifndef TG_MAX_BATCH
-#define TG_MAX_BATCH 8     // compile-time ceiling for scratch/bar sizing (BS ∈ {1,2,4,8})
 #endif
 
 constexpr int TG_NUM_WARPS = TG_BLOCK_SIZE / TG_WARP_SIZE;        // 8
@@ -71,22 +73,12 @@ constexpr int TG_WORKER_WARPS = TG_NUM_WARPS - 1;                 // 7 (warp 0 i
 // volatile-poll until >= target. This replaces per-layer grid.sync() with
 // fine-grained dependency signaling.
 //
-// Correctness argument (mirrors docs/11 §4.2):
-//  - Release: fence.acq_rel.gpu publishes this CTA's global writes to GPU
-//    scope BEFORE atomicAdd. Any CTA that later observes the incremented
-//    counter is guaranteed to see those writes.
-//  - Acquire: the consumer's fence.acq_rel.gpu (after observing the counter
-//    >= target) ensures subsequent loads see the producer's published stores.
-//  - volatile poll prevents the counter read from being cached in registers.
-//  - __nanosleep(20) throttles memory-traffic from busy-wait (cohere "DONT DELETE").
-// =============================================================================
-
 // sm_80 has no TMA and therefore no fence.proxy.async. We use fence.acq_rel.gpu
 // (same primitive as AtomicGridSync in kernel.cu:108-145, proven on A100) for
-// both release and acquire. This guarantees GPU-scope visibility of prior
-// global stores before the atomicAdd that signals a producer, and visibility
-// of the producer's stores to a consumer that has observed the counter cross
-// the threshold.
+// both release and acquire: it guarantees GPU-scope visibility of prior global
+// stores before the atomicAdd that signals a producer, and visibility of the
+// producer's stores to a consumer that has observed the counter cross the
+// threshold.
 //
 // Correctness argument (mirrors docs/11 §4.2):
 //  - Release: fence.acq_rel.gpu publishes this CTA's global writes to GPU

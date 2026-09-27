@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nanovllm.backends.megakernel.taskgraph import taskgraph_compatibility
+from nanovllm.engine.kv_layout import decode_position
 
 
 VALID_CUDA_ARCHES = {"sm_70", "sm_80", "sm_86", "sm_89", "sm_90", "sm_120"}
@@ -248,7 +249,7 @@ class MegakernelBackend:
             int(
                 self.decoder.step(
                     seq.last_token,
-                    position=len(seq) - 1,
+                    position=decode_position(len(seq)),
                     block_table=block_table,
                 )
             )

@@ -12,6 +12,15 @@ from nanovllm.backends.megakernel import MegakernelBackend
 from nanovllm.backends.megakernel.backend import (
     is_megakernel_backend,
 )
+from nanovllm.engine.kv_layout import (
+    decode_cache_len,
+    decode_position,
+    decode_slot_mapping,
+    pad_block_table,
+    prefill_cache_len,
+    prefill_positions,
+    prefill_slot_mapping,
+)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -206,7 +215,8 @@ class ModelRunner:
         # *before* the cache allocation, so a read past a sequence's own length
         # (or any future shared cache_len) becomes an out-of-bounds device read.
         # Block 0 is allocated to every sequence, so it is always a valid target.
-        block_tables = [seq.block_table + [0] * (max_len - len(seq.block_table)) for seq in seqs]
+        # ``kv_layout.pad_block_table`` is the tested form of this contract.
+        block_tables = [pad_block_table(seq.block_table, max_len) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -223,9 +233,9 @@ class ModelRunner:
             start = seq.num_cached_tokens # 过滤掉seq命中的kv cache 的计算起始位置
             seqlen_q = seq.num_scheduled_tokens # 本次seq要算的token数
             end = start + seqlen_q
-            seqlen_k = end # 当前序列总共拥有的 KV Cache 长度
+            seqlen_k = prefill_cache_len(start, seqlen_q) # 当前序列总共拥有的 KV Cache 长度
             input_ids.extend(seq[start:end]) # 抽出 seq tokens
-            positions.extend(range(start, end)) #
+            positions.extend(prefill_positions(start, seqlen_q)) #
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             # 本 Batch 中最长的 Q 长度和最长的 K 长度
@@ -234,17 +244,9 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             # 计算kv cache 的分配的槽位的 逻辑位置->物理位置的映射 slot_mapping
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
+            slot_mapping.extend(
+                prefill_slot_mapping(seq.block_table, start, end, self.block_size)
+            )
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache 前缀缓存命中
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -261,11 +263,14 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
+            num_tokens = len(seq)
             input_ids.append(seq.last_token) # 取最后一个token
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq)) # 记录当前上下文长度
+            positions.append(decode_position(num_tokens))
+            context_lens.append(decode_cache_len(num_tokens)) # 记录当前上下文长度
             # 本次新算出的 KV 要写入显存的哪个绝对地址
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(
+                decode_slot_mapping(seq.block_table, num_tokens, self.block_size)
+            )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)

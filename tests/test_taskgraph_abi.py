@@ -60,8 +60,8 @@ class AbiSyncTests(unittest.TestCase):
         declared = {}
         for m in re.finditer(r"(TG_\w+)\s*=\s*(\d+)", header):
             name, val = m.group(1), int(m.group(2))
-            # Skip non-opcode matches like TG_INST_WIDTH, TG_LW_COUNT, TG_MAX_BATCH.
-            if name in ("TG_INST_WIDTH", "TG_LW_COUNT", "TG_MAX_BATCH",
+            # Skip non-opcode matches like TG_INST_WIDTH and the TG_LW_* enum.
+            if name in ("TG_INST_WIDTH", "TG_LW_COUNT",
                         "TG_LW_INPUT_LAYERNORM", "TG_LW_Q_PROJ", "TG_LW_K_PROJ",
                         "TG_LW_V_PROJ", "TG_LW_Q_NORM", "TG_LW_K_NORM",
                         "TG_LW_O_PROJ", "TG_LW_POST_ATTN_LAYERNORM",
@@ -150,7 +150,12 @@ class AbiSyncTests(unittest.TestCase):
 class BuildFlagSyncTests(unittest.TestCase):
     """``taskgraph_kernel.cu``'s ``#ifndef`` fallbacks must equal ``build.py``'s
     ``taskgraph_kernel_flags()`` defaults. Same pattern as
-    ``test_batch_launch_guards.py::KernelFlagDefaultTests``."""
+    ``test_batch_launch_guards.py::KernelFlagDefaultTests``.
+
+    Only flags the kernel actually reads are listed: the grid and the batch are
+    runtime launch-descriptor fields, so a compile-time ceiling for either would
+    be a dead knob (see
+    :meth:`test_kernel_has_no_dead_grid_or_batch_ceiling`)."""
 
     def _kernel_default(self, name: str) -> int | None:
         kernel = read(TG_KERNEL_CU)
@@ -161,10 +166,6 @@ class BuildFlagSyncTests(unittest.TestCase):
         build = read(BUILD_PY)
         m = re.search(rf'f"-D{name}=\{{_env_int\([\'"]{name}[\'"],\s*(\d+)\)}}', build)
         return int(m.group(1)) if m else None
-
-    def test_tg_num_blocks(self) -> None:
-        self.assertEqual(self._kernel_default("TG_NUM_BLOCKS"), 108)
-        self.assertEqual(self._build_default("TG_NUM_BLOCKS"), 108)
 
     def test_tg_block_size(self) -> None:
         self.assertEqual(self._kernel_default("TG_BLOCK_SIZE"), 256)
@@ -182,12 +183,24 @@ class BuildFlagSyncTests(unittest.TestCase):
         self.assertEqual(self._kernel_default("TG_B_STAGES"), 8)
         self.assertEqual(self._build_default("TG_B_STAGES"), 8)
 
-    def test_tg_max_batch(self) -> None:
-        self.assertEqual(self._kernel_default("TG_MAX_BATCH"), 8)
-        # TG_MAX_BATCH is hardcoded in build.py (not env-overridable), matching
-        # the LDG_MAX_BATCH pattern.
+    def test_kernel_has_no_dead_grid_or_batch_ceiling(self) -> None:
+        """``TG_NUM_BLOCKS`` / ``TG_MAX_BATCH`` must not come back.
+
+        They were defined in the kernel and passed by ``build.py`` (and locked by
+        this very test class) while nothing read them: the launch uses
+        ``desc.num_sms`` at runtime and the batch is ``desc.BS``. A build flag
+        that looks like it sizes the launch is worse than no flag -- the same
+        failure mode as the removed ``TG_INST_RING``.
+        """
+
+        kernel = read(TG_KERNEL_CU)
         build = read(BUILD_PY)
-        self.assertIn('"-DTG_MAX_BATCH=8"', build)
+        for name in ("TG_NUM_BLOCKS", "TG_MAX_BATCH"):
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    self._kernel_default(name), f"#define {name} is back in the kernel"
+                )
+                self.assertNotIn(f"-D{name}=", build)
 
 
 # =============================================================================

@@ -4,6 +4,12 @@
 **硬件**: A100-SXM4-80GB (sm_80, 108 SM)
 **模型**: Qwen3-0.6B (28 层, hidden=1024, intermediate=3072, vocab=151936)
 
+> **状态**：本文是 2026-09-23 的快照。§1.5 的 ms/step 是 `docs/12` 优化**之前**的
+> 数据（`TG_B_STAGES` 4→8、A staging 向量化与重排、tile 打包 6→7 之前），不能当作
+> 当前实现的能力，当前基线以服务器上的 `RUN_MODE=taskgraph-baseline` 为准。
+> §4/§5 已按当前实现更新：引擎集成已完成，ring buffer 已删除并在
+> `docs/12 §3.5` 判定不值得做。
+
 ---
 
 ## 1. 已完成
@@ -122,7 +128,8 @@ Task-graph (108 SM, 50 步):
    新加的 `tests/test_taskgraph_backend.py` 把 `BS 1..8` 也纳入了模拟器覆盖。
    **数值侧仍需服务器**（`test_taskgraph_positions::test_attn_splits_matches_causal_reference`）。
 2. **性能远未优化**:
-   - `__syncthreads` dispatch (~2µs/SM 开销)，ring buffer 仍是死代码
+   - `__syncthreads` dispatch (~2µs/SM 开销)；ring buffer **不在当前实现里**
+     （未接入的 scaffold 与 `TG_INST_RING` build flag 都已删除，见 `docs/11 §11.2`）
    - scalar attention 未向量化
    - 权重带宽利用率低 (111 GB/s vs A100 HBM 峰值 1.5 TB/s)
 3. ~~**Task-graph 未集成引擎**~~ **已完成**（本轮）：`decode_backend="megakernel"`
@@ -136,7 +143,8 @@ Task-graph (108 SM, 50 步):
 1. ~~写 `tools/compare_tg_vs_cudagraph.py`~~ → 改为扩 `compare.py`（已完成）
 2. 服务器跑 `RUN_MODE=taskgraph-baseline` 取主表 + 四口径账
 3. ~~调查 `attn_splits=2` schedule deadlock~~ → 记录已失效，改为服务器数值验证
-4. 性能优化: 启用 ring buffer dispatch、向量化 attention（`docs/12 §3`）
+4. 性能优化: 向量化 attention、split-K 确定性归约、A staging 移出 K 循环
+   （`docs/12 §3`）。ring buffer 已在 `docs/12 §3.5` 判定不值得做，不再列入。
 5. ~~集成 task-graph 到引擎 `MegakernelBackend`~~（已完成）
 
 ---

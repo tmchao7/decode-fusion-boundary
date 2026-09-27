@@ -40,6 +40,20 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 python -m compileall src/nanovllm benchmarks tools tests
 ```
 
+On a machine without CUDA, install only the CPU-test dependencies: the
+engine/scheduler/contract suites need `numpy` and `xxhash`, and the task-graph
+CUDA modules skip themselves instead of erroring, so discovery stays green.
+
+```bash
+python -m pip install numpy xxhash
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+The same suites also run without `transformers` or a model checkpoint: the
+CPU-only fixtures build a real `Config` with `transformers` replaced in
+`sys.modules` (`tests/engine_fixtures.py`), so a bad runtime parameter still
+fails with the production `ValueError`.
+
 A GPU machine additionally needs an NVIDIA driver, `nvcc`, and CUDA-enabled
 PyTorch. `setup_server.sh` creates the server environment from an existing
 system Python:

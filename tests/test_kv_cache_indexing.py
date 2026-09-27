@@ -8,7 +8,9 @@ Two independent things are checked here, both without a GPU:
    sequence lengths in one batch.
 
 (2) is the important one.  ``ModelRunner.prepare_block_tables`` right-pads the
-block table of short sequences so the batch is rectangular.  The torch path is
+block table of short sequences so the batch is rectangular, via the torch-free
+``nanovllm.engine.kv_layout.pad_block_table`` (so (2) calls the real engine
+helper instead of parsing ``model_runner.py`` source).  The torch path is
 unaffected because it zeroes its graph buffer and bounds every read with
 ``cache_seqlens``/``context_lens``.  The megakernel path consumes the padded
 table directly and bounds its attention loop with ``position + 1`` (the *longest*
@@ -20,32 +22,23 @@ cache allocation.
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from nanovllm.backends.megakernel.cache import PagedKVCacheSpec  # noqa: E402
-
-MODEL_RUNNER = REPO_ROOT / "src" / "nanovllm" / "engine" / "model_runner.py"
+from nanovllm.engine.kv_layout import pad_block_table  # noqa: E402
 
 
 def block_table_pad_value() -> int:
-    """Read the padding value out of ``prepare_block_tables``.
+    """Padding value ``prepare_block_tables`` uses for a short sequence.
 
-    Importing ``model_runner`` needs torch, so the source is parsed instead.
+    Calls the production helper directly: ``kv_layout`` is torch-free, so there
+    is no reason to parse source text (which is what the previous version of
+    this audit did).
     """
 
-    import re
-
-    source = MODEL_RUNNER.read_text(encoding="utf-8")
-    match = re.search(
-        r"seq\.block_table \+ \[(-?\d+)\] \* \(max_len - len\(seq\.block_table\)\)",
-        source,
-    )
-    if match is None:
-        raise AssertionError("prepare_block_tables padding rule changed")
-    return int(match.group(1))
+    return pad_block_table([], 1)[0]
 
 
 def ldg_kv_ptr_offset(

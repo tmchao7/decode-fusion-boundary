@@ -13,7 +13,9 @@ class TaskGraphKernelSourceTests(unittest.TestCase):
         bindings = BINDINGS.read_text(encoding="utf-8")
         self.assertIn("tg_decode_kernel", kernel)
         self.assertIn("cudaLaunchCooperativeKernel", kernel)
-        self.assertIn("TG_MAX_BATCH", kernel)
+        # The launch geometry comes from the runtime descriptor (no compile-time
+        # SM/batch ceiling); this is what TG_MAX_BATCH used to be mistaken for.
+        self.assertIn("desc->num_sms", kernel)
         self.assertIn('"tg_decode_step(', bindings)
         self.assertIn('ops.impl("tg_decode_step"', bindings)
 

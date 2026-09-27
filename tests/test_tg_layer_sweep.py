@@ -13,19 +13,25 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import sys
 import glob
-import torch
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from nanovllm.backends.megakernel.build import get_extension
-get_extension()
-
-from nanovllm.backends.megakernel.weights import (
-    load_weights, _pack_layer_weights, _rope_tables,
-    NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
-    NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE, MAX_SEQ_LEN,
-)
-from nanovllm.backends.megakernel import schedule as tg_schedule
+try:
+    import torch
+    from nanovllm.backends.megakernel.build import get_extension
+    get_extension()
+    from nanovllm.backends.megakernel.weights import (
+        load_weights, _pack_layer_weights, _rope_tables,
+        NUM_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+        NUM_KV_HEADS, HEAD_DIM, Q_SIZE, KV_SIZE, MAX_SEQ_LEN,
+    )
+    from nanovllm.backends.megakernel import schedule as tg_schedule
+except ModuleNotFoundError as exc:  # torch / the CUDA stack is server-only
+    # Skip the module instead of erroring, so a CPU-only checkout still gets a
+    # green discovery run. Only ModuleNotFoundError is caught: on the server a
+    # genuine extension build failure must stay loud, not become a skip.
+    raise unittest.SkipTest(f"task-graph CUDA tests require torch: {exc}")
 
 NUM_Q_HEADS = Q_SIZE // HEAD_DIM  # 16
 _tg_ops = torch.ops.nanovllm_megakernel_C

@@ -170,5 +170,34 @@ class BatchThroughputTests(unittest.TestCase):
         self.assertEqual(summary["prefill_tok_s"], 60.0)
 
 
+class SchedulerStatsPassthroughTests(unittest.TestCase):
+    def test_report_embeds_the_scheduler_counters(self):
+        """``LLMEngine._generate`` passes ``scheduler.stats()`` to ``report``."""
+
+        collector = MetricsCollector("megakernel")
+        stats = {
+            "waiting_sequences": 1,
+            "running_sequences": 2,
+            "peak_waiting_sequences": 3,
+            "peak_running_sequences": 4,
+            "decode_steps_since_prefill": 0,
+            "prefill_decode_ratio": 1,
+            "block_size": 256,
+            "allocated_blocks": 5,
+            "free_blocks": 6,
+            "peak_used_blocks": 7,
+            "prefix_cache_hits": 8,
+            "prefix_cache_misses": 9,
+        }
+
+        report = collector.report(wall_time=1.0, scheduler_stats=stats)
+
+        self.assertEqual(report["summary"]["scheduler"], stats)
+        # Reported only when the engine supplies it.
+        self.assertNotIn(
+            "scheduler", MetricsCollector("torch").report(wall_time=1.0)["summary"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

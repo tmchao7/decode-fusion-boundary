@@ -21,7 +21,13 @@ import glob
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:  # torch is a server-only dependency
+    # Skip the module instead of erroring, so a CPU-only checkout still gets a
+    # green discovery run. Only ModuleNotFoundError is caught: on the server a
+    # genuine extension build failure must stay loud, not become a skip.
+    raise unittest.SkipTest(f"task-graph CUDA tests require torch: {exc}")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
