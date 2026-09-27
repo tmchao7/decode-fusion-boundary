@@ -14,7 +14,7 @@
 |---|---|
 | 刚接手这个项目 | [10 交接文档](10_交接文档.md) → [01 项目说明](01_项目说明.md) → [05 基线与公平性](05_对比基线与公平性.md) |
 | 要复现/取数 | [08 服务器运行手册](08_服务器运行手册.md) → [04 基准测试方法](04_基准测试方法.md) → [02 指标说明](02_指标说明.md) |
-| 要改 kernel / 调度 | [11 task-graph 设计](11_task_graph重写设计.md) → [12 性能诊断与优化计划](12_性能诊断与优化计划.md) → [14 融合粒度实验](14_融合粒度实验.md) |
+| 要改 kernel / 调度 | [11 task-graph 设计](11_task_graph重写设计.md) → [17 调度验证器](17_调度验证器.md)（改 `schedule.py` 必须先过） → [12 性能诊断与优化计划](12_性能诊断与优化计划.md) → [14 融合粒度实验](14_融合粒度实验.md) |
 | 要理解"为什么打不过 cudagraph" | [07 架构结论](07_架构结论_megakernel为何打不过cudagraph.md) §0 → §9.10（外部独立复现）→ [06 实际运行数据](06_实际运行数据.md) |
 | 要决定做什么/投什么方向 | [16 MoE 可行性](16_MoE_A100可行性调研.md) → [15 招聘门槛调研](15_招聘门槛调研_推理优化与AI编译器实习.md) |
 | 想知道"配置为什么这么定" | [13 集成与基线规划](13_集成与基线规划.md) → [99 变更历史](99_变更历史.md) |
@@ -39,6 +39,7 @@
 | [14 融合粒度实验](14_融合粒度实验.md) | 现行 | Phase 1 实验；CPU 侧已验证，待取数 |
 | [15 招聘门槛调研](15_招聘门槛调研_推理优化与AI编译器实习.md) | 研究资料 | 岗位硬门槛、面试题分布、作品集信号（含证据分级） |
 | [16 MoE 可行性调研](16_MoE_A100可行性调研.md) | 研究资料 | 单卡 MoE 选型 + per-token 成本模型（英文） |
+| [17 调度验证器](17_调度验证器.md) | 现行 | 死锁/到达计数的离线验证器 + 对抗性变异（纯 CPU） |
 | [99 变更历史](99_变更历史.md) | 历史 | 各文档抽出的版本变更日志 |
 | [taskgraph_progress](taskgraph_progress.md) | **历史快照** | 2026-09-23 的优化进展报告 |
 
@@ -54,6 +55,17 @@ RUN_MODE=taskgraph         bash SERVER_COMMANDS.txt   # kernel 微基准 + ABI �
 RUN_MODE=taskgraph-baseline bash SERVER_COMMANDS.txt  # correctness + A/B + 四口径账
 RUN_MODE=taskgraph-fusion  bash SERVER_COMMANDS.txt   # 融合粒度扫描
 ```
+
+## 3b. 开发机（CPU）命令
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests          # 全套 CPU 测试
+python -m tools.verify_schedule --json results/schedule_verification.json  # 调度验证器
+python -m tools.bench_fusion_granularity --help              # 粒度扫描计划（不需要 GPU）
+```
+
+上面这些**不需要 GPU**；改动 `schedule.py` 之前必须跑 `tools.verify_schedule`（见
+[17](17_调度验证器.md)）。
 
 ## 4. 现行 vs 归档（不要混）
 

@@ -25,6 +25,7 @@ if str(REPO_ROOT / "src") not in __import__("sys").path:
     sys_path_added = True
 
 from nanovllm.backends.megakernel import schedule as tg  # noqa: E402
+from nanovllm.backends.megakernel import verifier as V  # noqa: E402
 
 MEGAKERNEL = REPO_ROOT / "src" / "nanovllm" / "backends" / "megakernel"
 TG_ABI_H = MEGAKERNEL / "csrc" / "tg_abi.h"
@@ -842,104 +843,24 @@ class DependencyGraphTests(unittest.TestCase):
 
 
 def simulate_execution(sched, num_sms, bars=None):
-    """Execute the per-SM instruction streams under the bar semantics.
+    """Maximal execution of a schedule -- delegates to the shipped verifier.
 
-    Models each SM as a program counter that advances when its next
-    instruction's wait is satisfied, applying the instruction's bar arrivals.
-    Repeats a full scan until nothing can make progress. Because bar counters
-    are monotone (executing an instruction never disables another wait), this
-    greedy maximal execution completes iff *some* concurrent execution can —
-    so a shortfall is a real deadlock, not a simulation artifact.
+    The opcode -> (wait, arrive) mapping used to be implemented here, which gave
+    the kernel's bar semantics two homes that could drift apart. It now lives in
+    ``nanovllm.backends.megakernel.verifier``, which also owns the arrival audit
+    and the adversarial mutants; ``tools/verify_schedule.py`` sweeps the geometry
+    matrix with the same code.
 
-    This is the invariant that matters for num_sms > 1: every producer a
-    consumer waits on must sit earlier in the global order (and hence be
-    reachable by its SM before that consumer's SM stalls).
-
-    ``bars`` may be pre-seeded and is carried across calls: the
-    fusion-granularity tests run one bar dict through every segment of a single
-    decode step (see :func:`simulate_segmented_execution`).
-
-    Returns (completed, total, bars, pc).
+    Returns ``(done, total, bars, pc)``; ``bars`` carries across calls so a
+    segmented step can be checked with the counters its earlier launches produced.
     """
-    from collections import defaultdict
 
-    if bars is None:
-        bars = defaultdict(int)
-
-    W = tg.TG_INST_WIDTH
-    per_sm = []
-    for sm in range(num_sms):
-        base = sm * sched.max_inst * W
-        per_sm.append([
-            sched.flat_inst_buf[base + i * W: base + (i + 1) * W]
-            for i in range(sched.num_inst_per_sm[sm])
-        ])
-    total = sum(len(x) for x in per_sm)
-    pc = [0] * num_sms
-    done = 0
-
-    def wait_ok(inst):
-        op = inst[0]
-        if op == tg.TgOp.QKV_PROJ:
-            return bars[("layer", inst[5])] >= inst[6]
-        if op == tg.TgOp.ATTN_DECODE:
-            return bars[("qkv", inst[7])] >= inst[8]
-        if op == tg.TgOp.ATTN_COMBINE:
-            return bars[("combine", inst[5])] >= inst[6]
-        if op == tg.TgOp.O_PROJ:
-            return bars[("attn", inst[6])] >= inst[7]
-        if op == tg.TgOp.FFN_UPGATE_ACT:
-            return bars[("oproj", inst[6])] >= inst[7]
-        if op == tg.TgOp.FFN_DOWN:
-            return bars[("silu", inst[6])] >= inst[7]
-        if op == tg.TgOp.ADD_RMSNORM:
-            return (bars[("oproj", inst[3])] >= inst[4]
-                    and bars[("ffn_down", inst[5])] >= inst[6])
-        if op == tg.TgOp.LM_HEAD:
-            return bars[("layer", inst[6])] >= inst[7]
-        if op == tg.TgOp.LM_ARGMAX:
-            return bars[("lm_head", inst[6])] >= inst[7]
-        return True  # NOP
-
-    def apply(inst):
-        op = inst[0]
-        if op == tg.TgOp.QKV_PROJ:
-            bars[("qkv", inst[7])] += inst[9]
-        elif op == tg.TgOp.ATTN_DECODE:
-            key = "combine" if (inst[9] >> 31) else "attn"
-            bars[(key, inst[9] & ~(1 << 31))] += 1
-        elif op == tg.TgOp.ATTN_COMBINE:
-            bars[("attn", inst[7])] += 1
-        elif op == tg.TgOp.O_PROJ:
-            bars[("oproj", inst[8])] += inst[9]
-        elif op == tg.TgOp.FFN_UPGATE_ACT:
-            bars[("silu", inst[8])] += inst[9]
-        elif op == tg.TgOp.FFN_DOWN:
-            bars[("ffn_down", inst[8])] += inst[9]
-        elif op == tg.TgOp.ADD_RMSNORM:
-            bars[("layer", inst[7])] += 1
-        elif op == tg.TgOp.LM_HEAD:
-            bars[("lm_head", inst[8])] += inst[9]
-        # LM_ARGMAX / NOP produce nothing.
-
-    while done < total:
-        progressed = False
-        for sm in range(num_sms):
-            if pc[sm] >= len(per_sm[sm]):
-                continue
-            inst = per_sm[sm][pc[sm]]
-            if wait_ok(inst):
-                apply(inst)
-                pc[sm] += 1
-                done += 1
-                progressed = True
-        if not progressed:
-            break
-    return done, total, bars, pc
+    result = V.execute(sched, num_sms, bars)
+    return result.done, result.total, result.bars, result.pc
 
 
 def simulate_segmented_execution(segments, num_sms):
-    """Execute back-to-back layer segments as one decode step.
+    """Run back-to-back layer segments as one decode step.
 
     Segments are launched in order, so each starts only after the previous has
     fully completed (a kernel launch is an implicit barrier) and one bar dict is
@@ -949,9 +870,8 @@ def simulate_segmented_execution(segments, num_sms):
 
     Returns ``(done, total, bars)`` summed over the segments.
     """
-    from collections import defaultdict
 
-    bars = defaultdict(int)
+    bars = None
     done = total = 0
     for sched in segments:
         seg_done, seg_total, bars, _ = simulate_execution(sched, num_sms, bars)
