@@ -19,6 +19,7 @@ from typing import Any, Callable
 import torch
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.engine.cudagraph_buckets import padding_report
 from nanovllm.metrics import (
     GpuTelemetrySampler,
     compare_metric_summaries,
@@ -307,6 +308,18 @@ def run_case(
                 "count": summary.get("fallback_count", 0),
                 "reasons": summary.get("fallback_reasons", []),
             },
+            # Recorded, not just documented: compare.py builds every engine with
+            # max_num_seqs == batch_size, so the cudagraph arm replays an exact
+            # bucket (factor 1.0). The archived crossover scan used
+            # max(batch, 32) and its cudagraph rows carry up to 1.88x padding.
+            "cudagraph": padding_report(
+                batch_size,
+                batch_size,
+                uses_cuda_graph=(
+                    backend_config.get("decode_backend") == "torch"
+                    and not backend_config.get("enforce_eager", False)
+                ),
+            ),
             "profiling": {
                 "source": "external_nsight",
                 "kernel_launches_per_token": None,

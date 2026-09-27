@@ -21,6 +21,10 @@ from nanovllm.engine.kv_layout import (
     prefill_positions,
     prefill_slot_mapping,
 )
+from nanovllm.engine.cudagraph_buckets import (
+    graph_buckets,
+    select_graph_bucket,
+)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -291,11 +295,9 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            # Buckets are [1,2,4,8] + range(16, max_bs+1, 16), so a batch size
-            # between buckets (9..15, 17..31, ...) has no captured graph. Fall
-            # back to eager instead of letting `next(...)` raise StopIteration
-            # in the middle of a generation loop.
-            bucket = next((x for x in self.graph_bs if x >= bs), None)
+            # A batch above the largest captured bucket falls back to eager
+            # instead of raising StopIteration mid-generation.
+            bucket = select_graph_bucket(bs, self.graph_bs)
             if bucket is None:
                 return self.model.compute_logits(self.model(input_ids, positions))
             graph = self.graphs[bucket]
@@ -385,13 +387,10 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        # max_bs is always a capturable bucket so a non-bucket batch (e.g. 10)
-        # has a graph to replay; without this, batches in (8, 16) hit
-        # StopIteration on the ``next(x ... if x >= bs)`` lookup when
-        # max_num_seqs == batch_size (benchmarks/compare sets exactly that).
-        if max_bs > self.graph_bs[-1]:
-            self.graph_bs.append(max_bs)
+        # Bucket list lives in engine/cudagraph_buckets.py so the runner and the
+        # benchmarks cannot drift; max_bs is itself a bucket, which is what gives
+        # a non-bucket batch (e.g. 10) an exact graph.
+        self.graph_bs = graph_buckets(config.max_num_seqs)
         self.graphs = {}
         self.graph_pool = None
 
