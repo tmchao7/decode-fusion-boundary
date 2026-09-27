@@ -159,6 +159,7 @@ class TaskGraphDecoder:
         import torch
 
         from nanovllm.backends.megakernel import schedule as tg_schedule
+        from nanovllm.backends.megakernel.row_contract import row_active_mask
         from nanovllm.backends.megakernel.weights import _pack_layer_weights
 
         self._torch = torch
@@ -242,7 +243,9 @@ class TaskGraphDecoder:
         i32 = dict(dtype=torch.int32, device="cuda")
         self._page_table = torch.zeros(bs, self._max_pages, **i32)
         self._cache_seqlens = torch.zeros(bs, **i32)
-        self._row_active = torch.ones(bs, **i32)
+        # Built through the shared contract (see row_contract.py): every row
+        # active, which is what a per-batch-size launch always wants.
+        self._row_active = torch.tensor(row_active_mask(None, bs), **i32)
         # Lazily-allocated 1-row staging for decode_row() (see its docstring).
         self._row_input = None
         self._row_pos = None
@@ -338,12 +341,19 @@ class TaskGraphDecoder:
 
     # -- decode ------------------------------------------------------------
 
-    def decode_rows(self, input_ids, positions, block_tables) -> list[int]:
+    def decode_rows(
+        self, input_ids, positions, block_tables, active_rows=None
+    ) -> list[int]:
         """One decode step for every row.
 
         ``input_ids``/``positions`` are 1-D int64 CUDA tensors; ``block_tables``
         is the padded ``[rows, <= max_pages]`` int32 CUDA tensor from
         ``ModelRunner.prepare_block_tables``. Returns one token id per row.
+
+        ``active_rows`` is the per-row activation mask (``None`` = every row).
+        Inactive rows skip the **KV cache write only** -- see
+        ``row_contract.py`` for why that is a correctness requirement under
+        continuous batching, and for the validation that goes with it.
 
         With ``fusion_groups > 1`` the step is executed as that many
         back-to-back cooperative launches, one per layer segment. Everything
@@ -405,6 +415,13 @@ class TaskGraphDecoder:
                 Q_SIZE, KV_SIZE, NUM_Q_HEADS, NUM_KV_HEADS,
                 HEAD_DIM, VOCAB_SIZE, 1, 1, MAX_ATTN_SPLITS,
             )
+        # Only touched when a caller supplies a mask: the default path must not
+        # pay an extra host-to-device copy per step.
+        if active_rows is not None:
+            self._row_active[:rows].copy_(
+                torch.tensor(row_active_mask(active_rows, rows), **i32)
+            )
+
         # One sync for the whole batch. ``.item()`` per row would serialize a
         # D2H per row; the sampled ids are contiguous in the int32 alias.
         return self._lm_logits_i32[:rows, 0].cpu().tolist()

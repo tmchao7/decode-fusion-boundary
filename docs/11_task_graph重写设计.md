@@ -743,7 +743,25 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
   `backends/megakernel/backend.py` 每步接入**（scheduler 选 batch/geometry，
   `TaskGraphDecoder` 按行 launch）。仍未实现的是本设计稿 §7 那套设备侧常驻
   `runtime.cu` / `session.py` 调度，不要把当前的每步调度当成它。
+  **2026-09-28 补充**：`row_active` 原先是一处"永远全 1"的隐式脚手架 ——
+  契约现在显式化在 `row_contract.py`（校验长度、至少激活一行；默认全活跃、零额外拷贝），
+  `decode_rows(..., active_rows=...)` 才写入掩码，并有 `tests/test_row_contract.py`
+  从 host / launcher / kernel **三侧**锁定（含"只有 KV 写入被门控、bar 仍全部到达"
+  这一条，它才是掩码不影响调度的原因）。
 - sampling：只有 greedy argmax，无 temperature/top-p。
+
+### 11.3b 离线可验证能力（2026-09-28，无需 GPU）
+
+本设计稿的调度面现在有独立的离线验证与成本模型，改动 `schedule.py` 的前置门禁在此：
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| 调度静态验证 | `tools/verify_schedule.py`、[17](17_调度验证器.md) | 两个检测器（执行/到达计数）+ 一个定位器（依赖环）；对抗性变异种群 282,720，抽样 1438 全被拒、**零误接受** |
+| 成本模型与预注册预测 | `src/nanovllm/cost_model.py`、[18](18_成本模型.md) | 波=依赖层级（170 层，每层同质），K 步 11612；单点标定后对 1 SM 的外样本预测误差 +4.6% |
+| 行激活契约 | `row_contract.py` | 见上一条；三侧锁定 |
+
+这三项**不能**替代服务器上的 correctness 门与 compute-sanitizer，它们只是把能在本地
+抓到的那一类问题拦在最前面（详见 17/18 的"局限"）。
 
 ### 11.4 服务器实测结果（2026-09-23，A100-SXM4-80GB）
 
