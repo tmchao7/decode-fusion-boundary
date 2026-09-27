@@ -265,6 +265,49 @@ class ServerCommandReferenceTests(unittest.TestCase):
             f"SERVER_COMMANDS.txt: {stale}",
         )
 
+    def test_every_gpu_test_module_is_invoked_with_a_working_runner(self) -> None:
+        """The kernel's correctness modules must actually run on the server.
+
+        They were previously invoked by *nothing* -- RUN_MODE=taskgraph ran only
+        the three CPU-side modules, so the seven kernel validation modules would
+        have been run only if an operator remembered to. A script-style module
+        invoked through unittest is worse than skipped: it reports zero tests and
+        exits 0.
+        """
+
+        tests_dir = REPO_ROOT / "tests"
+        modules = sorted(
+            path.stem
+            for path in tests_dir.glob("test_taskgraph_*.py")
+        ) + sorted(path.stem for path in tests_dir.glob("test_tg_*.py"))
+        self.assertTrue(modules)
+
+        for module in modules:
+            source = (tests_dir / f"{module}.py").read_text(encoding="utf-8")
+            unittest_style = "unittest.TestCase" in source
+            with self.subTest(module=module, style="unittest" if unittest_style else "script"):
+                if unittest_style:
+                    self.assertIn(f"tests.{module}", self.text)
+                    self.assertNotIn(f"tests/{module}.py", self.text)
+                else:
+                    self.assertIn(f"tests/{module}.py", self.text)
+                    self.assertNotIn(f"tests.{module}", self.text)
+
+    def test_the_offline_schedule_gate_runs_before_the_build(self) -> None:
+        """docs/17 makes the verifier a precondition for touching schedule.py."""
+
+        body = self._function_body("run_build")
+        gate = body.index("tools.verify_schedule")
+        build = body.index("nanovllm.backends.megakernel.build")
+        self.assertLess(gate, build)
+        self.assertIn("--sample", body)
+
+    def test_the_attn_splits_comparison_is_wired(self) -> None:
+        body = self._function_body("run_taskgraph_baseline")
+
+        self.assertIn("--attn-splits 2", body)
+        self.assertIn("taskgraph_attn_correctness", body)
+
     def test_documented_commands_use_flags_that_exist(self) -> None:
         """A wrong flag in a doc costs the same session as one in the command file.
 

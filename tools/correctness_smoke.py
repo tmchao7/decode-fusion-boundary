@@ -20,6 +20,29 @@ BACKENDS = {
 }
 
 
+def backend_config(name: str, attn_splits: int = 1) -> dict:
+    """Engine kwargs for one backend, with the attention split count applied.
+
+    ``attn_splits`` only reaches the megakernel: it selects how many SM groups
+    produce unnormalized attention partials, which the combine wave then
+    renormalizes (see docs/11 §11.3). The torch backends have nothing to split,
+    so passing a value there is a caller error rather than a silent no-op.
+    """
+
+    if name not in BACKENDS:
+        raise ValueError(f"unknown backend: {name}")
+    if attn_splits < 1:
+        raise ValueError(f"attn_splits must be >= 1; got {attn_splits}")
+    config = dict(BACKENDS[name])
+    if attn_splits != 1:
+        if name != "megakernel":
+            raise ValueError(
+                f"attn_splits only applies to the megakernel backend, not {name}"
+            )
+        config["megakernel_attn_splits"] = attn_splits
+    return config
+
+
 def prompt_ids(length: int, seed: int, index: int = 0) -> list[int]:
     rng = random.Random(seed + index * 104729 + length * 1009)
     return [rng.randrange(1, 10000) for _ in range(length)]
@@ -73,13 +96,13 @@ def build_cases(
     return cases
 
 
-def run_backend(model: str, name: str, prompts, max_tokens: int):
+def run_backend(model: str, name: str, prompts, max_tokens: int, attn_splits: int = 1):
     import torch
     from nanovllm import LLM, SamplingParams
 
     llm = LLM(
         model,
-        **BACKENDS[name],
+        **backend_config(name, attn_splits),
         max_num_seqs=len(prompts),
         max_model_len=2048,
     )
@@ -111,7 +134,7 @@ def serialize_backend_result(result: dict) -> dict:
     }
 
 
-def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int):
+def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int, attn_splits: int = 1):
     """Run one CUDA backend in a fresh process and return JSON-safe data."""
 
     try:
@@ -123,7 +146,7 @@ def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int)
         connection.close()
 
 
-def run_backend_isolated(model: str, name: str, prompts, max_tokens: int) -> dict:
+def run_backend_isolated(model: str, name: str, prompts, max_tokens: int, attn_splits: int = 1) -> dict:
     """Run a backend in a clean process so CUDA allocator state cannot leak.
 
     A backend may reserve most of the GPU for its paged KV pool. Reusing the
@@ -263,6 +286,16 @@ def main() -> None:
     )
     parser.add_argument("--backends", default="torch-eager,torch-cudagraph,megakernel")
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument(
+        "--attn-splits",
+        type=int,
+        default=1,
+        help=(
+            "megakernel_attn_splits for the megakernel backend: how many SM "
+            "groups produce partial attention (the combine wave renormalizes). "
+            "Only valid with the megakernel backend."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--require-megakernel", action="store_true")
     parser.add_argument(
@@ -305,7 +338,7 @@ def main() -> None:
         for backend in backend_names:
             print(f"Running correctness: case={case['id']} backend={backend}", flush=True)
             backend_results[backend] = run_backend_isolated(
-                args.model, backend, case["prompts"], args.max_tokens
+                args.model, backend, case["prompts"], args.max_tokens, args.attn_splits
             )
         reference = backend_results["torch-eager"]["outputs"]
         checks = {}
@@ -363,6 +396,8 @@ def main() -> None:
         "model": os.path.abspath(args.model),
         "max_tokens": args.max_tokens,
         "batch_sizes": args.batch_sizes,
+        # Recorded because two runs of this tool can differ only in this value.
+        "attn_splits": args.attn_splits,
         "cases": results,
     }
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"

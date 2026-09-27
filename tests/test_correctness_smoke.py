@@ -1,6 +1,7 @@
 import unittest
 
 from tools.correctness_smoke import (
+    backend_config,
     classify_comparison,
     compare_outputs,
     serialize_backend_result,
@@ -89,3 +90,29 @@ class ClassifyComparisonTests(unittest.TestCase):
         """With only one token (prefill), any mismatch is FAIL (token 0)."""
         status, _ = classify_comparison([[1]], [[99]])
         self.assertEqual(status, "FAIL")
+
+
+class BackendConfigTests(unittest.TestCase):
+    """``--attn-splits`` must reach the engine, and only where it means something."""
+
+    def test_default_is_the_plain_backend_config(self) -> None:
+        self.assertEqual(
+            backend_config("megakernel"),
+            {"decode_backend": "megakernel", "enforce_eager": False},
+        )
+
+    def test_attn_splits_reaches_the_megakernel(self) -> None:
+        config = backend_config("megakernel", 2)
+
+        self.assertEqual(config["megakernel_attn_splits"], 2)
+        self.assertEqual(config["decode_backend"], "megakernel")
+
+    def test_attn_splits_on_a_torch_backend_is_a_caller_error(self) -> None:
+        with self.assertRaises(ValueError):
+            backend_config("torch-cudagraph", 2)
+
+    def test_invalid_inputs_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            backend_config("nope")
+        with self.assertRaises(ValueError):
+            backend_config("megakernel", 0)

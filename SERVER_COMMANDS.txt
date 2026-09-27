@@ -99,6 +99,12 @@ run_bandwidth() {
 
 run_build() {
   require_model
+  # Offline gate first: a schedule that cannot execute must never reach a paid
+  # session, and a cooperative deadlock hangs the device (docs/17). Non-zero exit
+  # stops the chain. --sample bounds the adversarial sweep; see docs/17 §3.
+  python -m tools.verify_schedule --sample 60 \
+    --json results/schedule_verification.json \
+    2>&1 | tee results/schedule_verification.log
   select_gpu
   rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
   python -m nanovllm.backends.megakernel.build 2>&1 | tee results/a100_build.log
@@ -159,6 +165,18 @@ run_taskgraph() {
     tests.test_taskgraph_abi tests.test_taskgraph_backend \
     tests.test_taskgraph_kernel_source -v \
     2>&1 | tee results/taskgraph_abi_backend.log
+  # GPU correctness modules. The first four are unittest classes; the last three
+  # are scripts -- invoking a script through unittest reports 0 tests and exits 0,
+  # which is worse than not running it at all. tests/test_server_commands.py locks
+  # both the coverage and the runner style.
+  python -m unittest \
+    tests.test_taskgraph_smoke tests.test_taskgraph_positions \
+    tests.test_taskgraph_bs2 tests.test_taskgraph_multi_sm -v \
+    2>&1 | tee results/taskgraph_gpu_tests.log
+  python tests/test_tg_weight_check.py 2>&1 | tee results/tg_weight_check.log
+  python tests/test_tg_layer_sweep.py 2>&1 | tee results/tg_layer_sweep.log
+  python tests/test_tg_logits_compare.py 2>&1 | tee results/tg_logits_compare.log
+
   python -m tools.bench_taskgraph \
     --model "$MODEL" \
     --batch-size 1,2,4,8 \
@@ -183,6 +201,20 @@ run_taskgraph_baseline() {
     --allow-cascade \
     --json results/taskgraph_baseline_correctness.json \
     2>&1 | tee results/taskgraph_baseline_correctness.log
+
+  # attn_splits=2 writes unnormalized partials that the combine wave renormalizes
+  # (docs/11 §11.3). The split changes only the bf16 reduction order, so this is
+  # the numeric comparison that the CPU-side verifier cannot make.
+  python -m tools.correctness_smoke "$MODEL" \
+    --workloads benchmarks/workloads.json \
+    --backends torch-eager,megakernel \
+    --batch-sizes 1,2,4,8 \
+    --max-tokens 16 \
+    --attn-splits 2 \
+    --require-megakernel \
+    --allow-cascade \
+    --json results/taskgraph_attn_correctness.json \
+    2>&1 | tee results/taskgraph_attn_correctness.log
 
   python -m benchmarks.compare "$MODEL" \
     --suite performance \
