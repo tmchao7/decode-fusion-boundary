@@ -115,6 +115,10 @@ def weights_from_nano_model(model, hf_config):
         raise RuntimeError("Qwen Megakernel requires BF16 model weights")
     if getattr(hf_config, "attention_bias", False):
         raise RuntimeError("Qwen Megakernel requires Qwen QK normalization")
+    if model.lm_head.weight.data_ptr() != qwen.embed_tokens.weight.data_ptr():
+        raise RuntimeError(
+            "Qwen Megakernel requires tied lm_head and embed_tokens storage"
+        )
 
     layer_weights = []
     for layer in qwen.layers:

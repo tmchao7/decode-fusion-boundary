@@ -25,6 +25,18 @@ class TaskGraphKernelSourceTests(unittest.TestCase):
             (ROOT / "src/nanovllm/backends/megakernel/weights.py").exists()
         )
 
+    def test_active_kernel_has_no_unwired_ring_scaffold(self):
+        kernel = KERNEL.read_text(encoding="utf-8")
+        for symbol in (
+            "tg_controller_loop",
+            "tg_worker_loop",
+            "tg_ring_init",
+            "tg_ring_wait",
+        ):
+            self.assertNotIn(symbol, kernel)
+        self.assertIn("inst_shared", kernel)
+
+
 
 if __name__ == "__main__":
     unittest.main()

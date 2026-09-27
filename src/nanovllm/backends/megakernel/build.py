@@ -49,7 +49,6 @@ def taskgraph_kernel_flags() -> list[str]:
     return [
         f"-DTG_NUM_BLOCKS={_env_int('TG_NUM_BLOCKS', 108)}",
         f"-DTG_BLOCK_SIZE={_env_int('TG_BLOCK_SIZE', 256)}",
-        f"-DTG_INST_RING={_env_int('TG_INST_RING', 4)}",
         f"-DTG_B_STAGES={_env_int('TG_B_STAGES', 8)}",
         "-DTG_MAX_BATCH=8",
     ]

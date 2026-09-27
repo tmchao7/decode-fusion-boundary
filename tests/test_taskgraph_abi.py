@@ -170,9 +170,11 @@ class BuildFlagSyncTests(unittest.TestCase):
         self.assertEqual(self._kernel_default("TG_BLOCK_SIZE"), 256)
         self.assertEqual(self._build_default("TG_BLOCK_SIZE"), 256)
 
-    def test_tg_inst_ring(self) -> None:
-        self.assertEqual(self._kernel_default("TG_INST_RING"), 4)
-        self.assertEqual(self._build_default("TG_INST_RING"), 4)
+    def test_active_dispatch_has_no_dead_instruction_ring_build_flag(self) -> None:
+        """The active kernel uses the simple synchronized dispatch loop."""
+
+        self.assertNotIn("TG_INST_RING", read(TG_KERNEL_CU))
+        self.assertNotIn("TG_INST_RING", read(BUILD_PY))
 
     def test_tg_b_stages(self) -> None:
         # The cp.async pipeline depth. Env-overridable so the depth can be A/B'd

@@ -53,6 +53,10 @@ def qwen3_contract_mismatch(config) -> str | None:
     """
 
     hf_config = _get_attr(config, "hf_config")
+    if _get_attr(hf_config, "tie_word_embeddings", True) is not True:
+        return "tie_word_embeddings"
+    if _get_attr(hf_config, "attention_bias", False) is not False:
+        return "attention_bias"
     for name, expected in QWEN3_CONTRACT.items():
         if name == "max_model_len":
             actual = _get_attr(config, "max_model_len", 2048)

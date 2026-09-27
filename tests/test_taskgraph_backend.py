@@ -143,6 +143,19 @@ class BackendDispatchTests(unittest.TestCase):
         self.assertFalse(decision.supported)
         self.assertIn("unsupported Qwen config", decision.reason)
 
+    def test_taskgraph_rejects_untied_embeddings_and_attention_bias(self):
+        for override, expected in (
+            ({"tie_word_embeddings": False}, "tie_word_embeddings"),
+            ({"attention_bias": True}, "attention_bias"),
+        ):
+            with self.subTest(field=expected):
+                config = make_config(hf_config=make_hf_config(**override))
+                decision = MegakernelBackend.compatibility(
+                    config, [greedy_seq()], is_prefill=False
+                )
+                self.assertFalse(decision.supported)
+                self.assertIn(expected, decision.reason)
+
     def test_is_megakernel_backend_covers_only_the_mainline_path(self):
         self.assertTrue(is_megakernel_backend("megakernel"))
         self.assertFalse(is_megakernel_backend("megakernel-tg"))
@@ -556,3 +569,12 @@ class BarAllocationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class WeightContractSourceTests(unittest.TestCase):
+    def test_weight_loader_checks_tied_storage_identity(self):
+        source = (
+            REPO_ROOT / "src" / "nanovllm" / "backends" / "megakernel" / "weights.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("lm_head.weight.data_ptr()", source)
+        self.assertIn("embed_tokens.weight.data_ptr()", source)
+        self.assertIn("tied lm_head and embed_tokens storage", source)

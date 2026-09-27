@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
-from transformers import AutoConfig
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from transformers import AutoConfig
 
 
 # ``megakernel`` -> the task-graph persistent kernel (docs/11/12/13)
@@ -38,7 +43,7 @@ class Config:
     # vectorization before more splits).
     megakernel_attn_splits: int = 1
     megakernel_verbose: bool = False
-    hf_config: AutoConfig | None = None
+    hf_config: Any | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -60,8 +65,35 @@ class Config:
                 "megakernel_attn_splits must be >= 1; got "
                 f"{self.megakernel_attn_splits}"
             )
-        assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
-        assert 1 <= self.tensor_parallel_size <= 8
+        if not os.path.isdir(self.model):
+            raise ValueError(f"model directory does not exist: {self.model}")
+        if self.max_num_batched_tokens < 1:
+            raise ValueError(
+                "max_num_batched_tokens must be >= 1; got "
+                f"{self.max_num_batched_tokens}"
+            )
+        if self.max_num_seqs < 1:
+            raise ValueError(f"max_num_seqs must be >= 1; got {self.max_num_seqs}")
+        if self.max_model_len < 1:
+            raise ValueError(f"max_model_len must be >= 1; got {self.max_model_len}")
+        if self.gpu_memory_utilization <= 0.0 or self.gpu_memory_utilization > 1.0:
+            raise ValueError(
+                "gpu_memory_utilization must be in (0, 1]; got "
+                f"{self.gpu_memory_utilization}"
+            )
+        if self.kvcache_block_size < 256 or self.kvcache_block_size % 256 != 0:
+            raise ValueError(
+                "kvcache_block_size must be a multiple of 256 and >= 256; got "
+                f"{self.kvcache_block_size}"
+            )
+        if not 1 <= self.tensor_parallel_size <= 8:
+            raise ValueError(
+                "tensor_parallel_size must be in [1, 8]; got "
+                f"{self.tensor_parallel_size}"
+            )
+        # Keep importing the optional server stack lazy so CPU-only scheduler
+        # and configuration tests can run without transformers installed.
+        from transformers import AutoConfig
+
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

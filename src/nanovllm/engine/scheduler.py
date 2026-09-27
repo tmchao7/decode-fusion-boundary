@@ -20,6 +20,16 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self._peak_waiting_sequences = 0
+        self._peak_running_sequences = 0
+
+    def _update_peaks(self) -> None:
+        self._peak_waiting_sequences = max(
+            self._peak_waiting_sequences, len(self.waiting)
+        )
+        self._peak_running_sequences = max(
+            self._peak_running_sequences, len(self.running)
+        )
 
 
     def is_finished(self):
@@ -27,6 +37,7 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+        self._update_peaks()
 
     def _should_schedule_decode(self) -> bool:
         """Prefer decode when waiting prefill would otherwise starve ITL."""
@@ -38,20 +49,24 @@ class Scheduler:
 
     # schedule 收集 要处理的token序列 及其对应的flag(p or d)，貌似一次就反馈一组？就返回一个元组
     def schedule(self) -> tuple[list[Sequence], bool]:
+        self._update_peaks()
         if self._should_schedule_decode():
             scheduled = self._schedule_decode()
             if scheduled:
                 self._decode_steps_since_prefill += 1
+                self._update_peaks()
                 return scheduled, False
 
         scheduled = self._schedule_prefill()
         if scheduled:
             self._decode_steps_since_prefill = 0
+            self._update_peaks()
             return scheduled, True
 
         scheduled = self._schedule_decode()
         if scheduled:
             self._decode_steps_since_prefill += 1
+            self._update_peaks()
             return scheduled, False
         raise RuntimeError("scheduler made no progress")
 
@@ -105,7 +120,9 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        # KV pressure may preempt every running sequence. In that case the
+        # caller must be allowed to schedule waiting prefill instead of
+        # crashing on an empty decode batch.
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs
 
@@ -135,6 +152,8 @@ class Scheduler:
         return {
             "waiting_sequences": len(self.waiting),
             "running_sequences": len(self.running),
+            "peak_waiting_sequences": self._peak_waiting_sequences,
+            "peak_running_sequences": self._peak_running_sequences,
             "decode_steps_since_prefill": self._decode_steps_since_prefill,
             "prefill_decode_ratio": self.prefill_decode_ratio,
             **self.block_manager.stats(),

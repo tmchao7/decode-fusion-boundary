@@ -351,30 +351,28 @@ bar 数组每步 decode 前必须清零（上一步的计数器是旧的）。ho
 
 ## 5. Persistent Worker 循环
 
-### 5.1 kernel 入口（`tg_decode_kernel`）
+### 5.1 当前 kernel 入口（`tg_decode_kernel`）
+
+当前实现采用 correctness-first 的单共享指令缓冲，而不是设计稿早期的异步
+instruction ring：
 
 ```cpp
-__global__ __launch_bounds__(TG_BLOCK_SIZE, 1)
-void tg_decode_kernel(__grid_constant__ const TgGlobals g) {
-  // grid = num_sms, block = TG_BLOCK_SIZE (e.g. 256 = 8 warps)
-  const int bid = blockIdx.x;
-  const int num_inst = g.num_inst_per_sm[bid];
-  const int *sm_base = g.inst_buf + bid * g.max_inst * TG_INST_WIDTH;
+__shared__ int inst_shared[TG_INST_WIDTH];
 
-  // 指令环形缓冲（双缓冲，depth = TG_INST_RING = 4）
-  __shared__ int inst_ring[TG_INST_RING][TG_INST_WIDTH];
-  __shared__ uint32_t inst_arrived[TG_INST_RING];  // controller → worker
-  __shared__ uint32_t inst_done[TG_INST_RING];     // worker → controller
-
-  if (threadIdx.x < WARP_SIZE) {
-    // warp 0 = controller：预取指令
-    tg_controller_loop(inst_ring, inst_arrived, inst_done, sm_base, num_inst);
-  } else {
-    // warp 1..7 = worker：按 task dispatch
-    tg_worker_loop(inst_ring, inst_arrived, inst_done, g, bid);
+for (int i = 0; i < num_inst; ++i) {
+  if (warp_id == 0) {
+    tg_coop_load_inst(inst_shared, sm_base + i * TG_INST_WIDTH);
   }
+  __syncthreads();
+  if (warp_id != 0) {
+    tg_dispatch(inst_shared, g, bid, smem);
+  }
+  __syncthreads();
 }
 ```
+
+这条路径是当前 mainline 的真实执行路径。未来如果要重新引入异步 ring，必须
+单独做 ABI/死锁/性能 A/B，不应把未接入的 ring 代码当作当前实现能力。
 
 ### 5.2 角色简化（sm_80 无 TMA）
 
@@ -390,29 +388,12 @@ worker 间用 `bar.sync`（命名空间 1）同步指令边界（仿 cohere `wor
 worker 在进入下一条指令前完成当前指令的自己那部分。**关键不变式**：每个 worker warp
 在每条指令上执行**相同次数**的 `bar.sync`（`NOP` 也要走，否则 arrival 错位死锁）。
 
-### 5.3 controller / worker 双缓冲
+### 5.3 指令 dispatch 的当前限制
 
-```cpp
-// controller (warp 0)
-for (int i = 0; i < num_inst; ++i) {
-  int cur = i % TG_INST_RING;
-  if (i >= TG_INST_RING) tg_wait_shared(inst_done[cur], (i/TG_INST_RING)%2);
-  tg_coop_load_inst(inst_ring[cur], sm_base, i);  // 32 lane 各读一个 int
-  tg_arrive_shared(inst_arrived[cur], (i/TG_INST_RING)%2);
-}
-
-// worker (warp 1..7)
-for (int i = 0; i < num_inst; ++i) {
-  int cur = i % TG_INST_RING;
-  tg_wait_shared(inst_arrived[cur], (i/TG_INST_RING)%2);
-  tg_dispatch_instruction(inst_ring[cur], g, bid);  // 大 switch(opcode)
-  bar.sync 1;  // worker_sync
-  if (lane == 0) tg_arrive_shared(inst_done[cur], (i/TG_INST_RING)%2);
-}
-```
-
-shared memory 的 semaphore 用 `__shared__ uint32_t` + `volatile` 轮询 + `__syncthreads`
-数组（仿 cohere `megakernel.cuh:3070-3128`）。
+当前每条 instruction 都经过一次 controller load、CTA barrier、worker dispatch、
+CTA barrier。这样做便于先锁定 schedule/bar correctness，但也意味着 instruction
+fetch 和同步开销仍在关键路径上。优化方向应通过服务器上的 nsys 时间线验证后再做，
+不要预先假设 ring buffer 一定收益。
 
 ### 5.4 tile 分配（backfill 的关键）
 
@@ -680,7 +661,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
    能让"空闲 SM 去跑别的 task"弥补 padding 浪费。
 
 3. **指令 buffer 带宽**：28 层 × 每层 ~50 task × 16 int = ~22K int/SM。A100 HBM 带宽
-   够，但 controller 预取要跟得上 worker 消费。`TG_INST_RING=4` 双缓冲应够；若不够再加深。
+   够，但 controller 预取要跟得上 worker 消费。当前实现没有 `TG_INST_RING`；若未来引入 ring，必须先用 nsys 验证 fetch/sync 是否值得。
 
 4. **cooperative launch 仍需**：persistent worker 自旋 `tg_wait` 需要所有 block 驻留，
    所以仍用 `cudaLaunchCooperativeKernel`。A100 occupancy=1 block/SM（`__launch_bounds__

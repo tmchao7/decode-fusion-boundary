@@ -57,9 +57,6 @@ constexpr float TG_RMS_EPS = 1e-6f;
 #ifndef TG_BLOCK_SIZE
 #define TG_BLOCK_SIZE 256  // 8 warps/CTA; occupancy=1 block/SM via __launch_bounds__
 #endif
-#ifndef TG_INST_RING
-#define TG_INST_RING 4     // controller/worker double-buffer depth
-#endif
 #ifndef TG_MAX_BATCH
 #define TG_MAX_BATCH 8     // compile-time ceiling for scratch/bar sizing (BS ∈ {1,2,4,8})
 #endif
@@ -226,49 +223,6 @@ __device__ __forceinline__ void tg_wait_all(const uint32_t* bar1, int idx1,
     tg_fence_gpu();
   }
   tg_worker_sync_inner();
-}
-
-// =============================================================================
-// Shared-memory instruction-ring semaphores (controller <-> worker).
-// These are intra-CTA, so plain __syncthreads-style shared atomics suffice.
-// Pattern adapted from cohere megakernel.cuh:3070-3128 (simplified: we use a
-// single arrival counter per ring slot instead of a generation sense-flip
-// because TG_INST_RING is small and we reset per step).
-// =============================================================================
-
-// Initialize the ring semaphores. ``done`` starts at 0 (no generation has
-// been consumed yet); the controller's first-generation wait target is also 0
-// (i / RING = 0 for i < RING), so it proceeds without blocking.
-__device__ __forceinline__ void tg_ring_init(uint32_t* arrived, uint32_t* done,
-                                             int ring) {
-  if (threadIdx.x == 0) {
-#pragma unroll
-    for (int i = 0; i < ring; ++i) {
-      arrived[i] = 0;
-      done[i] = 0;
-    }
-  }
-  __syncthreads();
-}
-
-__device__ __forceinline__ uint32_t tg_ring_load(volatile uint32_t* slot) {
-  uint32_t val;
-  uint32_t addr = (uint32_t)__cvta_generic_to_shared(const_cast<uint32_t*>(slot));
-  asm volatile("ld.shared.volatile.u32 %0, [%1];" : "=r"(val) : "r"(addr));
-  return val;
-}
-
-__device__ __forceinline__ void tg_ring_set(uint32_t* slot, uint32_t val) {
-  uint32_t addr = (uint32_t)__cvta_generic_to_shared(slot);
-  asm volatile("st.shared.volatile.u32 [%0], %1;"
-               :: "r"(addr), "r"(val) : "memory");
-}
-
-__device__ __forceinline__ void tg_ring_wait(volatile uint32_t* slot,
-                                             uint32_t target) {
-  while (tg_ring_load(slot) < target) {
-    __nanosleep(100);
-  }
 }
 
 // =============================================================================
@@ -1776,56 +1730,6 @@ __device__ __forceinline__ void tg_dispatch(const int* inst, TgGlobals& g,
 }
 
 // =============================================================================
-// Controller loop (warp 0). Prefetches instructions into the shared ring,
-// signalling workers via inst_arrived and waiting for inst_done before
-// reusing a ring slot. Adapted from cohere megakernel.cuh:3074-3095.
-//
-// NOTE: UNUSED SCAFFOLDING. The kernel entry currently dispatches with a plain
-// __syncthreads() loop (correctness-first; see tg_decode_kernel), so
-// tg_controller_loop / tg_worker_loop / the tg_ring_* semaphores are never
-// called. They are kept for the planned ring-buffer dispatch; delete or wire
-// them up when that lands.
-// =============================================================================
-
-__device__ __forceinline__ void tg_controller_loop(
-    int (*inst_ring)[TG_INST_WIDTH], uint32_t* inst_arrived,
-    uint32_t* inst_done, const int* sm_base, int num_inst) {
-  for (int i = 0; i < num_inst; ++i) {
-    int cur = i % TG_INST_RING;
-    // Wait for the worker to release this ring slot.  The worker sets
-    // done[cur] = (prev_i / RING) + 1 after consuming the previous generation.
-    // For generation gen = i / RING, the controller waits for done >= gen
-    // (i.e. the previous generation's done value).  For the first generation
-    // (i < RING), gen = 0 and done was initialized to 0, so the wait is a
-    // no-op (0 >= 0).
-    uint32_t wait_target = (uint32_t)(i / TG_INST_RING);
-    tg_ring_wait(&inst_done[cur], wait_target);
-    // Cooperatively load the 16-int instruction.
-    tg_coop_load_inst(inst_ring[cur], sm_base + i * TG_INST_WIDTH);
-    // Signal workers that slot cur is ready (arrived = gen + 1).
-    uint32_t val = (i / TG_INST_RING) + 1;
-    tg_ring_set(&inst_arrived[cur], val);
-  }
-}
-
-// =============================================================================
-// Worker loop (warps 1..TG_WORKER_WARPS). Waits for the controller to publish
-// each instruction, dispatches it, then signals the slot is reusable.
-// Adapted from cohere megakernel.cuh:3097-3128.
-// =============================================================================
-
-__device__ __forceinline__ void tg_worker_loop(
-    int (*inst_ring)[TG_INST_WIDTH], uint32_t* inst_arrived,
-    uint32_t* inst_done, TgGlobals& g, int bid) {
-  // Worker warps read num_inst from globals (already loaded by controller into
-  // shared would be one option; we re-read from the per-SM count array via a
-  // shared copy set by controller). For simplicity, controller writes num_inst
-  // to a shared int before the loop; workers read it. (Implemented below in
-  // the kernel entry — we pass num_inst through shared memory.)
-  // NOTE: num_inst is passed via the kernel entry's shared mem (see below).
-}
-
-// =============================================================================
 // Persistent kernel entry.
 // =============================================================================
 
@@ -1836,11 +1740,10 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
   const int num_inst = g.num_inst_per_sm[bid];
   const int* sm_base = g.inst_buf + (int64_t)bid * g.max_inst * TG_INST_WIDTH;
 
-  // Shared-memory instruction ring + semaphores.
-  __shared__ int inst_ring[TG_INST_RING][TG_INST_WIDTH];
-  __shared__ uint32_t inst_arrived[TG_INST_RING];
-  __shared__ uint32_t inst_done[TG_INST_RING];
-  __shared__ int shared_num_inst;
+  // One shared instruction buffer. The active implementation uses a
+  // correctness-first load/sync/dispatch/sync loop; an asynchronous ring can
+  // be introduced later only with a dedicated correctness and performance A/B.
+  __shared__ int inst_shared[TG_INST_WIDTH];
 
   // Shared memory for compute ops (see TgSmem).
   // s_norm is in dynamic shared memory (extern __shared__) because it needs
@@ -1870,26 +1773,20 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
   smem.s_argmax_val = s_argmax_val;
   smem.s_argmax_idx = s_argmax_idx;
 
-  if (threadIdx.x == 0) shared_num_inst = num_inst;
-  tg_ring_init(inst_arrived, inst_done, TG_INST_RING);
-  __syncthreads();
-
   const int warp_id = threadIdx.x / TG_WARP_SIZE;
 
   // Simple __syncthreads-based dispatch (no ring buffer).
   // Controller (warp 0) loads instruction, all threads sync, workers dispatch,
   // all threads sync.
-  int local_num_inst = shared_num_inst;
-  for (int i = 0; i < local_num_inst; ++i) {
-    int cur = i % TG_INST_RING;
-    // Controller loads instruction into shared ring
+  for (int i = 0; i < num_inst; ++i) {
+    // Controller loads one instruction into shared memory.
     if (warp_id == 0) {
-      tg_coop_load_inst(inst_ring[cur], sm_base + i * TG_INST_WIDTH);
+      tg_coop_load_inst(inst_shared, sm_base + i * TG_INST_WIDTH);
     }
     __syncthreads();
-    // Workers dispatch
+    // Workers dispatch.
     if (warp_id != 0) {
-      tg_dispatch(inst_ring[cur], g, bid, smem);
+      tg_dispatch(inst_shared, g, bid, smem);
     }
     __syncthreads();
   }
