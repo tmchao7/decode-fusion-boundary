@@ -25,6 +25,7 @@ from nanovllm.metrics import (
     merge_metric_reports,
     dump_json,
     environment_metadata,
+    summarize_runs,
 )
 from tools.workloads import load_workloads
 
@@ -240,6 +241,35 @@ def run_case(
                     "telemetry": telemetry.summary(),
                 }
             )
+
+        # Per-run scalars plus their cross-run dispersion. The merged summary
+        # below pools every token of every run, which hides *between-run*
+        # variance; a reviewer asking "is this 1.31x significant?" is asking
+        # about exactly this, so keep one scalar per run and a bootstrap CI.
+        per_run = []
+        for run_result in run_results:
+            run_summary = run_result["metrics"]["summary"]
+            output_tokens = run_summary.get("output_tokens") or 0
+            wall_time = run_summary.get("wall_time_s")
+            per_run.append(
+                {
+                    "wall_time_s": wall_time,
+                    "output_tokens": output_tokens,
+                    "wall_ms_per_token": (
+                        None
+                        if not wall_time or not output_tokens
+                        else wall_time * 1000.0 / output_tokens
+                    ),
+                    "tpot_ms": (run_summary.get("tpot_ms") or {}).get("mean"),
+                    "decode_tok_s": run_summary.get("decode_tok_s"),
+                }
+            )
+        run_spread = {
+            key: summarize_runs(
+                [row[key] for row in per_run if row[key] is not None]
+            )
+            for key in ("wall_ms_per_token", "tpot_ms", "decode_tok_s")
+        }
 
         merged_metrics = merge_metric_reports(
             [run_result["metrics"] for run_result in run_results]

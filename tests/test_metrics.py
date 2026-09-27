@@ -1,4 +1,5 @@
 import json
+import statistics
 import unittest
 from types import SimpleNamespace
 
@@ -9,6 +10,8 @@ from nanovllm.metrics import (
     aggregate_requests,
     compare_metric_summaries,
     percentile,
+    summarize,
+    summarize_runs,
 )
 
 
@@ -197,6 +200,104 @@ class SchedulerStatsPassthroughTests(unittest.TestCase):
         self.assertNotIn(
             "scheduler", MetricsCollector("torch").report(wall_time=1.0)["summary"]
         )
+
+
+class SummaryStatisticsTests(unittest.TestCase):
+    def test_reports_dispersion_not_just_the_mean(self):
+        """A mean without dispersion cannot answer "is this difference real?"."""
+
+        summary = summarize([1.0, 2.0, 3.0, 4.0])
+
+        self.assertEqual(summary["count"], 4)
+        self.assertEqual(summary["min"], 1.0)
+        self.assertEqual(summary["max"], 4.0)
+        self.assertAlmostEqual(summary["stddev"], statistics.stdev([1.0, 2.0, 3.0, 4.0]))
+        self.assertAlmostEqual(summary["cov"], summary["stddev"] / 2.5)
+        self.assertEqual(summary["p5"], percentile([1.0, 2.0, 3.0, 4.0], 0.05))
+
+    def test_single_sample_has_no_dispersion(self):
+        summary = summarize([7.0])
+
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["mean"], 7.0)
+        self.assertIsNone(summary["stddev"])
+        self.assertIsNone(summary["cov"])
+
+    def test_empty_sample_is_all_none(self):
+        summary = summarize([])
+
+        for key in ("count", "mean", "stddev", "cov", "min", "max", "p5", "p50"):
+            with self.subTest(key=key):
+                self.assertIsNone(summary[key])
+
+    def test_zero_mean_has_no_coefficient_of_variation(self):
+        summary = summarize([-1.0, 1.0])
+
+        self.assertEqual(summary["mean"], 0.0)
+        self.assertIsNone(summary["cov"])
+
+    def test_scale_is_applied_before_the_statistics(self):
+        summary = summarize([1.0, 2.0], scale=1000.0)
+
+        self.assertEqual(summary["mean"], 1500.0)
+        self.assertEqual(summary["min"], 1000.0)
+
+
+class RunSpreadTests(unittest.TestCase):
+    def test_bootstrap_interval_brackets_the_mean(self):
+        spread = summarize_runs([10.0, 11.0, 12.0, 13.0, 14.0])
+
+        self.assertEqual(spread["count"], 5)
+        self.assertLessEqual(spread["ci95_low"], spread["mean"])
+        self.assertGreaterEqual(spread["ci95_high"], spread["mean"])
+        self.assertAlmostEqual(
+            spread["ci95_half_width"],
+            (spread["ci95_high"] - spread["ci95_low"]) / 2.0,
+        )
+        self.assertGreater(spread["resamples"], 0)
+
+    def test_interval_is_reproducible_for_a_fixed_seed(self):
+        values = [10.0, 11.0, 12.0, 13.0, 14.0]
+
+        self.assertEqual(summarize_runs(values), summarize_runs(values))
+
+    def test_constant_runs_have_zero_spread(self):
+        spread = summarize_runs([5.0] * 5)
+
+        self.assertEqual(spread["stddev"], 0.0)
+        self.assertEqual(spread["cov"], 0.0)
+        self.assertEqual(spread["ci95_low"], 5.0)
+        self.assertEqual(spread["ci95_high"], 5.0)
+
+    def test_single_run_has_no_interval(self):
+        spread = summarize_runs([5.0])
+
+        self.assertEqual(spread["count"], 1)
+        self.assertIsNone(spread["ci95_low"])
+        self.assertIsNone(spread["ci95_high"])
+        self.assertIsNone(spread["ci95_half_width"])
+
+    def test_empty_is_all_none(self):
+        spread = summarize_runs([])
+
+        self.assertIsNone(spread["mean"])
+        self.assertIsNone(spread["ci95_low"])
+        self.assertIsNone(spread["stddev"])
+
+    def test_more_runs_narrow_the_interval(self):
+        """Quoting a CI is only useful if it shrinks as runs are added.
+
+        Compares the same value distribution sampled 4x more often, so the
+        spread is unchanged and only ``n`` differs (a 2-sample baseline cannot
+        estimate spread, so it is not a valid comparison).
+        """
+
+        base = [9.94, 10.03, 9.98, 10.06]
+
+        loose = summarize_runs(base)
+        tight = summarize_runs(base * 4)
+
+        self.assertLess(tight["ci95_half_width"], loose["ci95_half_width"])
 
 
 if __name__ == "__main__":

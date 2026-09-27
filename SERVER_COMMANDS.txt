@@ -12,6 +12,10 @@
 #   RUN_MODE=taskgraph-fusion bash SERVER_COMMANDS.txt    # fusion-granularity sweep
 #   RUN_MODE=all bash SERVER_COMMANDS.txt             # build, correctness, benchmark
 #
+# Statistics: every timed mode runs 5 measured runs and reports per-run
+# dispersion (stddev/CoV) plus a bootstrap 95% CI -- see docs/02 统计口径.
+# docs/06/07's historical tables used runs=3 and are only comparable within
+# themselves.
 # The archived kernel.cu/burst line is intentionally not exposed here. See
 # branch codex/archive/frozen-kernel for historical reproduction commands.
 
@@ -126,7 +130,7 @@ run_benchmark() {
     --batch-sizes 1,2,4,8 \
     --max-tokens 128 \
     --warmup 2 \
-    --runs 3 \
+    --runs 5 \
     --baseline torch-cudagraph \
     --json results/a100_performance.json \
     --markdown results/a100_performance.md \
@@ -178,7 +182,7 @@ run_taskgraph_baseline() {
     --batch-sizes 1,2,4,8 \
     --max-tokens 128 \
     --warmup 2 \
-    --runs 3 \
+    --runs 5 \
     --baseline torch-cudagraph \
     --json results/taskgraph_baseline.json \
     --markdown results/taskgraph_baseline.md \
@@ -202,7 +206,7 @@ run_taskgraph_fusion() {
     --prompt-lengths 32,512,1920 \
     --max-tokens 128 \
     --warmup 2 \
-    --runs 3 \
+    --runs 5 \
     --json results/fusion_granularity.json \
     2>&1 | tee results/fusion_granularity.log
 }

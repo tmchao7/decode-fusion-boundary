@@ -551,7 +551,7 @@ class BarAllocationTests(unittest.TestCase):
 
         for attn_splits in (1, 2):
             for bs in range(1, TG_MAX_BATCH + 1):
-                for num_sms in (1, 4, 108):
+                for num_sms in (1, 4, 108, 170):
                     with self.subTest(attn_splits=attn_splits, BS=bs, num_sms=num_sms):
                         sched = tg_schedule.build_schedule(
                             tg_schedule.default_geometry(BS=bs, attn_splits=attn_splits),

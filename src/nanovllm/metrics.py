@@ -8,6 +8,7 @@ multiple phases of a request.
 from __future__ import annotations
 
 import json
+import random
 import statistics
 import threading
 from contextlib import contextmanager
@@ -33,14 +34,87 @@ def percentile(values: Iterable[float], quantile: float) -> float | None:
     return values[lower] + (values[upper] - values[lower]) * fraction
 
 
+def _sample_stddev(values: list[float]) -> float | None:
+    """Sample standard deviation, ``None`` when it is undefined (n < 2)."""
+
+    if len(values) < 2:
+        return None
+    return statistics.stdev(values)
+
+
 def summarize(values: Iterable[float], scale: float = 1.0) -> dict[str, float | None]:
+    """Distribution summary for one pooled sample.
+
+    Reports absolute dispersion (``stddev``, ``cov``, ``min``/``max``) next to
+    the percentiles, not just the mean: "report all results, not just the best"
+    and "never report ratios without absolute values" (Hoefler & Belli,
+    https://spcl.inf.ethz.ch/Teaching/2024-dphpc/hoefler-scientific-benchmarking.pdf).
+    ``cov`` is the coefficient of variation (stddev / |mean|), which is the
+    number to quote when asked "how stable is this measurement?".
+    """
+
     values = [float(value) * scale for value in values]
+    mean = statistics.fmean(values) if values else None
+    stddev = _sample_stddev(values)
     return {
-        "mean": statistics.fmean(values) if values else None,
+        "count": len(values) or None,
+        "mean": mean,
+        "stddev": stddev,
+        "cov": (
+            None
+            if stddev is None or mean is None or mean == 0.0
+            else stddev / abs(mean)
+        ),
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "p5": percentile(values, 0.05),
         "p50": percentile(values, 0.50),
         "p95": percentile(values, 0.95),
         "p99": percentile(values, 0.99),
     }
+
+
+def summarize_runs(
+    values: Iterable[float],
+    *,
+    resamples: int = 10_000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Cross-run dispersion plus a bootstrap 95% confidence interval.
+
+    ``summarize`` pools every token of every run into one sample, which hides the
+    *between-run* variance — exactly the variance a reviewer asks about
+    ("your 1.31x: is it significant?"). This function takes one scalar per run
+    and reports its dispersion.
+
+    The interval is a deterministic percentile bootstrap rather than a
+    ``mean ± 1.96 σ`` normal interval, because the number of runs is small and
+    normality must not be assumed (Hoefler & Belli #5/#6). The fixed ``seed``
+    keeps reports reproducible.
+    """
+
+    values = [float(value) for value in values]
+    summary: dict[str, Any] = dict(summarize(values))
+    n = len(values)
+    if n < 2:
+        summary["ci95_low"] = None
+        summary["ci95_high"] = None
+        summary["ci95_half_width"] = None
+        summary["resamples"] = resamples if n else None
+        return summary
+
+    rng = random.Random(seed)
+    means = sorted(
+        statistics.fmean(rng.choices(values, k=n)) for _ in range(resamples)
+    )
+    low = percentile(means, 0.025)
+    high = percentile(means, 0.975)
+    summary["ci95_low"] = low
+    summary["ci95_high"] = high
+    summary["ci95_half_width"] = None if low is None or high is None else (high - low) / 2.0
+    summary["resamples"] = resamples
+    return summary
+
 
 
 class CudaEventTimer:

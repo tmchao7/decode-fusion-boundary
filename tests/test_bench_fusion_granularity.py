@@ -128,7 +128,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(args.prompt_lengths, DEFAULT_PROMPT_LENGTHS)
         self.assertEqual(args.max_tokens, 128)
         self.assertEqual(args.warmup, 2)
-        self.assertEqual(args.runs, 3)
+        self.assertEqual(args.runs, 5)
 
     def test_overrides_are_parsed(self):
         args = build_parser().parse_args(

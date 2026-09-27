@@ -541,7 +541,7 @@ class WaveGranularityTests(unittest.TestCase):
 
     def test_max_per_inst_packs_maximally(self) -> None:
         # Always the cap: the grid size must NOT shrink the range.
-        for num_sms in (1, 8, 108):
+        for num_sms in (1, 8, 108, 170):
             self.assertEqual(tg._max_per_inst(192, num_sms), 7)
             self.assertEqual(tg._max_per_inst(10 ** 6, num_sms), 7)
         # Fewer tiles than the cap -> pack what exists.
@@ -568,7 +568,7 @@ class WaveGranularityTests(unittest.TestCase):
         equal width the extra SMs are what shorten the path.
         """
         geo = tg.default_geometry(BS=1, attn_splits=1)
-        for num_sms in (1, 8, 108):
+        for num_sms in (1, 8, 108, 170):
             p1 = wave_k_step_path(geo, num_sms, cap=1)
             p2 = wave_k_step_path(geo, num_sms, cap=2)
             p7 = wave_k_step_path(geo, num_sms, cap=7)
@@ -594,7 +594,7 @@ class WaveGranularityTests(unittest.TestCase):
         """
         geo = tg.default_geometry(BS=2, attn_splits=2)
         ref = None
-        for num_sms in (1, 4, 108):
+        for num_sms in (1, 4, 108, 170):
             sched = tg.build_schedule(geo, num_sms)
             done, total, bars, _ = simulate_execution(sched, num_sms)
             self.assertEqual(done, total)
@@ -989,7 +989,10 @@ class ScheduleExecutionTests(unittest.TestCase):
     def test_no_deadlock_across_batch_and_grid_sizes(self) -> None:
         for attn_splits in (1, 2):
             for BS in (1, 2, 4, 8):
-                for num_sms in (1, 4, 8, 108):
+                # 170 = RTX 5090 (sm_120) SM count: the rented-GPU grid
+                # must be covered here, not verified for the first time on
+                # a paid instance.
+                for num_sms in (1, 4, 8, 108, 170):
                     with self.subTest(attn_splits=attn_splits, BS=BS,
                                       num_sms=num_sms):
                         geo = tg.default_geometry(BS=BS, attn_splits=attn_splits)
@@ -1147,7 +1150,7 @@ class FusionGranularityScheduleTests(unittest.TestCase):
 
     def test_segmented_step_is_deadlock_free_across_grid_sizes(self):
         for attn_splits, BS in ((1, 1), (1, 8), (2, 1)):
-            for num_sms in (1, 108):
+            for num_sms in (1, 108, 170):
                 with self.subTest(attn_splits=attn_splits, BS=BS,
                                   num_sms=num_sms):
                     geo = tg.default_geometry(BS=BS, attn_splits=attn_splits)

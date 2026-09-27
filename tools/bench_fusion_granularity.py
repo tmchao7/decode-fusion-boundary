@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-lengths", default=DEFAULT_PROMPT_LENGTHS)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", default="results/fusion_granularity.json")
     return parser
