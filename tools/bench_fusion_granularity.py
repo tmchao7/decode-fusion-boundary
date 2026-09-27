@@ -44,32 +44,13 @@ for _path in (str(ROOT), str(ROOT / "src")):
 
 from nanovllm.backends.megakernel.schedule import split_layers  # noqa: E402
 from nanovllm.backends.megakernel.taskgraph import NUM_LAYERS  # noqa: E402
+from tools.cli import parse_int_list  # noqa: E402
 
 DEFAULT_GROUPS = "1,2,4,7,14,28"
 DEFAULT_BATCH_SIZES = "1,2,4,8"
 DEFAULT_PROMPT_LENGTHS = "32,512,1920"
 MAX_MODEL_LEN = 2048
 BACKEND = "megakernel"
-
-
-def parse_int_list(value: str, *, name: str) -> list[int]:
-    """Parse ``"1,2,4"`` into positive ints, rejecting empties and duplicates."""
-
-    items = [item.strip() for item in value.split(",") if item.strip()]
-    if not items:
-        raise ValueError(f"{name} must be a non-empty comma-separated list")
-    try:
-        values = [int(item) for item in items]
-    except ValueError as exc:
-        raise ValueError(f"{name} must contain integers; got {value!r}") from exc
-    for parsed in values:
-        if parsed < 1:
-            raise ValueError(f"{name} values must be >= 1; got {parsed}")
-    if len(set(values)) != len(values):
-        raise ValueError(f"{name} must not repeat values; got {values}")
-    return values
-
-
 def validate_groups(group_counts: list[int], *, num_layers: int = NUM_LAYERS) -> None:
     """Reject granularities the schedule builder cannot represent.
 

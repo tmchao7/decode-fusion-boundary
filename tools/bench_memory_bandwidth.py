@@ -168,8 +168,10 @@ def measure_read_bandwidth(
     """Stream ``total_bytes`` with a single reduction per iteration.
 
     A full-buffer reduction is the simplest kernel that reads every byte once
-    with no writes, so its runtime bounds the achievable read bandwidth from
-    above. Requires CUDA.
+    and writes nothing, so its runtime is an upper bound on how long reading
+    those bytes *must* take -- i.e. the GB/s it reports is a **lower bound** on
+    what the device can reach, which is the conservative direction for a roofline
+    denominator. Requires CUDA.
     """
 
     # Validate before importing torch so the argument checks stay testable on a

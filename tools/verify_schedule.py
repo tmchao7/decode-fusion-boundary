@@ -35,7 +35,7 @@ for _path in (str(ROOT), str(ROOT / "src")):
 
 from nanovllm.backends.megakernel import schedule as tg  # noqa: E402
 from nanovllm.backends.megakernel import verifier as V  # noqa: E402
-from tools.bench_fusion_granularity import parse_int_list  # noqa: E402
+from tools.cli import parse_int_list  # noqa: E402
 
 DEFAULT_BATCH_SIZES = "1,2,4,8"
 DEFAULT_NUM_SMS = "1,4,108,170"
@@ -136,7 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample",
         type=int,
         default=DEFAULT_SAMPLE,
-        help="adversarial mutants per configuration (fixed stride, 0 = all)",
+        help=(
+            "adversarial mutants per configuration, stratified by mutation kind "
+            "(0 = the whole population, ~2.5 h over the default matrix)"
+        ),
     )
     parser.add_argument("--json", default=None)
     return parser

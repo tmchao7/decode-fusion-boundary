@@ -162,12 +162,17 @@ def dependency_levels(
     return [levels[key] for key in sorted(levels)]
 
 
+_WAVE_K_FIELD = {
+    V.opcode_name(opcode): field for opcode, field in _GEMM_K_FIELD.items()
+}
+
+
 def _wave_k_steps(name: str, geo: tg.TgGeometry) -> int:
     """Serial K steps contributed by one instruction of this wave."""
 
-    for opcode, field in _GEMM_K_FIELD.items():
-        if V.opcode_name(opcode) == name:
-            return max(1, int(getattr(geo, field)) // tg.TgTiling.qkv_bk)
+    field = _WAVE_K_FIELD.get(name)
+    if field is not None:
+        return max(1, int(getattr(geo, field)) // tg.TgTiling.qkv_bk)
     if name in _NON_GEMM_K_STEPS:
         return _NON_GEMM_K_STEPS[name]
     raise ValueError(f"unknown wave {name!r}: the model has no K for it")
@@ -284,7 +289,13 @@ def segment_delta_ms(
         raise ValueError(f"base_ms must be > 0; got {base_ms}")
     if per_segment_us < 0:
         raise ValueError(f"per_segment_us must be >= 0; got {per_segment_us}")
-    return {g: base_ms + (g - 1) * per_segment_us / 1000.0 for g in groups if g >= 1}
+    groups = list(groups)
+    invalid = [g for g in groups if g < 1]
+    if invalid:
+        # Silently dropping these would report a curve for a granularity the
+        # caller asked about but never see.
+        raise ValueError(f"granularity must be >= 1; got {invalid}")
+    return {g: base_ms + (g - 1) * per_segment_us / 1000.0 for g in groups}
 
 
 def preregistered_granularity_prediction(

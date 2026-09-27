@@ -180,7 +180,7 @@ def decode_instruction(inst: Iterable[int]) -> DecodedInstruction:
 # ---------------------------------------------------------------------------
 
 
-def per_sm_streams(sched, num_sms: int) -> list[list[DecodedInstruction]]:
+def _per_sm_streams(sched, num_sms: int) -> list[list[DecodedInstruction]]:
     """The decoded instruction stream of every SM, in program order."""
 
     if num_sms < 1:
@@ -206,7 +206,7 @@ def per_sm_streams(sched, num_sms: int) -> list[list[DecodedInstruction]]:
     return streams
 
 
-def all_arrivals(streams: Iterable[Iterable[DecodedInstruction]]) -> dict[BarKey, int]:
+def _produced_counts(streams: Iterable[Iterable[DecodedInstruction]]) -> dict[BarKey, int]:
     """Total produced count per bar across every stream."""
 
     totals: dict[BarKey, int] = defaultdict(int)
@@ -217,7 +217,7 @@ def all_arrivals(streams: Iterable[Iterable[DecodedInstruction]]) -> dict[BarKey
     return dict(totals)
 
 
-def max_wait_thresholds(
+def _needed_thresholds(
     streams: Iterable[Iterable[DecodedInstruction]],
 ) -> dict[BarKey, int]:
     """Largest threshold any instruction waits on, per bar."""
@@ -249,7 +249,7 @@ class PreparedSchedule:
 
 def prepare(sched, num_sms: int) -> PreparedSchedule:
     return PreparedSchedule(
-        streams=tuple(tuple(stream) for stream in per_sm_streams(sched, num_sms))
+        streams=tuple(tuple(stream) for stream in _per_sm_streams(sched, num_sms))
     )
 
 
@@ -341,18 +341,23 @@ def wait_graph_cycle_prepared(
 ) -> list[tuple[int, int]] | None:
     """Return one dependency cycle in the flattening order, or ``None``.
 
-    Instruction *u* depends on instruction *v* when *v* supplies one of the
-    arrivals *u* waits for. A wait ``bar X >= t`` is satisfied by the first *t*
-    arrivals to *X* in the flattening order, so those are exactly the producers
-    ``u`` cannot proceed without -- including ones that sit later than *u* (the
-    kernel's counters are device-wide, so "later in the program order" is not
-    "unavailable"). A cycle in this relation means no instruction on it can ever
-    become ready, whatever the scheduling.
+    Instruction *u* depends on instruction *v* when *v* could supply an arrival
+    *u* waits for. Concretely: a wait ``bar X >= t`` is linked to the first *t*
+    arrivals to *X* in the flattening order, **including ones that sit later than
+    *u*** -- the kernel's counters are device-wide, so "later in program order" is
+    not "unavailable".
 
-    Note the direction of the guarantee: a cycle is always a real deadlock
-    (sound), while the abstraction can miss a deadlock that needs a more precise
-    accounting (incomplete) -- which is why ``execution`` remains the primary
-    detector and this is the localizer that names the cycle.
+    How strong that is: the arrival audit accepts a schedule only when every bar
+    produces exactly as many arrivals as its largest threshold, and under that
+    condition the first *t* arrivals *are* all the producers of *X* -- the sound
+    over-approximation ("*u* may need any of them"), so any cycle is a real
+    deadlock. On a schedule whose bars over-produce, the slice is a strict subset
+    and this check can only under-report; over-production is what
+    ``audit_arrivals`` is for.
+
+    So a cycle is always a real deadlock, while the abstraction can miss one that
+    needs a more precise accounting. ``execution`` stays the primary detector and
+    this is the localizer that names the cycle.
     """
 
     streams = prepared.streams
@@ -446,8 +451,8 @@ def audit_arrivals_prepared(prepared: PreparedSchedule) -> ArrivalAudit:
     """
 
     streams = prepared.streams
-    produced = all_arrivals(streams)
-    needed = max_wait_thresholds(streams)
+    produced = _produced_counts(streams)
+    needed = _needed_thresholds(streams)
     audit = ArrivalAudit()
     for key in sorted(set(produced) | set(needed)):
         have = produced.get(key, 0)
@@ -481,12 +486,8 @@ class VerificationReport:
             f"{verdict}: {self.instructions} instructions over {self.num_sms} SMs, "
             f"{self.completed} executed",
         ]
-        if self.stalled_sms:
-            lines.append(f"  stalled SMs: {self.stalled_sms}")
-        if self.cycle:
-            lines.append(f"  wait-graph cycle: {self.cycle}")
-        if not self.arrival_audit.ok:
-            lines.append(f"  arrivals: {self.arrival_audit.describe()}")
+        # The failures already carry the cycle and the arrival detail; repeating
+        # them here made every report print the same thing twice.
         lines.extend(f"  {failure}" for failure in self.failures)
         return "\n".join(lines)
 
@@ -552,9 +553,17 @@ def verify_prepared(
 
     failures: list[str] = []
     if not result.completed:
+        # Name what each stalled SM is blocked on: "SMs 3,7 stalled" costs a
+        # debugging session, "SM 3 waits on layer[12]>=56" does not.
+        stalls = [
+            f"SM {sm} at #{result.pc[sm]}: {prepared.streams[sm][result.pc[sm]].describe}"
+            for sm in result.stalled_sms[:3]
+            if result.pc[sm] < len(prepared.streams[sm])
+        ]
         failures.append(
             f"deadlock: {result.shortfall} instruction(s) never became ready "
             f"(stalled SMs {result.stalled_sms})"
+            + ("; " + " | ".join(stalls) if stalls else "")
         )
     if cycle is not None:
         failures.append(f"wait-graph cycle at {cycle}")
@@ -589,31 +598,6 @@ class MutatedSchedule:
         self.max_inst = sched.max_inst
         self.bar_dims = sched.bar_dims
         self.label = label
-
-
-def _positions_with(sched, num_sms: int, predicate) -> list[tuple[int, int]]:
-    """``(sm, index)`` of every instruction satisfying ``predicate``."""
-
-    width = tg.TG_INST_WIDTH
-    found: list[tuple[int, int]] = []
-    for sm in range(num_sms):
-        base = sm * sched.max_inst * width
-        for i in range(sched.num_inst_per_sm[sm]):
-            inst = decode_instruction(
-                sched.flat_inst_buf[base + i * width : base + (i + 1) * width]
-            )
-            if predicate(inst):
-                found.append((sm, i))
-    return found
-
-
-_MUTATION_KINDS = (
-    "drop_arrival",
-    "double_arrival",
-    "shift_bar",
-    "raise_threshold",
-    "truncate_stream",
-)
 
 
 def _mutation_candidates(sched, num_sms: int) -> list[tuple[str, int, int]]:

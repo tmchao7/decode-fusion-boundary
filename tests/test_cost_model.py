@@ -7,10 +7,19 @@ was not calibrated on. The numbers below are the documented ones from docs/12
 T(4) = 75.05 ms); they must not be re-tuned without updating docs/18.
 """
 
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import unittest
+from collections import Counter
 
 from nanovllm.backends.megakernel import schedule as tg
 from nanovllm.backends.megakernel import verifier as V
+from taskgraph_fixtures import instruction  # noqa: E402
 from nanovllm.cost_model import (
     GRID_SYNC_US,
     HOST_LAUNCH_US,
@@ -75,9 +84,9 @@ class StructureTests(unittest.TestCase):
         prepared = V.PreparedSchedule(
             streams=(
                 (
-                    V.decode_instruction(_row(tg.TgOp.NOP)),
+                    V.decode_instruction(instruction(tg.TgOp.NOP)),
                     V.decode_instruction(
-                        _row(tg.TgOp.QKV_PROJ, f5=0, f6=0, f7=0, f9=1)
+                        instruction(tg.TgOp.QKV_PROJ, f5=0, f6=0, f7=0, f9=1)
                     ),
                 ),
             )
@@ -92,10 +101,10 @@ class StructureTests(unittest.TestCase):
             streams=tuple(
                 V.decode_instruction(row)
                 for row in (
-                    _row(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
-                    _row(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
-                    _row(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-                    _row(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
+                    instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
+                    instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
+                    instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
+                    instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
                 )
             )
         )
@@ -106,10 +115,10 @@ class StructureTests(unittest.TestCase):
                 tuple(
                     V.decode_instruction(row)
                     for row in (
-                        _row(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
-                        _row(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
-                        _row(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-                        _row(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
+                        instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
+                        instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
+                        instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
+                        instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
                     )
                 ),
             )
@@ -270,13 +279,64 @@ class PreRegisteredPredictionTests(unittest.TestCase):
             preregistered_granularity_prediction(base_device_ms=1.0, groups=())
 
 
-def _row(opcode: int, **fields: int) -> list[int]:
-    row = [0] * tg.TG_INST_WIDTH
-    row[0] = opcode
-    for name, value in fields.items():
-        row[int(name[1:])] = value
-    return row
-
-
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackingConsistencyTests(unittest.TestCase):
+    """The model assumes `rounds = ceil(instructions / num_sms)` per wave.
+
+    That only holds if the schedule builder really packs `_max_per_inst` tiles
+    into each instruction, so check the observed per-layer instruction counts
+    against the tile counts the geometry implies. QKV is excluded on purpose: it
+    uses `_pack_qkv`'s opcode-specific layout, and is pinned to its observed
+    count instead of a formula that does not describe it.
+    """
+
+    def test_packed_gemm_waves_match_their_tile_counts(self) -> None:
+        step, geo = structure()
+        waves_per_name = Counter(wave.name for wave in step.waves)
+        # One wave per layer for the six layer waves, plus the two tail waves.
+        self.assertEqual(waves_per_name["O_PROJ"], 28)
+        self.assertEqual(waves_per_name["LM_HEAD"], 1)
+
+        expectations = {
+            "O_PROJ": tg._oproj_tile_count(geo),
+            "FFN_DOWN": tg._ffn_down_tile_count(geo),
+            "FFN_UPGATE_ACT": tg._ffn_upgate_tile_count(geo),
+        }
+        for name, tiles in expectations.items():
+            per_inst = tg._max_per_inst(tiles, 108)
+            with self.subTest(wave=name, tiles=tiles, per_inst=per_inst):
+                self.assertEqual(per_inst, 7)
+                self.assertEqual(
+                    -(-tiles // per_inst),
+                    self._observed_instructions(step, name),
+                )
+
+    def test_qkv_uses_its_own_layout(self) -> None:
+        """`_pack_qkv` packs q/k/v separately: 19 + 10 + 10 = 39, but the observed
+        count is 56. Pinned so a future change to that layout is noticed."""
+
+        step, _ = structure()
+
+        self.assertEqual(self._observed_instructions(step, "QKV_PROJ"), 56)
+        tiles = tg._qkv_tile_count(tg.default_geometry(1))
+        self.assertEqual(tiles, 256)
+        self.assertNotEqual(-(-tiles // 7), 56)
+
+    def test_lm_head_is_the_only_multi_round_wave(self) -> None:
+        step, geo = structure()
+
+        multi = {wave.name for wave in step.waves if wave.rounds > 1}
+        self.assertEqual(multi, {"LM_HEAD"})
+        tiles = tg._lm_head_tile_count(geo)
+        self.assertEqual(-(-tiles // 7), 1357)
+        self.assertEqual(len([w for w in step.waves if w.name == "LM_HEAD"]), 1)
+
+    @staticmethod
+    def _observed_instructions(step, name: str) -> int:
+        for wave in step.waves:
+            if wave.name == name:
+                return wave.instructions
+        raise AssertionError(f"no {name} wave in the structure")

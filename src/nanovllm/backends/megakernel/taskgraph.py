@@ -208,6 +208,10 @@ class TaskGraphDecoder:
         f32 = dict(dtype=torch.float32, device="cuda")
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
         bs = TG_MAX_BATCH
+        # Every scratch table below is sized for this bound, and the kernel's
+        # bars are compiled for it; decode_rows reports a clear error past it
+        # rather than letting a slice silently become the whole tensor.
+        self._max_rows = bs
         self._norm_out = torch.empty(bs, HIDDEN_SIZE, **f32)
         self._q_out = torch.empty(WMMA_PAD_ROWS, Q_SIZE, **f32)
         self._k_out = torch.empty(WMMA_PAD_ROWS, KV_SIZE, **f32)
@@ -367,6 +371,12 @@ class TaskGraphDecoder:
         rows = int(input_ids.numel())
         if rows == 0:
             return []
+        if rows > self._max_rows:
+            raise RuntimeError(
+                f"decode_rows got {rows} rows but this decoder is sized for "
+                f"{self._max_rows} (TG_MAX_BATCH); the backend's compatibility "
+                "check should have rejected this batch upstream"
+            )
         geometries = [
             self._build_geometry(segment, rows, self._attn_splits)
             for segment in range(self._fusion_groups)

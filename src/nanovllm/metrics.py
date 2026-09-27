@@ -97,10 +97,12 @@ def summarize_runs(
     summary: dict[str, Any] = dict(summarize(values))
     n = len(values)
     if n < 2:
+        # No interval is possible, so do not report how many resamples would
+        # have been drawn: `resamples` describes the interval that is here.
         summary["ci95_low"] = None
         summary["ci95_high"] = None
         summary["ci95_half_width"] = None
-        summary["resamples"] = resamples if n else None
+        summary["resamples"] = None
         return summary
 
     rng = random.Random(seed)

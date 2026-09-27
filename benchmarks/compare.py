@@ -314,7 +314,7 @@ def run_case(
             # max(batch, 32) and its cudagraph rows carry up to 1.88x padding.
             "cudagraph": padding_report(
                 batch_size,
-                batch_size,
+                max_num_seqs=batch_size,
                 uses_cuda_graph=(
                     backend_config.get("decode_backend") == "torch"
                     and not backend_config.get("enforce_eager", False)

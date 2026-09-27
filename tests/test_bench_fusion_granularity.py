@@ -20,11 +20,11 @@ from tools.bench_fusion_granularity import (  # noqa: E402
     DEFAULT_GROUPS,
     DEFAULT_PROMPT_LENGTHS,
     build_parser,
-    parse_int_list,
     sweep_plan,
     validate_groups,
     validate_lengths,
 )
+from tools.cli import parse_int_list
 
 TOOL = ROOT / "tools" / "bench_fusion_granularity.py"
 SERVER_COMMANDS = ROOT / "SERVER_COMMANDS.txt"

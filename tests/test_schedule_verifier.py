@@ -6,33 +6,18 @@ field layout (which the CUDA header defines), the two detectors, and the fact
 that the adversarial population contains no false accepts.
 """
 
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import unittest
 
 from nanovllm.backends.megakernel import schedule as tg
 from nanovllm.backends.megakernel import verifier as V
-
-WIDTH = tg.TG_INST_WIDTH
-
-
-def instruction(opcode: int, **fields: int) -> list[int]:
-    """Build one raw instruction row; ``f3=1`` means field 3."""
-
-    row = [0] * WIDTH
-    row[0] = opcode
-    for name, value in fields.items():
-        row[int(name[1:])] = value
-    return row
-
-
-class RawSchedule:
-    """Minimal stand-in for ``TgSchedule`` so tests can hand-build streams."""
-
-    def __init__(self, rows: list[list[int]], per_sm: list[int], max_inst: int) -> None:
-        self.flat_inst_buf = [value for row in rows for value in row]
-        self.num_inst_per_sm = per_sm
-        self.max_inst = max_inst
-        self.bar_dims = None
-
+from taskgraph_fixtures import BALANCED_CHAIN, BALANCED_CYCLE, RawSchedule, instruction  # noqa: E402
 
 class OpcodeDecodingTests(unittest.TestCase):
     """The field indices must match ``csrc/taskgraph_kernel.cu``."""
@@ -184,33 +169,19 @@ class ArrivalAuditTests(unittest.TestCase):
     def test_a_balanced_cycle_is_balanced(self) -> None:
         """Four instructions in a cycle whose arrival counts exactly cancel."""
 
-        rows = [
-            instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
-            instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
-            instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-            instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
-        ]
+        rows = BALANCED_CYCLE
         report = V.verify(RawSchedule(rows, [4], 4), 1)
 
         self.assertTrue(report.arrival_audit.ok)
         self.assertFalse(report.ok)
 
-    @staticmethod
-    def _balanced_chain() -> list[list[int]]:
-        return [
-            instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=2),
-            instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=2, f9=0),
-            instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-            instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
-        ]
-
     def test_a_consistent_chain_balances(self) -> None:
-        healthy = RawSchedule(self._balanced_chain(), [4], 4)
+        healthy = RawSchedule(BALANCED_CHAIN, [4], 4)
 
         self.assertTrue(V.audit_arrivals(healthy, 1).ok)
 
     def test_doubling_an_arrival_is_over_arrival(self) -> None:
-        rows = self._balanced_chain()
+        rows = BALANCED_CHAIN
         rows[0][9] = 4  # qkv arrives twice as often as anyone consumes
 
         audit = V.audit_arrivals(RawSchedule(rows, [4], 4), 1)
@@ -219,7 +190,7 @@ class ArrivalAuditTests(unittest.TestCase):
         self.assertIn(V.BarKey("qkv", 0), audit.over)
 
     def test_a_missing_arrival_is_under_arrival(self) -> None:
-        rows = self._balanced_chain()
+        rows = BALANCED_CHAIN
         rows[0][9] = 1  # qkv now arrives once, but ATTN waits for 2
 
         audit = V.audit_arrivals(RawSchedule(rows, [4], 4), 1)
@@ -230,12 +201,7 @@ class ArrivalAuditTests(unittest.TestCase):
 
 class CycleLocalizerTests(unittest.TestCase):
     def test_names_a_cycle_whose_arrivals_balance(self) -> None:
-        rows = [
-            instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
-            instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
-            instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-            instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
-        ]
+        rows = BALANCED_CYCLE
         report = V.verify(RawSchedule(rows, [4], 4), 1)
 
         self.assertIsNotNone(report.cycle)
@@ -269,12 +235,7 @@ class MutantGenerationTests(unittest.TestCase):
 
     # A tiny raw schedule keeps this exhaustive: materialising the population of
     # a full geometry (tens of thousands of 72k-int buffers) is minutes of copying.
-    SMALL = [
-        instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1),
-        instruction(tg.TgOp.ATTN_DECODE, f7=0, f8=1, f9=0),
-        instruction(tg.TgOp.O_PROJ, f6=0, f7=1, f8=0, f9=1),
-        instruction(tg.TgOp.ADD_RMSNORM, f3=0, f4=1, f5=0, f6=0, f7=0),
-    ]
+    SMALL = BALANCED_CYCLE
 
     def test_the_population_is_not_empty_and_every_mutant_differs(self) -> None:
         for sched, num_sms in (
@@ -349,13 +310,8 @@ class AdversarialReportTests(unittest.TestCase):
     def test_a_rejected_valid_schedule_is_a_false_accept(self) -> None:
         """The report must flag a *valid* schedule it cannot verify."""
 
-        class Broken:
-            flat_inst_buf = [0] * WIDTH
-            num_inst_per_sm = [1]
-            max_inst = 1
-            bar_dims = None
-
-        # A single NOP is trivially fine; make it a QKV wait nothing satisfies.
+        # A QKV wait that nothing satisfies: the report must call this a false
+        # accept, not silently count it as a rejected mutant.
         rows = [instruction(tg.TgOp.QKV_PROJ, f5=0, f6=1, f7=0, f9=1)]
         report = V.adversarial_report(
             [("broken", RawSchedule(rows, [1], 1), 1)], sample=None
