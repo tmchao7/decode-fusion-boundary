@@ -1,5 +1,7 @@
 # Qwen Megakernel Design Notes
 
+> **状态**：**已归档** —— 旧 `kernel.cu` 线的英文设计说明，未随 task-graph 重写更新。
+
 ## Current integration boundary
 
 The current backend is intentionally conservative:

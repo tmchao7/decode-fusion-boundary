@@ -13,6 +13,9 @@ The previous `kernel.cu` persistent/WMMA implementation is preserved on the
 archival branch `codex/archive/frozen-kernel`; it is intentionally not part of
 the mainline API, build, scheduler, or benchmark surface.
 
+**文档入口：[docs/README.md](docs/README.md)** —— 17 个文档按"现行 / 历史证据 /
+研究资料"三态分类，含按目的选最短路径、关键命令、以及现行 vs 归档的对照表。
+
 ## Mainline contract
 
 The active Megakernel is deliberately narrow:

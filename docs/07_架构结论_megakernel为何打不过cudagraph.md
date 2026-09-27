@@ -1,5 +1,7 @@
 # 多 batch 场景为何打不过 cudagraph：证据与根因分析（第 6 版，code-review 修正）
 
+> **状态**：**历史分析** —— 证据与根因；结论已被 §9.10 的外部工作独立复现。
+
 > 更新日期：2026-09-13（第 6 版 + code-review 修正）
 >
 > ⚠️ **本文是已归档 `kernel.cu` 线的历史分析**——README 明确这些结论不得当作当前
@@ -7,43 +9,7 @@
 > `SERVER_COMMANDS.txt` 收敛移除，请直接调用
 > `python -m tools.account_decode ...` / `python -m tools.bench_memory_bandwidth ...`；
 > 当前主线基线见 `docs/13` 与 `RUN_MODE=taskgraph-baseline`。
->
-> - 第 6 版新增 **§10 host/device 账本 + 高并发可行性判定**：把"每步必须流的权重
->   1.192 GB / 下界 0.585 ms 规格、0.69 ms 实测可达"（`tied_embedding=True`，
->   原值 1.503 GB / 0.97 ms 是双重计算 embedding+lm_head 的误算）、"cudagraph
->   每步 GPU 只占 21-25%、host 残差 2.2-2.8 ms"、"batch≈176 才转算力 bound"算成
->   可证伪的账；给出三句话判语
->   （**device 侧翻盘不可行，E2E 侧可赚的全是 host**），并列出三个便宜的证伪
->   实验（device 下界 probe / 可达带宽标定 / host 消除上界）。新增
->   `src/nanovllm/roofline.py`（含 26 个单测）与 `tools/account_decode.py`
->   （含 15 个单测，能吃 compare 与 crossover 两种 JSON，并对"实测低于物理下界"
->   主动打标定告警）。同时**修正引用错误**：megaQwen 的 owner 是 `Infatoshi`
->   而非 `NoneBone`，并补齐其原始自述数字；补引 MPK(OSDI'26) / TaxBreak /
->   Cohere megakernel 等。
-> - 第 5 版新增 **§3.5 nsys 实测纯 GPU kernel 时间分解**（4 组配置 b1/b8 × mega/cg），
->   用四个实测比值坐实根因：b1 mega 纯 kernel 慢于 cg 2.6x 但 E2E 反超（launch 消除）；
->   b8 mega 纯 kernel 慢 133x；b8/b1 mega kernel 增长 54x vs cg 1.04x（SM 空转）。
->   发现 ncu 不能用于 cooperative kernel（driver hang），改用 nsys。§6 同步更新。
-> - 第 4 版把 **§9.6 crossover 实验从「待跑」升级为「A100 已跑 + 实测数据」**：
->   batch=1/2/3/…/32 全扫描，拐点实测在 batch=1→2（悬崖式，无打平区），
->   b1 1.31x BEATS、b≥2 单调劣化到 b32 0.02x，MegaKernel 在 b6 触底后平台化
->   于 ~6.5 ms/tok。数据存 `results/crossover_scan.json` +
->   `results/crossover_plot.png`，工具 `tools/bench_burst_batch.py` +
->   `tools/plot_crossover.py`。§6 验证清单同步更新。
-> - 第 3 版在第 2 版结论之上，补充 **§9 外部公开实现/研究的交叉印证**
->   （megaQwen、Ada-MK、vLLM CUDA Graph 设计），并新增 **§6 验证清单中的
->   crossover 实验与 batch-aware 审计**两个待办。
->
-> 第 2 版相对第 1 版纠正了两处过时/错误判断：
->
-> 1. **张量核覆盖**：第 1 版称「只有 QKV 用 WMMA，O/Gate/Up/Down 与 Attention 全是
->    scalar」——这条**已过时**。当前 `ldg_o_proj_mlp_wmma`（`kernel.cu:1008-1122`）
->    已经用 WMMA 处理 **O projection + Gate + Up + Down**（`wmma_gemm` 调用见下文 §3）。
->    批处理 WMMA 路径的**全部 FC GEMM 已上张量核**，只剩 Attention(QK/PV) 与 LM head
->    仍 scalar。
-> 2. **同步(barrier)归因**：第 1 版/此前 agent 推测「~336 次全网格 barrier ≈ 7-8ms
->    主导」。**本机实测推翻了这一量级**：纯 336 次 barrier 仅 **0.547 ms/token**
->    （1.63 µs/barrier，`tools` 微基准，见 §3.4）。barrier 不是毫秒级主开销。
+> 第 1–6 版的逐版变更日志已抽到 [99 变更历史](99_变更历史.md)，正文从结论开始。
 
 ## 0. 一句话结论
 
@@ -508,36 +474,6 @@ D. MegaKernel + CUDA Graph   ← 二者不互斥：CG 消 CPU launch，mega 消 
 此收益主要来自执行路径稳定化 + graph replay 对 host scheduling 的优化）。跑满四个
 象限能干净地区分「launch 消除」与「kernel 内效率」各自贡献多少。
 
-### 9.10 AutoMegaKernel：唯一能重定向到 sm_80 的全前向 megakernel，在 A100 上同样输（2026-09-28 补）
-
-[AutoMegaKernel (arXiv:2606.09682)](https://arxiv.org/abs/2606.09682) 把 HuggingFace
-Llama 家族模型编译成**单个 persistent cooperative kernel** 跑完整前向，一份源码同时
-重定向 sm_80 / sm_90 / sm_120，并用一个"冻结的 schedule-IR 校验器"做静态死锁/竞态检查
-（7,160 个对抗性调度、其中 6,091 个不安全：**零误接受**；360 个真实 lowering 全部通过）。
-
-它对本文最重要的意义是：**在 A100/H100 上它输给 CUDA-graphed cuBLAS**，而且论文自己
-把原因定位在 **cross-SM-sync 瓶颈**：
-
-> "AMK trails cuBLAS on the high-bandwidth training-class A100/H100, where the
-> harness localizes the cross-SM-sync bottleneck; we report the gap plainly."
-
-而在 inference-class 卡上它是赢的：L4 1.33x、L40S 1.25–1.27x、A10G 1.08x、
-**RTX 5090 1.19–1.23x**（batch=1 decode）。
-
-三点读法：
-
-1. **本文 §0/§2 的结论被独立复现**。输在 A100 不是本仓库的实现事故，而是这一代
-   persistent-kernel 结构在**训练级带宽卡**上的共性瓶颈 —— 与 §3.4「barrier 实测
-   0.673 ms + 层间全串行」指向同一个机制。
-2. **判据不是带宽绝对值，而是"卡类"**：864 GB/s 的 L40S 赢、600 GB/s 的 A10G 赢、
-   2,039 GB/s 的 A100 输 —— 与本文"launch/compute 边界 vs 带宽"的账一致。
-3. **注意口径**：AMK 的胜利是 **W8A16 int8 vs bf16 的精度不对称对比**、decode
-   position 0、最大真机 checkpoint 只有 TinyLlama-1.1B。**它是带着量化优势在 A100 上
-   仍然输。**
-
-可操作含义（已落进 [14](14_融合粒度实验.md)）：A100 是"困难靶"，要展示融合收益应租
-inference-class 卡（RTX 5090）；而 A100 上的负结果本身就是**可发表的适用域结论**。
-
 ### 9.9 引用
 
 - megaQwen（Qwen3-0.6B custom CUDA kernel，RTX 3090）：
@@ -585,6 +521,36 @@ inference-class 卡（RTX 5090）；而 A100 上的负结果本身就是**可发
 > 注：以上引用为 2026-09 检索的公开资料，链接文本与 arXiv 编号按检索当时为准；
 > 引入本仓库时以「方向印证」看待，不作为本机实测依据。**本次核对修正了第 5 版
 > 之前把 megaQwen 记为 `NoneBone/megaQwen` 的错误，并补齐了它的原始自述数字。**
+
+### 9.10 AutoMegaKernel：唯一能重定向到 sm_80 的全前向 megakernel，在 A100 上同样输（2026-09-28 补）
+
+[AutoMegaKernel (arXiv:2606.09682)](https://arxiv.org/abs/2606.09682) 把 HuggingFace
+Llama 家族模型编译成**单个 persistent cooperative kernel** 跑完整前向，一份源码同时
+重定向 sm_80 / sm_90 / sm_120，并用一个"冻结的 schedule-IR 校验器"做静态死锁/竞态检查
+（7,160 个对抗性调度、其中 6,091 个不安全：**零误接受**；360 个真实 lowering 全部通过）。
+
+它对本文最重要的意义是：**在 A100/H100 上它输给 CUDA-graphed cuBLAS**，而且论文自己
+把原因定位在 **cross-SM-sync 瓶颈**：
+
+> "AMK trails cuBLAS on the high-bandwidth training-class A100/H100, where the
+> harness localizes the cross-SM-sync bottleneck; we report the gap plainly."
+
+而在 inference-class 卡上它是赢的：L4 1.33x、L40S 1.25–1.27x、A10G 1.08x、
+**RTX 5090 1.19–1.23x**（batch=1 decode）。
+
+三点读法：
+
+1. **本文 §0/§2 的结论被独立复现**。输在 A100 不是本仓库的实现事故，而是这一代
+   persistent-kernel 结构在**训练级带宽卡**上的共性瓶颈 —— 与 §3.4「barrier 实测
+   0.673 ms + 层间全串行」指向同一个机制。
+2. **判据不是带宽绝对值，而是"卡类"**：864 GB/s 的 L40S 赢、600 GB/s 的 A10G 赢、
+   2,039 GB/s 的 A100 输 —— 与本文"launch/compute 边界 vs 带宽"的账一致。
+3. **注意口径**：AMK 的胜利是 **W8A16 int8 vs bf16 的精度不对称对比**、decode
+   position 0、最大真机 checkpoint 只有 TinyLlama-1.1B。**它是带着量化优势在 A100 上
+   仍然输。**
+
+可操作含义（已落进 [14](14_融合粒度实验.md)）：A100 是"困难靶"，要展示融合收益应租
+inference-class 卡（RTX 5090）；而 A100 上的负结果本身就是**可发表的适用域结论**。
 
 ## 10. host/device 账本 + 高并发可行性判定（第 6 版新增）
 
