@@ -5,6 +5,7 @@
 #   bash SERVER_COMMANDS.txt                         # correctness
 #   RUN_MODE=model bash SERVER_COMMANDS.txt           # download/check model
 #   RUN_MODE=verify bash SERVER_COMMANDS.txt          # environment + extension import
+#   RUN_MODE=bandwidth bash SERVER_COMMANDS.txt       # measure achievable HBM bandwidth
 #   RUN_MODE=build bash SERVER_COMMANDS.txt           # clean CUDA-extension rebuild
 #   RUN_MODE=benchmark bash SERVER_COMMANDS.txt      # torch eager/graph/Megakernel A/B
 #   RUN_MODE=taskgraph bash SERVER_COMMANDS.txt       # kernel microbench + ABI tests
@@ -84,6 +85,16 @@ run_verify() {
   require_model
   select_gpu
   python -m tools.verify_server_env --require-megakernel --model "$MODEL"
+}
+
+# The roofline denominator must be measured on the machine that produced the
+# measurement: every A100 headroom number uses 1699 GB/s measured (83.3% of the
+# 2039 GB/s spec), and a 5090 must not inherit that number. Run this once per
+# machine and before any accounting run.
+run_bandwidth() {
+  select_gpu
+  python -m tools.bench_memory_bandwidth --bytes 1.2e9 --iterations 20 \
+    --json results/bandwidth.json 2>&1 | tee results/a100_bandwidth.log
 }
 
 run_build() {
@@ -214,6 +225,7 @@ run_taskgraph_fusion() {
 case "$RUN_MODE" in
   model) run_model ;;
   verify) run_verify ;;
+  bandwidth) run_bandwidth ;;
   build) run_build ;;
   correctness) run_correctness ;;
   benchmark) run_benchmark ;;

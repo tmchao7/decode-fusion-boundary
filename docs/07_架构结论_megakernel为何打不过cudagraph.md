@@ -5,7 +5,7 @@
 > ⚠️ **本文是已归档 `kernel.cu` 线的历史分析**——README 明确这些结论不得当作当前
 > task-graph 实现的测量。文中的 `RUN_MODE=account` / `RUN_MODE=roofline` 已随
 > `SERVER_COMMANDS.txt` 收敛移除，请直接调用
-> `python -m tools.account_decode ...` / `python -m tools.bench_roofline_a100 ...`；
+> `python -m tools.account_decode ...` / `python -m tools.bench_memory_bandwidth ...`；
 > 当前主线基线见 `docs/13` 与 `RUN_MODE=taskgraph-baseline`。
 >
 > - 第 6 版新增 **§10 host/device 账本 + 高并发可行性判定**：把"每步必须流的权重

@@ -13,13 +13,62 @@ import ast
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 SERVER_COMMANDS = REPO_ROOT / "SERVER_COMMANDS.txt"
+TOOLS_ROOT = REPO_ROOT / "tools"
+
+# A file whose first lines carry one of these markers is a historical record
+# (docs/06, docs/07, docs/09) and may reference the archive branch. A single
+# line can also opt out by naming the reference as archived/deprecated.
+HISTORY_MARKERS = (
+    "归档", "历史", "已废弃", "未包含",
+    "archive", "archived", "historical", "deprecated",
+)
+_BANNER_LINES = 12
+_TOOL_REFERENCE = re.compile(r"tools/([a-z_0-9]+)\.py|tools\.([a-z_0-9]+)")
+
+
+def find_dangling_tool_references(
+    paths: Iterable[Path],
+    *,
+    tools_root: Path = TOOLS_ROOT,
+    history_markers: tuple[str, ...] = HISTORY_MARKERS,
+) -> list[str]:
+    """Return ``path:line cites tools.<module>`` for modules this branch lacks.
+
+    Only module-shaped references count: a ``tools/<module>.py`` path or the
+    dotted ``tools.<module>`` form. A bare directory mention
+    (``tools/benchmarks``), a glob and a struck-through retraction are not
+    module references, and a historical banner exempts a whole file.
+    """
+
+    dangling: list[str] = []
+    for path in paths:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if any(marker in "\n".join(lines[:_BANNER_LINES]) for marker in history_markers):
+            continue
+        for number, line in enumerate(lines, start=1):
+            # Prose wraps, so a marker may sit on the line above the citation.
+            window = line if number == 1 else lines[number - 2] + line
+            if any(marker in window for marker in history_markers):
+                continue
+            if "~~" in line:  # struck-through: an explicit retraction
+                continue
+            for match in _TOOL_REFERENCE.finditer(line):
+                module = match.group(1) or match.group(2)
+                if line[match.end() :].startswith("*"):  # glob, not a module
+                    continue
+                if not (tools_root / f"{module}.py").is_file():
+                    dangling.append(f"{path.name}:{number} cites tools.{module}")
+    return dangling
+
 DOCS_09 = REPO_ROOT / "docs" / "08_服务器运行手册.md"
 
 # Modules we own; everything else in the file (pip, nsys, nvidia-smi) is not
@@ -199,15 +248,59 @@ class ServerCommandReferenceTests(unittest.TestCase):
             if path.name in self.HISTORICAL_DOCS:
                 continue
             text = path.read_text(encoding="utf-8")
-            for mode in re.findall(
-                r"RUN_MODE=([a-z][a-z-]*)\s+bash SERVER_COMMANDS", text
-            ):
-                if not re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE):
-                    stale.append(f"{path.name}: RUN_MODE={mode}")
+            for number, line in enumerate(text.splitlines(), start=1):
+                # Prose about *removing* a mode is not an instruction to run it.
+                if any(
+                    marker in line
+                    for marker in ("已移除", "已删除", "已过时", "不再", "历史", "归档",
+                                   "removed", "stale", "archive")
+                ):
+                    continue
+                for mode in re.findall(r"RUN_MODE=([a-z][a-z-]*)", line):
+                    if not re.search(rf"^\s*{mode}\)", self.text, re.MULTILINE):
+                        stale.append(f"{path.name}:{number} RUN_MODE={mode}")
         self.assertFalse(
             stale,
             "documented RUN_MODE(s) have no dispatch branch in "
             f"SERVER_COMMANDS.txt: {stale}",
+        )
+
+    def test_documented_commands_use_flags_that_exist(self) -> None:
+        """A wrong flag in a doc costs the same session as one in the command file.
+
+        The command file itself is checked flag-by-flag elsewhere; this catches
+        the copies inside the docs, which is where a tool rename leaves stale
+        flags behind (``--sections bandwidth`` survived a rename until now).
+        """
+
+        cache: dict[str, set[str]] = {}
+        problems: list[str] = []
+        for path in (REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").glob("*.md"))):
+            if path.name in self.HISTORICAL_DOCS:
+                continue
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                for match in re.finditer(r"python -m ([a-zA-Z_0-9.]+)([^\n]*)", line):
+                    module, tail = match.group(1), match.group(2)
+                    if module in cache:
+                        allowed = cache[module]
+                    else:
+                        try:
+                            allowed = module_flags(module) | external_help_flags(module)
+                        except (AssertionError, FileNotFoundError, SyntaxError, SystemExit):
+                            # Not a local module (e.g. ``python -m pip install``).
+                            continue
+                        cache[module] = allowed
+                    for token in tail.split():
+                        if not token.startswith("--"):
+                            continue
+                        flag = token.split("=", 1)[0].strip("`）,;")
+                        if flag not in allowed:
+                            problems.append(f"{path.name}:{number} {module} {flag}")
+        self.assertFalse(
+            problems,
+            f"documented commands pass flags their module does not accept: {problems}",
         )
 
     def test_mainline_commands_do_not_reference_archived_backends(self) -> None:
@@ -219,6 +312,95 @@ class ServerCommandReferenceTests(unittest.TestCase):
             "megakernel_burst",
         ):
             self.assertNotIn(name, self.text)
+
+    # Sources that must never point an operator at a module this branch does not
+    # ship: the checked-in docs, the command file, the live tools and the library.
+    REFERENCE_TARGETS = (
+        "README.md",
+        "SERVER_COMMANDS.txt",
+        "docs",
+        "tools",
+        "src/nanovllm",
+        "tests",
+    )
+
+    def test_referenced_tools_exist_on_this_branch(self) -> None:
+        """No doc, message or comment may cite a tool this branch does not ship.
+
+        ``tools/bench_roofline_a100.py`` and ``tools/verdict.py`` (archive branch
+        only) live on ``codex/archive/frozen-kernel``, but the docs and a tool's
+        own hint text kept recommending them -- the same failure mode as the
+        removed ``RUN_MODE=taskgraph-perf``. Historical docs are exempt, so a
+        rename is caught here instead of on a paid server session.
+
+        Only module-shaped references are checked: a ``tools/<module>.py`` path
+        or the dotted ``tools.<module>`` form. A bare directory mention
+        (``tools/benchmarks``), a glob and a struck-through retraction are not
+        module references.
+        """
+
+        paths: list[Path] = []
+        for target in self.REFERENCE_TARGETS:
+            path = REPO_ROOT / target
+            if path.is_dir():
+                paths.extend(sorted(path.rglob("*.py")))
+                paths.extend(sorted(path.glob("*.md")))
+            else:
+                paths.append(path)
+
+        self.assertFalse(
+            find_dangling_tool_references(paths),
+            "references to tools that do not exist on this branch: "
+            f"{find_dangling_tool_references(paths)}",
+        )
+
+    def test_the_scanner_catches_a_dangling_reference(self) -> None:
+        """Negative validation: the guard must fail on a real dangling citation."""
+
+        def cite(module: str) -> str:
+            # Built by concatenation so this test's own source does not contain a
+            # literal citation for the scanner to find.
+            return "`tools/" + module + ".py` and `tools." + module + "`"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bad = root / "bad.md"
+            bad.write_text("见 " + cite("no_such_tool") + "。\n", encoding="utf-8")
+            self.assertEqual(
+                find_dangling_tool_references([bad]),
+                ["bad.md:1 cites tools." + "no_such_tool"] * 2,
+            )
+
+            historic = root / "historic.md"
+            historic.write_text(
+                "> 本文属于历史记录（归档）。\n\n见 " + cite("no_such_tool") + "。\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(find_dangling_tool_references([historic]), [])
+
+            retracted = root / "retracted.md"
+            retracted.write_text(
+                "1. ~~写 " + cite("no_such_tool") + "~~ → 改为扩 compare.py（已完成）\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(find_dangling_tool_references([retracted]), [])
+
+            globbed = root / "globbed.md"
+            globbed.write_text(
+                "| correctness 门 | `tools/correctness_*.py` |\n", encoding="utf-8"
+            )
+            self.assertEqual(find_dangling_tool_references([globbed]), [])
+
+            directory_mention = root / "prose.md"
+            directory_mention.write_text(
+                "the tools/benchmarks packages live at the repository root\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(find_dangling_tool_references([directory_mention]), [])
+
+            shipped = root / "shipped.md"
+            shipped.write_text("见 `tools/bench_taskgraph.py`。\n", encoding="utf-8")
+            self.assertEqual(find_dangling_tool_references([shipped]), [])
 
     def _function_body(self, name: str) -> str:
         match = re.search(

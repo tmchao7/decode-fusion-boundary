@@ -110,7 +110,7 @@ class HardwareSpec:
     ``bandwidth_gbps`` is the HBM2e peak of the **80 GB** SXM4 part (2039 GB/s).
     The 1555 GB/s figure that used to live here is the 40 GB HBM2 part, so it
     understated this device by ~24% and turned a real measurement into a
-    "physically impossible" alarm.  ``tools/bench_roofline_a100.py`` derives the
+    "physically impossible" alarm.  ``tools/bench_memory_bandwidth.py`` derives the
     same value from the device clocks and bus width; prefer that measured value
     when the probe has run (pass ``--bandwidth-gbps``).
     """

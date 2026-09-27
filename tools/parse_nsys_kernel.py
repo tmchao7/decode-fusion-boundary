@@ -101,7 +101,7 @@ def parse_memory(path: str) -> dict:
             "tables_present": tables,
             "hint": "re-profile with GPU metrics sampling enabled "
             "(--gpu-metrics-device / --enable-gpu-metrics) or fall back to "
-            "tools.bench_roofline_a100 --sections bandwidth for a measured "
+            "tools.bench_memory_bandwidth for a measured "
             "attainable-bandwidth number",
         }
 
