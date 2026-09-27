@@ -1,19 +1,32 @@
 # Megakernel-vLLM
 
-Qwen3-0.6B decode research backend for nano-vLLM. The **mainline has one
-Megakernel implementation**: a persistent task-graph CUDA kernel. Its primary
-comparison target is the existing torch CUDA-Graph path.
+**Question.** In LLM decode, how do the returns from *whole-model kernel fusion*
+compare with those from *CUDA Graph* as batch size grows — and where does each one
+stop paying?
+
+**Answer (measured, on A100-SXM4-80GB).** Kernel fusion wins at batch 1 and only
+there, and the win is not compute: it eliminates ~2.2 ms/step of host work while
+being **2.6x slower on the device**. At batch ≥ 2 the device gap dominates and the
+megakernel loses by up to 133x. An independent 2026 result
+([AutoMegaKernel](https://arxiv.org/abs/2606.09682)) localizes the same A100/H100
+loss to the cross-SM-sync bottleneck, while the same design wins on
+inference-class parts (L4/L40S/A10G/RTX 5090, 1.08–1.33x).
+
+So this repo is **not** a "faster kernel" claim. It is an instrument for locating
+the fusion/CUDA-Graph boundary, with the physics (roofline + measured achievable
+bandwidth) and the negative results reported alongside the wins.
 
 ```text
-decode_backend="torch", enforce_eager=False -> torch-cudagraph
-decode_backend="megakernel"                 -> task-graph Megakernel
+decode_backend="torch", enforce_eager=False -> torch-cudagraph  (the strong baseline)
+decode_backend="megakernel"                 -> task-graph Megakernel (one cooperative launch/step)
 ```
 
 The previous `kernel.cu` persistent/WMMA implementation is preserved on the
 archival branch `codex/archive/frozen-kernel`; it is intentionally not part of
-the mainline API, build, scheduler, or benchmark surface.
+the mainline API, build, scheduler, or benchmark surface. Its numbers are the
+evidence base below and are labelled as such.
 
-**文档入口：[docs/README.md](docs/README.md)** —— 17 个文档按"现行 / 历史证据 /
+**文档入口：[docs/README.md](docs/README.md)** —— 19 个文档按"现行 / 历史证据 /
 研究资料"三态分类，含按目的选最短路径、关键命令、以及现行 vs 归档的对照表。
 
 ## Mainline contract
@@ -32,6 +45,87 @@ The active Megakernel is deliberately narrow:
 The kernel reuses nano-vLLM's paged KV cache. It does not allocate a second KV
 cache or replay the prompt. Unsupported requests fall back to the standard torch
 path with an explicit reason.
+
+## Results and applicable range
+
+Archived `kernel.cu` line, Qwen3-0.6B, greedy, A100-SXM4-80GB (108 SMs); each row
+is end-to-end wall time per token next to the pure-device time per step, so the
+host/launch contribution is visible rather than implied.
+
+| batch | backend | E2E ms/tok | device ms/step | host residual | note |
+|---|---|---|---|---|---|
+| 1 | torch-eager | — | — | — | host-bound floor |
+| 1 | torch-cudagraph | 2.944 | **0.74** | ~2.2 ms/step | 1611 GB/s = **95% of measured-achievable 1699 GB/s** |
+| 1 | megakernel | **2.241** | 1.89 | ~0.35 ms/step | **1.31x E2E** from launch elimination, 2.6x slower on device |
+| 8 | torch-cudagraph | — | 0.77 | — | |
+| 8 | megakernel | — | **101.8** | — | **133x slower on device** |
+
+**Physics.** One decode step must stream 1.192 GB of weights
+(`tied_embedding=True`): 0.585 ms at the 2039 GB/s spec, 0.702 ms at the measured
+1699 GB/s. The CUDA-Graph path at 0.74 ms/step is therefore *at the wall*, and no
+fusion of the same arithmetic can beat it — which is exactly what the device
+column shows. Applicability: **batch 1, short context, this model class**. The
+crossover is not a gentle curve: it is a cliff at batch 1→2.
+
+The task-graph `megakernel` on this branch is a rewrite of that design; its own
+numbers are **not measured yet** (`RUN_MODE=taskgraph-baseline`), and until they
+are, every figure above belongs to the archived line. The pre-registered
+prediction it will be tested against is in
+[`docs/18_成本模型.md`](docs/18_成本模型.md).
+
+## What did not work (negative results)
+
+Kept because they are the most useful part of the artifact:
+
+1. **Full-grid barriers are not the bottleneck.** The original hypothesis was
+   ~336 `grid.sync()` calls costing 7–8 ms. Measured: **0.547 ms** (1.63 µs each).
+   The attribution was wrong, and the measurement that killed it is in
+   `docs/07` §3.4.
+2. **"Put the GEMMs on tensor cores and it flips" — it did not.** After all FC
+   GEMMs moved to WMMA, batch 8 remained **133x** slower: the loss is the wave
+   structure and per-SM memory-level parallelism, not the tensor-core coverage.
+3. **Deferring work to more SMs does not shorten a wave.** Spreading an
+   instruction's tiles across more SMs leaves warps idle; the wave costs
+   `(K/16) x k_step_time` regardless (`docs/12` §1.4).
+4. **A100 is the wrong target for a full-fusion megakernel**, and an independent
+   paper says so too (`docs/07` §9.10).
+
+## Profiling notes
+
+`nsys` works and is how the device/host split above was obtained. **`ncu` does
+not**: kernel replay conflicts with `cudaLaunchCooperativeKernel` and hangs the
+GPU driver (observed; `nvidia-smi` blocks too). Use
+`RUN_MODE=bandwidth` to calibrate achievable bandwidth, `tools/parse_nsys_kernel.py`
+for per-kernel decomposition, and `tools/account_decode.py` for the four-way
+accounting — see [`docs/04_基准测试方法.md`](docs/04_基准测试方法.md).
+
+## Methodology
+
+- **Correctness gate**: greedy first token must match torch-eager; BF16
+  reduction-order divergence at later tokens is classified `CASCADE`, and
+  anything else is `FAIL`. A number that does not pass the gate is never reported.
+- **Statistics**: timed modes run 5 measured runs and report count/mean/stddev/
+  CoV/min/max/p5/p50/p95/p99 plus a bootstrap 95% CI, per
+  [docs/02](docs/02_指标说明.md). The archived tables used `runs=3` +
+  min-of-runs and are only comparable within themselves.
+- **Schedule gate**: `python -m tools.verify_schedule` proves the instruction
+  stream cannot deadlock and rejects adversarially mutated schedules (0 false
+  accepts over a 282,720-mutant population) before anything is built on the GPU.
+- **Numbers come from code, not from reading logs**: byte accounting, roofline
+  bounds and the `DEVICE_BORDERLINE` verdict are computed and unit-tested.
+
+## Threats to validity
+
+- Attention and the LM head remained scalar in the archived line, so its device
+  time is an upper bound for the megakernel side; the CUDA-Graph side uses
+  FlashAttention/cuBLAS. The comparison is therefore *conservative for* the
+  megakernel, and stated as such.
+- Single card, no NCCL; MoE, expert parallelism and all-to-all are out of scope,
+  which removes the cost centre that dominates the multi-GPU literature.
+- The cost model is calibrated at batch 1 and does not represent the batch ≥ 2
+  collapse; it says so rather than extrapolating.
+- The archived and task-graph lines are different kernels. Never mix their
+  numbers.
 
 ## Install
 
