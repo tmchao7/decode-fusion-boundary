@@ -1453,14 +1453,25 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
   tg_worker_sync_inner();
 
   // Phase 3: SiLU(gate) * up (elementwise) — ONLY for this instruction's tiles.
-  // Each instruction packs up to 6 tiles; each tile covers 16 columns of the
-  // intermediate dimension. We must NOT process all 3072 positions, only the
-  // ones written by this instruction's GEMM, otherwise later instructions
+  // This instruction packs ``num_tiles`` CONSECUTIVE tiles starting at
+  // ``tile_n0`` (inst[10]); each tile covers TG_WMMA_TILE columns of the
+  // intermediate dimension. We must NOT process all TG_INTERMEDIATE positions,
+  // only the ones this instruction's GEMM wrote, otherwise later instructions
   // re-apply SiLU to positions already processed by earlier ones.
+  //
+  // The tile index is ``tile_n0 + t``, derived from the range. It used to be
+  // read as ``inst[10 + t]`` — the per-tile list the encoder wrote into
+  // inst[11..15] — but ``f3d8114`` replaced that list with the range and left
+  // this loop behind. The consequences were not subtle: inst[11..15] are now
+  // zero, so every instruction re-Silu'd tile 0, num_tiles times, and every
+  // other column kept its RAW gate projection. Only 29 of the 192 intermediate
+  // tiles were ever activated (measured offline against the emitted schedule);
+  // ``inst[10 + t]`` also reads inst[16] for t == 6, i.e. one word past the
+  // 16-word instruction row.
+  //
   // For BS>1, process all batch rows for each tile column.
   for (int t = 0; t < num_tiles; t++) {
-    int packed = inst[10 + t];
-    int tile_n = packed & 0xFFFF;
+    int tile_n = tile_n0 + t;
     int offset = tile_n * TG_WMMA_TILE;
     for (int i = wtid; i < TG_WMMA_TILE * g.BS; i += TG_NUM_WORKER_THREADS) {
       int col = i % TG_WMMA_TILE;

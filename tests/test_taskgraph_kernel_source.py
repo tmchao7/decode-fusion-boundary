@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -5,6 +6,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 KERNEL = ROOT / "src/nanovllm/backends/megakernel/csrc/taskgraph_kernel.cu"
 BINDINGS = ROOT / "src/nanovllm/backends/megakernel/csrc/torch_bindings.cpp"
+SCHEDULE = ROOT / "src/nanovllm/backends/megakernel/schedule.py"
+
+
+def _kernel_function_body(source: str, name: str) -> str:
+    """Extract a ``__device__ ... name(...) { ... }`` body.
+
+    Brace-counted rather than regex-terminated: the bodies contain nested
+    braces, and a non-greedy regex happily cuts a function in half.
+    """
+
+    start = source.index(f"void {name}(")
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace : index + 1]
+    raise AssertionError(f"unterminated body for {name}")
 
 
 class TaskGraphKernelSourceTests(unittest.TestCase):
@@ -56,6 +78,97 @@ class TaskGraphKernelSourceTests(unittest.TestCase):
         # later step uses a larger batch.
         self.assertIn("if (dyn_smem_bytes > smem_attr_bytes)", kernel)
         self.assertNotIn("smem_attr_set", kernel)
+
+    def test_kernel_never_indexes_instruction_words_past_the_row(self) -> None:
+        """A packed GEMM is a RANGE: ``inst[9]`` = count, ``inst[10]`` = first tile.
+
+        ``f3d8114`` replaced the per-tile list in ``inst[11..15]`` with that
+        range, but ``tg_ffn_upgate_op`` kept reading ``inst[10 + t]``. For
+        ``t < 5`` that silently read the *now-zero* tile slots (so every
+        instruction re-Silu'd tile 0, once per packed tile) and for ``t == 6``
+        it read ``inst[16]`` — one word past the 16-word row, i.e. the next
+        instruction's opcode. Only 29 of the 192 intermediate tiles were ever
+        activated; FFN_DOWN then ran on 163 columns of raw gate projection.
+
+        Guard the general property, not the one call site: no instruction word
+        may be indexed by a *loop variable*.
+        """
+
+        kernel = KERNEL.read_text(encoding="utf-8")
+        # Strip comments first: the fix's own explanation quotes the old
+        # expression, and that must not count as a use.
+        code = re.sub(r"//[^\n]*", "", kernel)
+        offending = re.findall(r"inst\[\s*[A-Za-z_]\w*\s*(?:[+-]\s*\d+)?\s*\]", code)
+        self.assertEqual(
+            offending,
+            [],
+            f"instruction words indexed by a variable: {offending}",
+        )
+
+        # And the range must be walked as a range in the SiLU phase.
+        body = _kernel_function_body(kernel, "tg_ffn_upgate_op")
+        self.assertIn("int tile_n = tile_n0 + t;", body)
+        self.assertIn("int offset = tile_n * TG_WMMA_TILE;", body)
+
+    def test_silu_phase_covers_every_intermediate_tile_exactly_once(self) -> None:
+        """Offline check of what the kernel's SiLU loop touches.
+
+        Reproduces the kernel's own indexing against the emitted schedule and
+        asserts it activates each of the 192 intermediate tiles exactly once.
+        This is the test that would have caught the ``inst[10 + t]`` bug on a
+        CPU-only checkout, before it cost a GPU session.
+        """
+
+        import sys
+        from collections import defaultdict
+
+        sys.path.insert(0, str(ROOT / "src"))
+        from nanovllm.backends.megakernel import schedule as tg
+
+        # The WMMA N tile is `ffn_bn` (16), and it is what the kernel's
+        # `tile_n * TG_WMMA_TILE` stride must correspond to. Read it from the
+        # geometry rather than restating 16, so a tiling change cannot leave
+        # this test asserting yesterday's arithmetic.
+        for batch_size in (1, 2, 4, 8):
+            geo = tg.default_geometry(BS=batch_size, attn_splits=1)
+            sched = tg.build_schedule(geo, num_sms=1)
+            width = tg.TG_INST_WIDTH
+            flat = sched.flat_inst_buf
+
+            # Keyed by layer: the pool is per-layer, and FFN_DOWN for layer L
+            # only reads the layer-L columns that layer-L's UPGATE wrote.
+            touched: dict[int, dict[int, int]] = defaultdict(
+                lambda: defaultdict(int)
+            )
+            for i in range(sched.num_inst_per_sm[0]):
+                base = i * width
+                inst = flat[base : base + width]
+                if inst[0] != tg.TgOp.FFN_UPGATE_ACT:
+                    continue
+                layer, num_tiles = inst[1], inst[9]
+                tile_n0 = inst[10] & 0xFFFF
+                for t in range(num_tiles):
+                    tile_n = tile_n0 + t  # the kernel's expression, mirrored
+                    touched[layer][tile_n] += 1
+
+            expected = set(range(geo.intermediate // geo.tiling.ffn_bn))
+            with self.subTest(batch_size=batch_size):
+                self.assertEqual(
+                    sorted(touched), list(range(geo.num_layers))
+                )
+                for layer, hits in sorted(touched.items()):
+                    self.assertEqual(
+                        set(hits),
+                        expected,
+                        f"layer {layer} untouched intermediate tiles: "
+                        f"{sorted(expected - set(hits))[:8]}",
+                    )
+                    self.assertEqual(
+                        sorted(set(hits.values())),
+                        [1],
+                        f"layer {layer}: each intermediate tile must be "
+                        "activated exactly once",
+                    )
 
 
 
