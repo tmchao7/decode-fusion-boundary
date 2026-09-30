@@ -1459,15 +1459,33 @@ __device__ __forceinline__ void tg_ffn_upgate_op(
   // only the ones this instruction's GEMM wrote, otherwise later instructions
   // re-apply SiLU to positions already processed by earlier ones.
   //
-  // The tile index is ``tile_n0 + t``, derived from the range. It used to be
-  // read as ``inst[10 + t]`` — the per-tile list the encoder wrote into
-  // inst[11..15] — but ``f3d8114`` replaced that list with the range and left
-  // this loop behind. The consequences were not subtle: inst[11..15] are now
-  // zero, so every instruction re-Silu'd tile 0, num_tiles times, and every
-  // other column kept its RAW gate projection. Only 29 of the 192 intermediate
-  // tiles were ever activated (measured offline against the emitted schedule);
-  // ``inst[10 + t]`` also reads inst[16] for t == 6, i.e. one word past the
-  // 16-word instruction row.
+  // The tile index is ``tile_n0 + t``, derived from the range. This is
+  // mandatory, not stylistic: a per-tile list cannot address a full pack.
+  // ``inst`` here is ``inst_shared``, a ``__shared__ int[TG_INST_WIDTH]``
+  // local copy (see the kernel entry — op bodies never rebase it), so only
+  // inst[10..15] exist after the range start and ``_TILE_SLOTS_PER_INST`` is 7.
+  //
+  // It used to read the per-tile list as ``inst[10 + t]``. ``f3d8114``
+  // replaced that list with a range, zeroed inst[11..15] and raised the pack
+  // cap 6 -> 7, leaving this loop behind. The consequences were not subtle:
+  //
+  //   t == 0      inst[10]     = tile_n0  -> only the 28 pack STARTS activated
+  //   1 <= t <= 5 inst[11..15] = 0        -> tile 0 re-Silu'd 3836x
+  //   t == 6      inst[16]     -> ONE WORD PAST inst_shared: undefined, and in
+  //                                         practice whatever __shared__ object
+  //                                         the compiler laid out next (s_a
+  //                                         holds the GEMM's own bf16 A fragment,
+  //                                         so its bits read back as tile ids in
+  //                                         the tens of thousands, e.g. bf16 1.0
+  //                                         = 0x3F80 = 16256 -> ~1 MB past a
+  //                                         192 KiB silu_out). The exact value
+  //                                         is layout-dependent; the out-of-
+  //                                         bounds read-modify-write is not.
+  //
+  // Measured against the emitted BS=1 schedule: 28 of the 192 intermediate
+  // tiles were ever activated, 164 (85%) kept their RAW gate projection, and
+  // 756 instructions per step read inst[16]. That unchecked store is a prime
+  // suspect for the grid > 1 illegal memory access on sm_120.
   //
   // For BS>1, process all batch rows for each tile column.
   for (int t = 0; t < num_tiles; t++) {

@@ -2,6 +2,14 @@ import re
 import unittest
 from pathlib import Path
 
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from nanovllm.backends.megakernel import schedule as tg  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 KERNEL = ROOT / "src/nanovllm/backends/megakernel/csrc/taskgraph_kernel.cu"
@@ -83,32 +91,81 @@ class TaskGraphKernelSourceTests(unittest.TestCase):
         """A packed GEMM is a RANGE: ``inst[9]`` = count, ``inst[10]`` = first tile.
 
         ``f3d8114`` replaced the per-tile list in ``inst[11..15]`` with that
-        range, but ``tg_ffn_upgate_op`` kept reading ``inst[10 + t]``. For
-        ``t < 5`` that silently read the *now-zero* tile slots (so every
-        instruction re-Silu'd tile 0, once per packed tile) and for ``t == 6``
-        it read ``inst[16]`` — one word past the 16-word row, i.e. the next
-        instruction's opcode. Only 29 of the 192 intermediate tiles were ever
-        activated; FFN_DOWN then ran on 163 columns of raw gate projection.
+        range and left ``tg_ffn_upgate_op`` reading ``inst[10 + t]``:
 
-        Guard the general property, not the one call site: no instruction word
-        may be indexed by a *loop variable*.
+          * ``t == 0``      reads ``inst[10]``   = ``tile_n0``, the pack start
+          * ``1 <= t <= 5`` reads the *now-zero* ``inst[11..15]``, so tile 0 is
+            re-activated once per tile in the pack
+          * ``t == 6``      reads ``inst[16]``, one word PAST ``inst_shared``
+
+        Measured against the emitted BS=1 schedule: only the 28 pack starts
+        (tiles 0, 7, 14, ... 189) were ever activated out of 192, 164 were never
+        SiLU'd, tile 0 was re-SiLU'd 3836 times, and 756 instructions per step
+        read ``inst[16]`` — an out-of-bounds shared-memory read feeding an
+        unchecked read-modify-write into ``g.silu_out``.
+
+        Guard the general property, not the one call site: every instruction
+        word read must be indexed by an integer *literal*. A regex that only
+        looks for ``inst[<identifier>]`` misses ``inst[10 + t]``, which is
+        exactly the shape that shipped.
         """
 
         kernel = KERNEL.read_text(encoding="utf-8")
         # Strip comments first: the fix's own explanation quotes the old
         # expression, and that must not count as a use.
         code = re.sub(r"//[^\n]*", "", kernel)
-        offending = re.findall(r"inst\[\s*[A-Za-z_]\w*\s*(?:[+-]\s*\d+)?\s*\]", code)
+        indices = re.findall(r"inst\[([^\]]*)\]", code)
+        self.assertTrue(indices, "no instruction reads found; did the kernel move?")
+        computed = [expr for expr in indices if not expr.strip().isdigit()]
         self.assertEqual(
-            offending,
+            computed,
             [],
-            f"instruction words indexed by a variable: {offending}",
+            f"instruction words indexed by something other than a literal: {computed}",
         )
 
         # And the range must be walked as a range in the SiLU phase.
         body = _kernel_function_body(kernel, "tg_ffn_upgate_op")
         self.assertIn("int tile_n = tile_n0 + t;", body)
         self.assertIn("int offset = tile_n * TG_WMMA_TILE;", body)
+
+    def test_no_literal_instruction_word_read_is_out_of_bounds(self) -> None:
+        """``inst`` in an op body is ``inst_shared``, a ``__shared__ int[16]``.
+
+        The kernel entry calls ``tg_dispatch(inst_shared, ...)`` and no op body
+        rebases the pointer, so every ``inst[N]`` is a shared-memory read of a
+        16-element array. A literal ``inst[16]`` is therefore an out-of-bounds
+        read of whatever ``__shared__`` array was declared next — which is how
+        the ``inst[10 + t]`` bug produced tile ids in the tens of thousands.
+        """
+
+        src = KERNEL.read_text(encoding="utf-8")
+        # TG_INST_WIDTH lives in the ABI header, which is what sizes inst_shared.
+        abi = (ROOT / "src/nanovllm/backends/megakernel/csrc/tg_abi.h").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r"constexpr int TG_INST_WIDTH\s*=\s*(\d+)", abi)
+        self.assertIsNotNone(match, "tg_abi.h no longer defines TG_INST_WIDTH")
+        width = int(match.group(1))
+        self.assertIn(
+            "inst_shared[TG_INST_WIDTH]",
+            src,
+            "the dispatch buffer must stay sized by TG_INST_WIDTH",
+        )
+        used = {int(n) for n in re.findall(r"inst\[(\d+)\]", re.sub(r"//[^\n]*", "", src))}
+        self.assertTrue(used, "no literal instruction reads found")
+        self.assertLess(
+            max(used), width, f"instruction word reads {sorted(used)} exceed [{width}]"
+        )
+
+        # A per-tile list needs one word per tile; the range encoding does not.
+        # Lock the reason the loop above may not use `inst[10 + t]`.
+        slots_after_range_start = width - 10
+        self.assertGreater(
+            tg._TILE_SLOTS_PER_INST,
+            slots_after_range_start,
+            "the pack cap now fits in inst[10..width-1], so the range encoding "
+            "is no longer forced by the instruction width -- revisit this guard",
+        )
 
     def test_silu_phase_covers_every_intermediate_tile_exactly_once(self) -> None:
         """Offline check of what the kernel's SiLU loop touches.
