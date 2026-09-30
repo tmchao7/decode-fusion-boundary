@@ -1738,8 +1738,18 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
   __shared__ int inst_shared[TG_INST_WIDTH];
 
   // Shared memory for compute ops (see TgSmem).
-  // s_norm is in dynamic shared memory (extern __shared__) because it needs
-  // [TG_WMMA_TILE * TG_HIDDEN] = 64 KB, exceeding the 48 KB static limit.
+  //
+  // s_norm is in dynamic shared memory because the per-warp B staging plus the
+  // A fragments already exceed the 48 KB static limit on their own. It holds
+  // the RMSNorm staging row indexed as ``s_norm[batch * hidden]``, and it is the
+  // WMMA A operand for GEMMs with ``M = BS``: it needs **BS rows**, not
+  // ``TG_WMMA_TILE`` (16) rows. It was previously sized at
+  // ``TG_WMMA_TILE * TG_HIDDEN * 4`` = 64 KB, which is 8x the batch-8
+  // requirement; on sm_120 that pushed static + dynamic to 102608 B against a
+  // 102400 B per-SM budget and ``cudaFuncSetAttribute`` failed with "invalid
+  // argument", so the very first launch died. The size is now derived from
+  // ``desc->BS`` in ``tg_launch_decode``; see the comment there.
+  //
   // Per-warp A staging (each warp converts its own 16x16 fragment), so the
   // GEMM K loop needs no CTA barrier. __align__(16) is required by
   // wmma::load_matrix_sync.
@@ -1752,7 +1762,8 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
   __shared__ float s_argmax_val[TG_WORKER_WARPS];
   __shared__ int s_argmax_idx[TG_WORKER_WARPS];
 
-  // Dynamic shared memory for s_norm [TG_WMMA_TILE * TG_HIDDEN] (64 KB).
+  // Dynamic shared memory for s_norm: one float row per batch row (see the
+  // sizing comment above). The launch helper requests ``BS * hidden`` floats.
   extern __shared__ float s_norm[];
 
   TgSmem smem;
@@ -1796,27 +1807,58 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
 // tokens in lm_logits and look like a wrong answer.
 extern "C" cudaError_t tg_launch_decode(const tg::TgLaunchDesc* desc,
                                         cudaStream_t stream) {
-  // s_norm is in dynamic shared memory: [TG_WMMA_TILE * TG_HIDDEN] floats.
-  constexpr int TG_DYN_SMEM_BYTES = TG_WMMA_TILE * TG_HIDDEN * sizeof(float);
-  // One-time: raise the dynamic shared memory limit (default 48 KB on sm_80).
-  static bool smem_attr_set = false;
-  if (!smem_attr_set) {
+  // s_norm must hold one float row per batch row: the RMSNorm op writes
+  // s_norm[batch * hidden] for every batch, and the WMMA A operand is read as
+  // [BS, hidden]. Sizing it at TG_WMMA_TILE * hidden (64 KB) rather than
+  // BS * hidden (32 KB at BS=8) is not merely wasteful -- static (37072 B
+  // measured) + 65536 B exceeds the 102400 B per-SM shared memory budget on
+  // sm_120 (RTX 5090), so cudaFuncSetAttribute fails with "invalid argument"
+  // and the very first decode launch dies. On the A100 the budget was larger
+  // than the request, which is why this surfaced only on the 5090.
+  if (desc->BS < 1 || desc->hidden < 1) {
+    fprintf(stderr, "tg_launch_decode: invalid geometry BS=%d hidden=%d\n",
+            desc->BS, desc->hidden);
+    return cudaErrorInvalidValue;
+  }
+  const int dyn_smem_bytes =
+      (int)((size_t)desc->BS * (size_t)desc->hidden * sizeof(float));
+
+  // Raise the dynamic shared memory ceiling to the largest value any call has
+  // needed. Tracking the value (rather than a "already set" flag) matters
+  // because the batch size differs between steps: a flag set by a BS=1 step
+  // would leave a 4 KB limit in place for a later BS=8 step.
+  static int smem_attr_bytes = 0;
+  if (dyn_smem_bytes > smem_attr_bytes) {
     cudaError_t attr_err = cudaFuncSetAttribute(
         (void*)tg_decode_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        TG_DYN_SMEM_BYTES);
+        dyn_smem_bytes);
     if (attr_err != cudaSuccess) {
-      fprintf(stderr, "tg_launch_decode: cudaFuncSetAttribute(%d bytes) failed: %s\n",
-              TG_DYN_SMEM_BYTES, cudaGetErrorString(attr_err));
+      // Report the real budget instead of a bare "invalid argument": this
+      // failure is static + dynamic exceeding the per-SM limit, which is easy
+      // to misread as a driver or architecture problem.
+      cudaFuncAttributes fn_attr{};
+      cudaFuncGetAttributes(&fn_attr, (void*)tg_decode_kernel);
+      int per_sm = 0;
+      cudaDeviceGetAttribute(&per_sm,
+                             cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0);
+      fprintf(stderr,
+              "tg_launch_decode: cudaFuncSetAttribute(dynamic=%d bytes, "
+              "BS=%d, hidden=%d) failed: %s; static=%zu + dynamic=%d = %zu "
+              "vs per-SM shared memory %d bytes. Lower the batch size.\n",
+              dyn_smem_bytes, desc->BS, desc->hidden,
+              cudaGetErrorString(attr_err), fn_attr.sharedSizeBytes,
+              dyn_smem_bytes,
+              fn_attr.sharedSizeBytes + (size_t)dyn_smem_bytes, per_sm);
       return attr_err;
     }
-    smem_attr_set = true;
+    smem_attr_bytes = dyn_smem_bytes;
   }
   void* args[] = {(void*)desc};
   cudaError_t err = cudaLaunchCooperativeKernel(
       (void*)tg_decode_kernel,
       dim3(desc->num_sms), dim3(TG_BLOCK_SIZE), args,
-      TG_DYN_SMEM_BYTES, stream);
+      dyn_smem_bytes, stream);
   if (err != cudaSuccess) {
     fprintf(stderr, "tg_launch_decode: cudaLaunchCooperativeKernel(grid=%d, "
             "block=%d) failed: %s\n",
