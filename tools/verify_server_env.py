@@ -95,7 +95,16 @@ def main() -> int:
         requested_arch = requested_arch if requested_arch.startswith("sm_") else f"sm_{requested_arch}"
         print(f"requested build arch: {requested_arch}")
         if requested_arch != actual_arch:
-            print(f"WARNING: requested arch differs from visible GPU arch {actual_arch}")
+            # A per-arch build is SASS-only, so this is fatal at the first launch
+            # rather than a portability footnote.
+            print(
+                f"ERROR: NANOVLLM_CUDA_ARCH={requested_arch} but the visible GPU "
+                f"is {actual_arch}. A single-arch build cannot run there "
+                "(no compatible kernel image); unset NANOVLLM_CUDA_ARCH to "
+                "auto-detect, or set it to the device's own arch.",
+                file=sys.stderr,
+            )
+            checks_ok = False
     bf16_supported = bool(torch.cuda.is_bf16_supported())
     print(f"BF16 supported: {bf16_supported}")
     if args.require_megakernel and (capability[0] < 8 or not bf16_supported):

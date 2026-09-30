@@ -30,7 +30,16 @@ export QWEN3_MODEL_PATH="$MODEL"
 export PYTHONPATH="$REPO/src:$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
-export NANOVLLM_CUDA_ARCH="${NANOVLLM_CUDA_ARCH:-sm_80}"
+# Do NOT default the build arch: nvcc's -arch=sm_XX emits SASS for that arch only
+# (no PTX), so a forced sm_80 build cannot run a launch on an sm_120 card -- it
+# fails with "no kernel image is available for execution on the device". Left
+# unset, build.py detects the visible device (sm_80 on A100, sm_120 on RTX 5090).
+if [[ -n "${NANOVLLM_CUDA_ARCH:-}" ]]; then
+  export NANOVLLM_CUDA_ARCH
+  echo "CUDA arch: forced to ${NANOVLLM_CUDA_ARCH} by the environment"
+else
+  echo "CUDA arch: auto-detected from the visible device (override with NANOVLLM_CUDA_ARCH=sm_XX)"
+fi
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$REPO/.torch_extensions}"
 
 mkdir -p "$REPO/results"

@@ -10,7 +10,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nanovllm.roofline import (  # noqa: E402
+    A100_SXM4_80GB,
     DEFAULT_KERNEL_SOURCE,
+    RTX_5090,
     HardwareSpec,
     ModelDims,
     RooflineModel,
@@ -345,3 +347,29 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HardwareSpecPresetTests(unittest.TestCase):
+    """Named device presets are spec values; the roofline must use them as given."""
+
+    def test_the_a100_preset_is_the_dataclass_default(self) -> None:
+        self.assertEqual(A100_SXM4_80GB.name, "A100-SXM4-80GB")
+        self.assertEqual(A100_SXM4_80GB.bandwidth_gbps, 2039.0)
+
+    def test_the_5090_preset_carries_its_own_spec(self) -> None:
+        self.assertEqual(RTX_5090.name, "RTX 5090")
+        self.assertEqual(RTX_5090.bandwidth_gbps, 1792.0)
+        self.assertLess(RTX_5090.bandwidth_gbps, A100_SXM4_80GB.bandwidth_gbps)
+
+    def test_the_5090_weight_stream_floor_is_tighter_than_the_spec_gap_suggests(self) -> None:
+        """1.192 GB/step: 0.665 ms at 1792 GB/s spec vs 0.585 ms at 2039 GB/s.
+
+        The two cards land within ~5% of each other once the A100's measured 83%
+        of spec is accounted for, which is the point of calibrating per machine.
+        """
+
+        step_bytes = 1.192e9
+        self.assertAlmostEqual(step_bytes / RTX_5090.bandwidth_gbps / 1e6, 0.665, places=3)
+        self.assertAlmostEqual(
+            step_bytes / A100_SXM4_80GB.bandwidth_gbps / 1e6, 0.585, places=3
+        )

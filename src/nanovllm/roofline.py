@@ -127,6 +127,18 @@ class HardwareSpec:
         return float(self.peak_tflops) * float(self.compute_efficiency)
 
 
+#: Named presets. Every ``bandwidth_gbps`` here is the **spec**, not what the
+#: device reaches: the A100 gap is 2039 spec vs 1699 measured (83%), so pass a
+#: measured value (``tools/bench_memory_bandwidth.py``) whenever one exists --
+#: the same must be done on a rented 5090 rather than inheriting the A100 number.
+A100_SXM4_80GB = HardwareSpec()
+RTX_5090 = HardwareSpec(
+    name="RTX 5090",
+    bandwidth_gbps=1792.0,  # 32 GB GDDR7, 512-bit at 28 Gbps
+    peak_tflops=209.5,      # vendor dense BF16 tensor TFLOPs
+)
+
+
 def parse_kernel_constants(source: str | Path = DEFAULT_KERNEL_SOURCE) -> dict[str, int]:
     """Extract the model constants used by the task-graph kernel."""
 

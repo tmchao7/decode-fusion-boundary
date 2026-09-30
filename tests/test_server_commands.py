@@ -293,6 +293,18 @@ class ServerCommandReferenceTests(unittest.TestCase):
                     self.assertIn(f"tests/{module}.py", self.text)
                     self.assertNotIn(f"tests.{module}", self.text)
 
+    def test_the_build_arch_is_not_forced_to_one_device(self) -> None:
+        """nvcc's -arch=sm_XX emits SASS for that arch only, with no PTX.
+
+        A forced default therefore cannot run on any other device: an sm_80
+        default made the whole command file unrunnable on a rented RTX 5090
+        (sm_120), failing at the first launch with "no kernel image is
+        available for execution on the device".
+        """
+
+        self.assertNotIn("NANOVLLM_CUDA_ARCH:-sm_", self.text)
+        self.assertIn("auto-detected", self.text)
+
     def test_the_offline_schedule_gate_runs_before_the_build(self) -> None:
         """docs/17 makes the verifier a precondition for touching schedule.py."""
 
