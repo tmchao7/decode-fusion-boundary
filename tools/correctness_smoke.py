@@ -138,7 +138,9 @@ def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int,
     """Run one CUDA backend in a fresh process and return JSON-safe data."""
 
     try:
-        result = run_backend(model, name, prompts, max_tokens)
+        # attn_splits MUST be forwarded: dropping it here silently downgraded
+        # ``--attn-splits 2`` to 1 while the JSON artifact still recorded 2.
+        result = run_backend(model, name, prompts, max_tokens, attn_splits)
         connection.send({"ok": True, "result": serialize_backend_result(result)})
     except BaseException:
         connection.send({"ok": False, "error": traceback.format_exc()})
@@ -159,7 +161,7 @@ def run_backend_isolated(model: str, name: str, prompts, max_tokens: int, attn_s
     parent, child = context.Pipe(duplex=False)
     process = context.Process(
         target=_backend_worker,
-        args=(child, model, name, prompts, max_tokens),
+        args=(child, model, name, prompts, max_tokens, attn_splits),
     )
     process.start()
     child.close()

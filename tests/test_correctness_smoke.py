@@ -116,3 +116,55 @@ class BackendConfigTests(unittest.TestCase):
             backend_config("nope")
         with self.assertRaises(ValueError):
             backend_config("megakernel", 0)
+
+    def test_attn_splits_survives_the_isolated_process_handoff(self) -> None:
+        """``--attn-splits 2`` must reach the child process that runs the backend.
+
+        Regression: ``run_backend_isolated`` accepted ``attn_splits`` and never
+        put it in ``Process(args=...)``, and ``_backend_worker`` accepted it and
+        called ``run_backend`` without it. The gate therefore ran at split=1
+        while ``results/taskgraph_attn_correctness.json`` recorded
+        ``"attn_splits": 2`` — a false record that looks like passing coverage.
+
+        Asserted structurally (AST) rather than by executing: the child would
+        need a GPU, and this bug is purely "is the argument forwarded".
+        """
+
+        import ast
+        import inspect
+        import textwrap
+
+        from tools import correctness_smoke
+
+        def calls_in(func) -> list[ast.Call]:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+            return [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+        # 1. The Process(...) handoff must pass attn_splits positionally.
+        isolated = correctness_smoke.run_backend_isolated
+        process_calls = [
+            call
+            for call in calls_in(isolated)
+            if getattr(call.func, "attr", None) == "Process"
+        ]
+        self.assertEqual(len(process_calls), 1, "expected one Process(...) call")
+        args_kw = next(k for k in process_calls[0].keywords if k.arg == "args")
+        tunnel = [getattr(a, "id", None) for a in args_kw.value.elts]
+        self.assertIn(
+            "attn_splits",
+            tunnel,
+            f"attn_splits is not forwarded to the child process: args={tunnel}",
+        )
+
+        # 2. The worker must forward it to run_backend.
+        worker = [c for c in calls_in(correctness_smoke._backend_worker)
+                  if getattr(c.func, "id", None) == "run_backend"]
+        self.assertEqual(len(worker), 1, "expected one run_backend(...) call")
+        forwarded = [getattr(a, "id", None) for a in worker[0].args]
+        forwarded += [k.value.id for k in worker[0].keywords
+                      if getattr(k.value, "id", None)]
+        self.assertIn(
+            "attn_splits",
+            forwarded,
+            f"the worker drops attn_splits: run_backend args={forwarded}",
+        )
