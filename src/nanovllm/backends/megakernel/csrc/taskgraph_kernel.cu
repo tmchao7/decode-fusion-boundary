@@ -876,10 +876,14 @@ __device__ __forceinline__ void tg_rope(
 // QKV_PROJ: RMSNorm(x_resid) → WMMA GEMM for a pack of Q/K/V N tiles.
 //
 // Instruction layout:
-//   inst[1]=layer, inst[2]=tile_n(primary), inst[3]=gemm_idx(0=Q,1=K,2=V),
-//   inst[4]=needs_rope, inst[5]=wait_bar_idx(bar_layer), inst[6]=wait_target,
-//   inst[7]=produce_bar_idx(bar_qkv), inst[8]=batch_row,
-//   inst[9]=num_tiles, inst[10..15]=consecutive tile_n list
+//   inst[1]=layer, inst[3]=gemm_idx(0=Q,1=K,2=V),
+//   inst[5]=wait_bar_idx(bar_layer), inst[6]=wait_target,
+//   inst[7]=produce_bar_idx(bar_qkv),
+//   inst[9]=num_tiles, inst[10]=first tile_n of the RANGE (inst[11..15] unused)
+//
+// inst[2] (primary tile_n) and inst[8] (batch_row) are written by the encoder
+// but never read here: the range start in inst[10] supersedes the former, and
+// this op always covers every BS row, so the latter has nothing to select.
 //
 // batch_row is always 0 (the op covers all BS rows). The RMSNorm is computed
 // once per instruction (redundantly across instructions, but cheap next to the
@@ -1328,7 +1332,8 @@ __device__ __forceinline__ void tg_attn_combine_op(
 
 // O_PROJ: WMMA GEMM, attn_out → o_proj_out.
 // Generic GEMM layout: inst[6]=wait_bar_idx, inst[7]=wait_target,
-// inst[8]=produce_bar_idx, inst[9]=num_tiles, inst[10..15]=packed tile IDs.
+// inst[8]=produce_bar_idx, inst[9]=num_tiles, inst[10]=first tile_n of the range
+// (inst[11..15] unused: packing is a range, see tg_ffn_upgate_op).
 
 __device__ __forceinline__ void tg_o_proj_op(
     const int* inst, TgGlobals& g, int bid,

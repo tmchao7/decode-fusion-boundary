@@ -882,6 +882,88 @@ def simulate_segmented_execution(segments, num_sms):
     return done, total, bars
 
 
+class PackedRangeCoverageTests(unittest.TestCase):
+    """Every packed GEMM's tile RANGE must partition its weight matrix.
+
+    A packed group becomes ONE kernel GEMM with ``N = num_tiles * 16`` starting
+    at ``inst[10]``. Nothing in the kernel bounds-checks that range, so if the
+    packer ever emitted an overlapping or short range, the kernel would write
+    overlapping output tiles (or leave some uncomputed) with no error. The
+    ``FFN_UPGATE_ACT`` SiLU phase reads the same range through ``tile_n0 + t``,
+    so a gap there is a silently un-activated intermediate column.
+
+    Checked per (op, layer, gemm_idx) group -- K and V share one QKV group only
+    until the gemm index differs -- over every batch size and grid size the
+    project actually runs.
+    """
+
+    #: Tile-count bound for each packed opcode, from the model geometry.
+    _OPS = (
+        tg.TgOp.QKV_PROJ,
+        tg.TgOp.O_PROJ,
+        tg.TgOp.FFN_UPGATE_ACT,
+        tg.TgOp.FFN_DOWN,
+        tg.TgOp.LM_HEAD,
+    )
+
+    def _tile_count(self, geo, opcode: int, gemm_idx: int) -> int:
+        tile = 16  # geo.tiling.*_bn; they are all 16 today
+        if opcode == tg.TgOp.QKV_PROJ:
+            # gemm_idx 0 = Q (q_size), 1/2 = K/V (kv_size).
+            return (geo.q_size if gemm_idx == 0 else geo.kv_size) // tile
+        if opcode in (tg.TgOp.O_PROJ, tg.TgOp.FFN_DOWN):
+            return geo.hidden // tile
+        if opcode == tg.TgOp.FFN_UPGATE_ACT:
+            return geo.intermediate // tile
+        if opcode == tg.TgOp.LM_HEAD:
+            return geo.vocab // tile
+        raise AssertionError(f"not a packed opcode: {opcode}")
+
+    def test_every_packed_range_covers_its_tiles_exactly_once(self) -> None:
+        from collections import defaultdict
+
+        for BS in (1, 2, 4, 8):
+            for num_sms in (1, 4, 108, 170):
+                geo = tg.default_geometry(BS=BS, attn_splits=1)
+                sched = tg.build_schedule(geo, num_sms=num_sms)
+                width = tg.TG_INST_WIDTH
+
+                hits: dict[tuple, dict[int, int]] = defaultdict(
+                    lambda: defaultdict(int)
+                )
+                for sm in range(num_sms):
+                    base_sm = sm * sched.max_inst * width
+                    for i in range(sched.num_inst_per_sm[sm]):
+                        inst = sched.flat_inst_buf[
+                            base_sm + i * width : base_sm + (i + 1) * width
+                        ]
+                        if inst[0] not in self._OPS:
+                            continue
+                        gemm_idx = inst[3] if inst[0] == tg.TgOp.QKV_PROJ else -1
+                        group = (inst[0], inst[1], gemm_idx)
+                        tile_n0, num_tiles = inst[10] & 0xFFFF, inst[9]
+                        for t in range(num_tiles):
+                            hits[group][tile_n0 + t] += 1
+
+                self.assertTrue(hits, "no packed GEMM instructions found")
+                for group, counts in hits.items():
+                    opcode, layer, gemm_idx = group
+                    bound = self._tile_count(geo, opcode, gemm_idx)
+                    with self.subTest(BS=BS, num_sms=num_sms, group=group):
+                        self.assertEqual(
+                            sorted(counts),
+                            list(range(bound)),
+                            f"opcode {opcode} layer={layer} gemm_idx={gemm_idx}: "
+                            f"the packed ranges do not cover tiles 0..{bound - 1} "
+                            "exactly once",
+                        )
+                        self.assertEqual(
+                            sorted(set(counts.values())),
+                            [1],
+                            f"group {group} covers a tile more than once",
+                        )
+
+
 def instructions(sched):
     """Every instruction (``TG_INST_WIDTH`` ints) in a schedule's flat buffer."""
 
