@@ -66,14 +66,36 @@ class ModelDims:
     def kv_size(self) -> int:
         return self.num_kv_heads * self.head_dim
 
-    def params_per_layer(self) -> int:
-        """Attention (q/k/v/o) + MLP (gate/up/down) + two RMSNorm vectors."""
+    def attention_params_per_layer(self) -> int:
+        """q, k, v, o plus the layer's norm vectors, via the single spec source."""
 
-        qkv = self.hidden_size * (self.q_size + 2 * self.kv_size)
-        o_proj = self.q_size * self.hidden_size
-        mlp = 3 * self.hidden_size * self.intermediate_size
-        norms = 2 * self.hidden_size
-        return qkv + o_proj + mlp + norms
+        return _spec_for(self).attention_params_per_layer()
+
+    def qk_norm_params_per_layer(self) -> int:
+        """The per-head ``q_norm`` / ``k_norm`` pair, via the spec.
+
+        Qwen3-0.6B has these two tensors; an earlier version of this model omitted
+        them, which made ``params_per_layer`` 256 short while a *separately* amortised
+        final norm happened to bring the total back within 0.002%. Deriving from the
+        spec is what makes them impossible to forget again.
+        """
+
+        return _spec_for(self).qk_norm_params_per_layer
+
+    def final_norm_params(self) -> int:
+        """The output RMSNorm, counted once rather than spread over the layers."""
+
+        return self.hidden_size
+
+    def params_per_layer(self) -> int:
+        """Attention (q/k/v/o) + MLP (gate/up/down) + layer norms + per-head QK norms.
+
+        ``15,730,944`` for Qwen3-0.6B, matching the instantiated model's layer-0
+        tensor sum. Excludes :meth:`final_norm_params`, which belongs to the model
+        rather than to a layer; :meth:`total_params` adds it exactly once.
+        """
+
+        return _spec_for(self).params_per_layer()
 
     def params_embedding(self) -> int:
         return self.vocab_size * self.hidden_size
@@ -100,6 +122,7 @@ class ModelDims:
 
         return (
             self.num_layers * self.params_per_layer()
+            + self.final_norm_params()
             + (0 if tied_embedding else self.params_embedding())
             + self.params_lm_head()
         )
@@ -279,43 +302,135 @@ def hardware_from_bandwidth_json(
     )
 
 
+def _spec_for(dims: "ModelDims"):
+    """Build the :class:`~nanovllm.model_spec.ModelSpec` a :class:`ModelDims` describes.
+
+    ``ModelDims`` predates the spec and is still a public constructor (tests and the
+    CLI build it directly), so it stays -- but every *derived* number now comes from
+    the single spec source rather than being recomputed here. That is what makes a
+    field this dataclass does not even model (``qk_norm``, the final norm) impossible
+    to silently omit.
+
+    ``qk_norm`` is inferred rather than assumed: Qwen3 and OLMoE both carry
+    ``q_norm``/``k_norm``, so a spec built from dimensions alone has them on.
+    """
+
+    from nanovllm.model_spec import ModelSpec
+
+    return ModelSpec(
+        name="roofline.ModelDims",
+        num_layers=dims.num_layers,
+        hidden_size=dims.hidden_size,
+        intermediate_size=dims.intermediate_size,
+        num_q_heads=dims.num_q_heads,
+        num_kv_heads=dims.num_kv_heads,
+        head_dim=dims.head_dim,
+        vocab_size=dims.vocab_size,
+    )
+
+
 def parse_kernel_constants(source: str | Path = DEFAULT_KERNEL_SOURCE) -> dict[str, int]:
-    """Extract the model constants used by the task-graph kernel."""
+    """Extract the model constants used by the task-graph kernel.
+
+    Includes the kernel's **derived** constants (``TG_Q_SIZE`` / ``TG_KV_SIZE``) even
+    though the kernel declares them as expressions, not literals.  That matters for
+    drift detection: if the kernel ever wrote ``TG_Q_SIZE = 2048`` instead of
+    ``TG_NUM_Q_HEADS * TG_HEAD_DIM``, a parser that only read literals would see
+    nothing wrong while the two silently disagreed about what a head is.
+    """
 
     text = Path(source).read_text(encoding="utf-8")
-    wanted = {
-        "hidden_size": "TG_HIDDEN",
-        "intermediate_size": "TG_INTERMEDIATE",
-        "num_q_heads": "TG_NUM_Q_HEADS",
-        "num_kv_heads": "TG_NUM_KV_HEADS",
-        "head_dim": "TG_HEAD_DIM",
-    }
-    found: dict[str, int] = {}
-    for field, symbol in wanted.items():
-        match = re.search(
-            rf"^constexpr int {symbol}\s*=\s*(\d+)\s*;", text, re.MULTILINE
-        )
+
+    def literal(symbol: str) -> int:
+        match = re.search(rf"^constexpr int {symbol}\s*=\s*([^;]+);", text, re.MULTILINE)
         if match is None:
             raise ValueError(f"could not find constant {symbol} in {source}")
-        found[field] = int(match.group(1))
-    vocab = re.search(
-        r"^constexpr int TG_VOCAB\s*=\s*(\d+)\s*;", text, re.MULTILINE
-    )
-    if vocab is None:
-        raise ValueError(f"could not find LDG_VOCAB_SIZE in {source}")
-    found["vocab_size"] = int(vocab.group(1))
-    return found
+        value = _eval_int_expression(match.group(1), found)
+        if value is None:
+            raise ValueError(
+                f"could not evaluate constant {symbol} = {match.group(1).strip()!r} "
+                f"in {source}"
+            )
+        return value
+
+    found: dict[int | str, int] = {}
+    for field, symbol in (
+        ("hidden_size", "TG_HIDDEN"),
+        ("intermediate_size", "TG_INTERMEDIATE"),
+        ("num_q_heads", "TG_NUM_Q_HEADS"),
+        ("num_kv_heads", "TG_NUM_KV_HEADS"),
+        ("head_dim", "TG_HEAD_DIM"),
+        ("num_layers", "TG_NUM_LAYERS"),
+        ("vocab_size", "TG_VOCAB"),
+    ):
+        found[field] = literal(symbol)
+    for field, symbol in (("q_size", "TG_Q_SIZE"), ("kv_size", "TG_KV_SIZE")):
+        # Derived in the kernel; optional so older/trimmed fixtures still parse.
+        match = re.search(rf"^constexpr int {symbol}\s*=\s*([^;]+);", text, re.MULTILINE)
+        if match is None:
+            continue
+        value = _eval_int_expression(match.group(1), found)
+        if value is not None:
+            found[field] = value
+    return dict(found)
+
+
+def _eval_int_expression(expression: str, known: dict[Any, int]) -> int | None:
+    """Evaluate a kernel ``constexpr`` right-hand side made of ints, ``*`` and names.
+
+    Deliberately narrow: anything outside digits, ``*`` and known ``TG_*`` names is
+    refused rather than handed to :func:`eval`.  Combined with the character check
+    that is the injection guard.
+    """
+
+    text = expression.strip()
+    if not re.fullmatch(r"[0-9A-Za-z_\s*]+", text):
+        return None
+    symbol_to_field = {
+        "TG_HIDDEN": "hidden_size",
+        "TG_INTERMEDIATE": "intermediate_size",
+        "TG_NUM_Q_HEADS": "num_q_heads",
+        "TG_NUM_KV_HEADS": "num_kv_heads",
+        "TG_HEAD_DIM": "head_dim",
+        "TG_NUM_LAYERS": "num_layers",
+        "TG_VOCAB": "vocab_size",
+        "TG_Q_SIZE": "q_size",
+        "TG_KV_SIZE": "kv_size",
+    }
+    for symbol, field_name in symbol_to_field.items():
+        if symbol in text:
+            value = known.get(field_name)
+            if value is None:
+                return None
+            text = re.sub(rf"\b{symbol}\b", str(int(value)), text)
+    if not re.fullmatch(r"[0-9*\s]+", text):
+        return None
+    try:
+        return int(eval(text))  # noqa: S307 - the character class above is the guard
+    except (SyntaxError, ValueError, TypeError):
+        return None
 
 
 def assert_kernel_constants(
-    dims: ModelDims, source: str | Path = DEFAULT_KERNEL_SOURCE
+    dims: ModelDims | Any, source: str | Path = DEFAULT_KERNEL_SOURCE
 ) -> None:
-    """Raise if :class:`ModelDims` no longer matches the checked-in kernel."""
+    """Raise if the model geometry no longer matches the checked-in kernel.
+
+    Accepts a :class:`ModelDims` (roofline's own view) or a
+    :class:`nanovllm.model_spec.ModelSpec`.
+    """
 
     actual = parse_kernel_constants(source)
-    expected = asdict(dims)
+    if isinstance(dims, ModelDims):
+        expected = {
+            **asdict(dims),
+            "q_size": dims.q_size,
+            "kv_size": dims.kv_size,
+        }
+    else:
+        expected = dims.kernel_constants()
     mismatches = {
-        key: (expected[key], value)
+        key: (expected.get(key), value)
         for key, value in actual.items()
         if expected.get(key) != value
     }
@@ -380,6 +495,7 @@ class RooflineModel:
 
         return (
             self.dims.num_layers * self.dims.params_per_layer()
+            + self.dims.final_norm_params()
             + self.dims.params_lm_head()
         ) * self.bytes_per_param
 
@@ -398,9 +514,15 @@ class RooflineModel:
         lm_head = d.params_lm_head(self.tied_embedding)
         return {
             "layers_bytes": layers * scale,
+            "final_norm_bytes": d.final_norm_params() * scale,
             "lm_head_bytes": lm_head * scale,
             "embedding_bytes": self.embedding_bytes(),
-            "weight_bytes_total": (layers + lm_head) * scale + self.embedding_bytes(),
+            # The final norm is one tensor, so it is added here exactly once --
+            # matching `total_params` and `core_weight_bytes`, which is what makes
+            # the parts sum to the total.
+            "weight_bytes_total": (
+                layers + d.final_norm_params() + lm_head
+            ) * scale + self.embedding_bytes(),
         }
 
     def kv_bytes(self, batch_size: int, seq_len: int) -> int:

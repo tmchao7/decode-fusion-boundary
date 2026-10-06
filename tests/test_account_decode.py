@@ -227,8 +227,21 @@ class CliTests(unittest.TestCase):
 
     def test_the_default_denominator_is_the_checked_in_probe_path(self) -> None:
         self.assertEqual(DEFAULT_BANDWIDTH_JSON, Path("results") / "bandwidth.json")
-        proc = self._run(["nonexistent.json"])
-        # The missing artifact is reported before the missing input file matters.
+        # Run from a directory that has no results/bandwidth.json, so this asserts
+        # the *default resolution* rather than the developer's working tree: on a
+        # machine that has already run RUN_MODE=bandwidth the checked-in path
+        # exists, and an earlier version of this test silently became a no-op there.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc = subprocess.run(
+                [sys.executable, "-m", "tools.account_decode", "nonexistent.json"],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+                env={
+                    "PYTHONPATH": f"{ROOT / 'src'}:{ROOT}",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("RUN_MODE=bandwidth", proc.stderr)
 

@@ -288,28 +288,38 @@ def cross_check_against_baseline(
     ``docs/14`` §6 acceptance 2 requires the sweep's ``g=1`` to agree with
     ``RUN_MODE=taskgraph-baseline``; without this check the two artifacts can drift
     apart with nothing noticing.
+
+    The join key is ``(batch_size, prompt_length)`` and deliberately **not** the
+    workload id: ``benchmarks.compare`` names grid rows ``perf_p<L>_b<B>`` while
+    this tool names its own rows ``fusion_g<g>_p<L>_b<B>`` (it has to, since several
+    granularities share one grid point). Keying on the id would make every
+    comparison miss and report "no matching baseline row" forever -- i.e. the check
+    would be present but never actually check anything.
     """
 
-    def row_key(experiment: dict) -> tuple[str, int, int]:
+    def grid_point(experiment: dict) -> tuple[int, int] | None:
         workload = experiment.get("workload") or {}
-        prompt_lengths = workload.get("prompt_lengths") or [0]
+        prompt_lengths = workload.get("prompt_lengths") or []
+        if not prompt_lengths:
+            return None
         return (
-            str(workload.get("id")),
             int(workload.get("batch_size") or 0),
             int(prompt_lengths[0]),
         )
 
-    # compare.py builds the workload id from the (prompt, batch) pair, so the id
-    # alone is enough; the tuple keys keep a mismatched baseline visible instead
-    # of silently matching the wrong row.
-    baseline: dict[tuple[str, int, int], float] = {}
+    def label(experiment: dict) -> str:
+        workload = experiment.get("workload") or {}
+        return str(workload.get("id"))
+
+    baseline: dict[tuple[int, int], float] = {}
     for experiment in baseline_experiments:
         if experiment.get("backend") != BACKEND:
             continue
         device = roofline_device_ms(experiment)
-        if device is None:
+        key = grid_point(experiment)
+        if device is None or key is None:
             continue
-        baseline[row_key(experiment)] = device
+        baseline[key] = device
 
     findings: list[dict[str, Any]] = []
     for row in rows:
@@ -317,14 +327,14 @@ def cross_check_against_baseline(
             continue
         experiment = row.get("experiment") or {}
         measured = roofline_device_ms(experiment)
-        if measured is None:
+        key = grid_point(experiment)
+        if measured is None or key is None:
             continue
-        key = row_key(experiment)
         reference = baseline.get(key)
         finding: dict[str, Any] = {
-            "workload_id": key[0],
-            "batch_size": key[1],
-            "prompt_length": key[2],
+            "workload_id": label(experiment),
+            "batch_size": key[0],
+            "prompt_length": key[1],
             "measured": measured,
             "baseline": reference,
             "relative_delta": None,

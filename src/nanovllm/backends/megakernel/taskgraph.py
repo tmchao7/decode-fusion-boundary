@@ -26,27 +26,31 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from nanovllm.model_spec import QWEN3_06B as MEGAKERNEL_SPEC
+
 # Compile-time ceiling for scratch/bar sizing (``-DTG_MAX_BATCH`` in build.py).
 # Keep in sync with ``taskgraph_kernel.cu``; ``test_taskgraph_abi`` locks the
 # kernel/build.py defaults and ``test_megakernel_backend`` locks this value
 # against the batch policy.
 TG_MAX_BATCH = 8
 
-# Qwen3-0.6B geometry the task-graph kernel is compiled for.
-NUM_LAYERS = 28
-NUM_Q_HEADS = 16
-NUM_KV_HEADS = 8
-HEAD_DIM = 128
-HIDDEN_SIZE = 1024
-INTERMEDIATE_SIZE = 3072
-Q_SIZE = NUM_Q_HEADS * HEAD_DIM   # 2048
-KV_SIZE = NUM_KV_HEADS * HEAD_DIM  # 1024
-VOCAB_SIZE = 151936
+# Qwen3-0.6B geometry the task-graph kernel is compiled for. Sourced from the
+# single spec so a second model cannot be added by editing this block; the names
+# stay here because schedulers, tools and tests import them from this module.
+NUM_LAYERS = MEGAKERNEL_SPEC.num_layers
+NUM_Q_HEADS = MEGAKERNEL_SPEC.num_q_heads
+NUM_KV_HEADS = MEGAKERNEL_SPEC.num_kv_heads
+HEAD_DIM = MEGAKERNEL_SPEC.head_dim
+HIDDEN_SIZE = MEGAKERNEL_SPEC.hidden_size
+INTERMEDIATE_SIZE = MEGAKERNEL_SPEC.intermediate_size
+Q_SIZE = MEGAKERNEL_SPEC.q_size
+KV_SIZE = MEGAKERNEL_SPEC.kv_size
+VOCAB_SIZE = MEGAKERNEL_SPEC.vocab_size
 
 # Capacity of ``o_partial`` / ``lse_partial``; must equal the
 # ``max_attn_splits`` that ``schedule.default_geometry`` bakes into the
 # schedule, because the kernel indexes the partials with it.
-MAX_ATTN_SPLITS = 4
+MAX_ATTN_SPLITS = MEGAKERNEL_SPEC.max_attn_splits
 
 # WMMA outputs are written with ``wmma::store_matrix_sync``, which always
 # stores a full 16-row tile even when BS < 16 (see the binding's layout guards).

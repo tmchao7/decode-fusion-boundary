@@ -504,6 +504,39 @@ class CrossCheckTests(unittest.TestCase):
         )
         self.assertIsNone(findings[0]["baseline"])
 
+    def test_the_join_ignores_workload_ids(self):
+        """The two tools name the same grid point differently, by construction.
+
+        ``benchmarks.compare`` writes ``perf_p32_b1`` for a grid row; this tool
+        writes ``fusion_g1_p32_b1`` because several granularities share one point.
+        A join on the id would therefore never match, and the acceptance-2 check
+        would be present but silently inert.
+        """
+
+        sweep_row = {"fusion_groups": 1, "experiment": fake_experiment(0.8, 3.0)}
+        sweep_row["experiment"]["workload"]["id"] = "fusion_g1_p32_b1"
+        baseline_row = fake_experiment(0.81, 3.0)
+        baseline_row["workload"]["id"] = "perf_p32_b1"
+
+        findings = cross_check_against_baseline([sweep_row], [baseline_row])
+        self.assertEqual(len(findings), 1)
+        self.assertIsNotNone(findings[0]["baseline"])
+        self.assertTrue(findings[0]["within_tolerance"])
+        self.assertEqual(findings[0]["workload_id"], "fusion_g1_p32_b1")
+
+    def test_join_distinguishes_different_grid_points(self):
+        sweep_row = {"fusion_groups": 1, "experiment": fake_experiment(0.8, 3.0)}
+        sweep_row["experiment"]["workload"]["prompt_lengths"] = [512]
+        baseline_row = fake_experiment(0.8, 3.0)
+        baseline_row["workload"]["prompt_lengths"] = [32]
+        findings = cross_check_against_baseline([sweep_row], [baseline_row])
+        self.assertIsNone(findings[0]["baseline"])
+
+    def test_a_row_without_prompt_lengths_is_skipped_not_mismatched(self):
+        sweep_row = {"fusion_groups": 1, "experiment": fake_experiment(0.8, 3.0)}
+        sweep_row["experiment"]["workload"].pop("prompt_lengths")
+        self.assertEqual(cross_check_against_baseline([sweep_row], []), [])
+
 
 class RooflineFlagsTests(unittest.TestCase):
     def test_help_and_plan_paths_do_not_need_a_bandwidth_artifact(self):

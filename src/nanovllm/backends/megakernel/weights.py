@@ -4,21 +4,31 @@ import struct
 
 import torch
 
+from nanovllm.model_spec import QWEN3_06B
 from nanovllm.rope_config import (
     QWEN3_DEFAULT_ROPE_THETA,
     assert_supported_rope_type,
     resolve_rope_theta,
 )
 
-NUM_LAYERS = 28
-NUM_KV_HEADS = 8
-HEAD_DIM = 128
-HIDDEN_SIZE = 1024
-INTERMEDIATE_SIZE = 3072
-Q_SIZE = 16 * HEAD_DIM  # 2048
-KV_SIZE = 8 * HEAD_DIM  # 1024
-MAX_SEQ_LEN = 2048
-VOCAB_SIZE = 151936
+# Geometry comes from the single spec source; these names are re-exported because
+# callers and tests import them from here. Do not type a literal into this block:
+# ``Q_SIZE`` and ``KV_SIZE`` used to read ``16 * HEAD_DIM`` / ``8 * HEAD_DIM``, which
+# reproduced the right numbers while duplicating ``num_q_heads`` as a literal and
+# silently disagreeing the moment the spec moved.
+# ``test_model_spec.py`` asserts every one of these is *derived* and agrees.
+NUM_LAYERS = QWEN3_06B.num_layers
+NUM_KV_HEADS = QWEN3_06B.num_kv_heads
+HEAD_DIM = QWEN3_06B.head_dim
+HIDDEN_SIZE = QWEN3_06B.hidden_size
+INTERMEDIATE_SIZE = QWEN3_06B.intermediate_size
+Q_SIZE = QWEN3_06B.q_size
+KV_SIZE = QWEN3_06B.kv_size
+MAX_SEQ_LEN = QWEN3_06B.max_model_len
+VOCAB_SIZE = QWEN3_06B.vocab_size
+
+#: Tensors one layer's weight ABI carries, in ``tg_abi.h``'s declared order.
+LAYER_WEIGHT_POINTERS = QWEN3_06B.weight_pointer_count
 
 
 def _resolve_rope_theta(config, default: float = QWEN3_DEFAULT_ROPE_THETA) -> float:
@@ -160,10 +170,10 @@ def weights_from_nano_model(model, hf_config):
 
 
 def _pack_layer_weights(layer_weights: list[torch.Tensor]) -> torch.Tensor:
-    """Pack 11 tensors per layer into the CUDA ABI's pointer blob."""
+    """Pack one layer's weight pointers into the CUDA ABI's flat blob."""
 
     ptr_size = 8
-    n_ptrs = 11
+    n_ptrs = LAYER_WEIGHT_POINTERS
     struct_bytes = n_ptrs * ptr_size
     buf = bytearray(NUM_LAYERS * struct_bytes)
     for i in range(NUM_LAYERS):

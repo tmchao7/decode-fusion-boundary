@@ -43,18 +43,27 @@ class ModelDimsTests(unittest.TestCase):
         """
 
         dims = ModelDims()
-        # Hand count: qkv 1024*(2048+2048)=4.19M, o 2048*1024=2.10M,
-        # mlp 3*1024*3072=9.44M, 2 norms 2048 -> 15,730,688 per layer
-        self.assertEqual(dims.params_per_layer(), 15_730_688)
+        # Verified against the instantiated model: its layer-0 tensors sum to exactly
+        # 15,730,944 (11 tensors). The earlier hand count here used 2 norms and no
+        # q_norm/k_norm, which is 256 short; a separately amortised final norm brought
+        # the total back to within 0.002%, which is exactly why it went unnoticed.
+        #   q 2048x1024 + k 1024x1024 + v 1024x1024 + o 1024x2048 = 6,291,456
+        #   input + post_attention norm = 2,048
+        #   q_norm + k_norm = 2 x 128 = 256
+        #   gate + up + down = 3 x 1024 x 3072 = 9,437,184
+        self.assertEqual(dims.params_per_layer(), 15_730_944)
+        self.assertEqual(dims.final_norm_params(), 1024)
         layers = dims.num_layers * dims.params_per_layer()
         lm_head = dims.params_lm_head()
         self.assertEqual(lm_head, 151936 * 1024)
         # Qwen3-0.6B has tie_word_embeddings=True.
-        self.assertEqual(dims.total_params(tied_embedding=True), layers + lm_head)
+        self.assertEqual(dims.total_params(tied_embedding=True), layers + 1024 + lm_head)
         self.assertEqual(
             dims.total_params(tied_embedding=False),
-            layers + dims.params_embedding() + lm_head,
+            layers + 1024 + dims.params_embedding() + lm_head,
         )
+        # The instantiated model reports exactly this total.
+        self.assertEqual(dims.total_params(tied_embedding=True), 596_049_920)
 
     def test_weight_bytes_counts_the_lm_head_exactly_once(self) -> None:
         model = RooflineModel()
@@ -91,11 +100,21 @@ class ModelDimsTests(unittest.TestCase):
     def test_weight_breakdown_sums_to_total(self) -> None:
         model = RooflineModel()
         parts = model.weight_bytes_breakdown()
+        # The final norm is its own row because it is one tensor for the whole model:
+        # folding it into `layers_bytes` is what let it be counted an extra time.
         self.assertEqual(
-            parts["layers_bytes"] + parts["lm_head_bytes"] + parts["embedding_bytes"],
+            parts["layers_bytes"]
+            + parts["final_norm_bytes"]
+            + parts["lm_head_bytes"]
+            + parts["embedding_bytes"],
             parts["weight_bytes_total"],
         )
+        self.assertEqual(parts["final_norm_bytes"], 2048)
         self.assertEqual(parts["weight_bytes_total"], model.weight_bytes())
+        self.assertEqual(
+            parts["layers_bytes"] + parts["final_norm_bytes"] + parts["lm_head_bytes"],
+            model.core_weight_bytes(),
+        )
 
 
 class HardwareTests(unittest.TestCase):
