@@ -294,7 +294,26 @@ device = NVIDIA GeForce RTX 5090, cc=12.0, smemPerSM=102400 B, maxThreadsPerSM=1
 | `TG_LW_COUNT == 11` 硬锁（每层 11 个权重指针） | ⬜ 待解（S2），MoE 需要专家维度的第二层间接 |
 | 恰好 8 个 bar 数组硬锁 | ⬜ 待解（S2） |
 | 16 字指令的字段预算无人管 | ⬜ 待解（S2），MoE 需 9 字段，目前是手算 |
-| 4 个 wave builder 各带 copy 的 packer | ⬜ 待解（S3），MoE 会变 6 套 |
+| 4 个 wave builder 各带 copy 的 packer | ❌ **决定不做**，见下方"为什么砍掉 S3" |
+
+#### 为什么砍掉"抽一个 wave 抽象"（原计划的 S3）
+
+原计划把 `_pack_tiles` / `_pack_qkv` / attn combine / add_rmsnorm 四套"依赖+打包"逻辑
+抽成一个 `Wave`，理由是"MoE 再加两套会变成 6 套"。**维护这个计划时发现前提不成立：**
+
+1. **dense 与 MoE 的 wave 在三个维度上结构不同**——dense 的依赖轴是 `(layer, kv_head, split)`，
+   MoE 的是 `(layer, expert_slot)`；dense 的 tile 源是"某个权重矩阵的 N 列"，
+   MoE 的是"第 slot 个被激活专家的权重矩阵的 N 列"，基址来自**设备侧**解析的 `expert_ids`；
+   bar 语义也不同（`bar_silu` 在 dense 是 per-split，在 MoE 是 per-slot）。
+   把这三者塞进一个抽象，得到的是一个**参数比实现还长**的抽象。
+2. **MoE 真正缺的不是抽象，是它自己的 builder。** `build_moe_layer_waves` 无论如何都要新写。
+3. 换言之：S3 的收益（少两套重复代码）小于它的风险（改到**所有现有调度**），
+   而它**不为 MoE 解锁任何东西**。
+
+所以 S3 被砍掉，改为：**MoE 自带 `build_moe_layer_waves`，允许与 dense 的复制**
+（复制的是 ~40 行打包循环，不是逻辑）。作为替代保障，
+`tests/test_schedule_fingerprint.py` 用 32 个配置的 SHA-256 把现有指令流钉死——
+它本来是给 S3 当验收门的，现在改成防**未来任何改动**意外改字节。
 
 ### 从 cohere **借鉴设计**（不移植代码）
 
