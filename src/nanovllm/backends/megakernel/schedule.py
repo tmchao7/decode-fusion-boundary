@@ -38,15 +38,136 @@ class TgOp:
     LM_HEAD = 8
     LM_ARGMAX = 9
 
+    # -- sparse-model opcodes (docs/22 §3). Values 10-13 are reserved here so the
+    # -- field budget below is measured against the real layout rather than a plan.
+    # -- Unimplemented until stage A1; nothing emits them yet.
+    ROUTER = 10
+    EXPERT_GATEUP = 11
+    EXPERT_DOWN = 12
+    EXPERT_COMBINE = 13
+
+
+#: Instruction words each opcode occupies, and what they mean.
+#:
+#: The 16-word width is a hard ABI limit (``TgInstruction.data[]``) and
+#: ``test_taskgraph_abi`` locks the width itself. What was *not* tracked is how much
+#: of that budget each opcode spends: a builder could quietly reach word 15, and the
+#: next field would have nowhere to go -- discoverable only by counting by hand.
+#:
+#: Note ``len(names)`` is one greater than the index of the last name, because word
+#: 0 is the opcode. Words are also genuinely shared: the kernel packs two byte-sized
+#: fields into one word (see ``wait_bar_idx`` / ``wait_target``), so the tuple lists
+#: *every field the builder writes* and ``words_used`` is the count of indices, not
+#: of names.
+#:
+#: Sparse opcodes need eight words (``ROUTER`` and the three expert ops all fit the
+#: layout below), which is what ``docs/22`` §3 predicted by hand. This table turns
+#: that prediction into something the suite checks and reports headroom for.
+OPCODE_FIELD_USAGE: dict[int, tuple[int, tuple[str, ...]]] = {
+    TgOp.NOP: (1, ("opcode",)),
+    TgOp.QKV_PROJ: (11, (
+        "opcode", "layer", "tile_n", "gemm_idx", "needs_rope", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "batch_row", "num_tiles", "range_start",
+    )),
+    TgOp.ATTN_DECODE: (10, (
+        "opcode", "layer", "batch_idx", "kv_head_idx", "split_idx", "num_splits",
+        "window_size", "wait_bar_idx", "wait_target", "produce",
+    )),
+    TgOp.ATTN_COMBINE: (8, (
+        "opcode", "layer", "batch_idx", "kv_head_idx", "num_splits", "wait_bar_idx",
+        "wait_target", "produce_bar_idx",
+    )),
+    # Generic GEMM shape, shared by O_PROJ / FFN_UPGATE_ACT / FFN_DOWN / LM_HEAD.
+    TgOp.O_PROJ: (11, (
+        "opcode", "layer", "tile_m", "tile_n", "split", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "num_tiles", "range_start",
+    )),
+    TgOp.FFN_UPGATE_ACT: (11, (
+        "opcode", "layer", "tile_m", "tile_n", "split", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "num_tiles", "range_start",
+    )),
+    TgOp.FFN_DOWN: (11, (
+        "opcode", "layer", "tile_m", "tile_n", "split", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "num_tiles", "range_start",
+    )),
+    TgOp.LM_HEAD: (11, (
+        "opcode", "layer", "tile_m", "tile_n", "split", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "num_tiles", "range_start",
+    )),
+    TgOp.ADD_RMSNORM: (9, (
+        "opcode", "layer", "batch_idx", "wait_oproj_idx", "wait_oproj_target",
+        "wait_ffn_idx", "wait_ffn_target", "produce_bar_idx", "is_final_layer",
+    )),
+    # Terminal: word 0 is the opcode, 1..5 are reserved zeros, 6/7 are the wait.
+    TgOp.LM_ARGMAX: (8, (
+        "opcode", "layer", "tile_m", "tile_n", "split", "k_tiles", "wait_bar_idx",
+        "wait_target",
+    )),
+    # --- sparse opcodes (docs/22 §3): eight words each, two spare.
+    TgOp.ROUTER: (9, (
+        "opcode", "layer", "slot", "tile_n", "num_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "range_start",
+    )),
+    TgOp.EXPERT_GATEUP: (9, (
+        "opcode", "layer", "slot", "tile_n", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "range_start",
+    )),
+    TgOp.EXPERT_DOWN: (9, (
+        "opcode", "layer", "slot", "tile_n", "k_tiles", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "range_start",
+    )),
+    TgOp.EXPERT_COMBINE: (9, (
+        "opcode", "layer", "batch_idx", "slot", "num_slots", "wait_bar_idx",
+        "wait_target", "produce_bar_idx", "range_start",
+    )),
+}
+
+#: Sparse opcodes, so the budget test can assert on them as a group.
+MOE_OPCODES: tuple[int, ...] = (
+    TgOp.ROUTER,
+    TgOp.EXPERT_GATEUP,
+    TgOp.EXPERT_DOWN,
+    TgOp.EXPERT_COMBINE,
+)
+
 
 # =============================================================================
 # Bar dimension bookkeeping. See docs/11 §4.1.
 # =============================================================================
 
 
+#: Barrier arrays the dense task graph synchronises through, in the order
+#: ``tg_abi.h``'s ``TgBars`` declares them. **The layout lives here**, not in the
+#: ABI header or the test suite: adding a sparse model's bars (``docs/22`` adds four)
+#: must be a one-line change here plus the matching struct field, and
+#: ``test_taskgraph_abi`` fails if the two ever disagree -- in either direction.
+#: A field the header declares but this tuple does not is just as much a bug as the
+#: reverse, because the kernel indexes the array it was compiled against.
+BAR_FIELDS: tuple[str, ...] = (
+    "bar_qkv",
+    "bar_attn",
+    "bar_oproj",
+    "bar_silu",
+    "bar_ffn_down",
+    "bar_layer",
+    "bar_combine",
+    "bar_lm_head",
+)
+
+#: Barrier arrays a sparse model's extra waves need (see ``docs/22`` §L2.2). Not in
+#: :data:`BAR_FIELDS` until the MoE opcodes actually land, so this tuple documents
+#: the intended extension point without claiming a header field that does not exist.
+MOE_BAR_FIELDS: tuple[str, ...] = (
+    "bar_router",
+    "bar_silu",          # re-used: per-slot activation rather than per-split
+    "bar_expert_out",
+    "bar_moe_layer",
+)
+
+
 @dataclass(frozen=True)
 class TgBarDims:
-    """Lengths of the 7 dense-model bar arrays.
+    """Lengths of the dense-model bar arrays (see :data:`BAR_FIELDS`).
 
     Each bar is a device ``uint32`` array zeroed per step. The index formulas
     in :class:`TgBarIndex` map a (layer, batch, kv_head, split) onto a slot in

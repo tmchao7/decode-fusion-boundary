@@ -26,6 +26,7 @@ if str(REPO_ROOT / "src") not in __import__("sys").path:
 
 from nanovllm.backends.megakernel import schedule as tg  # noqa: E402
 from nanovllm.backends.megakernel import verifier as V  # noqa: E402
+from nanovllm.model_spec import QWEN3_06B  # noqa: E402
 
 MEGAKERNEL = REPO_ROOT / "src" / "nanovllm" / "backends" / "megakernel"
 TG_ABI_H = MEGAKERNEL / "csrc" / "tg_abi.h"
@@ -82,8 +83,15 @@ class AbiSyncTests(unittest.TestCase):
                 f"schedule={getattr(tg.TgOp, name)}",
             )
 
-    def test_layer_weight_count_is_eleven(self) -> None:
-        """LDGLayerWeights has 11 fields; the enum must count them."""
+    def test_layer_weight_count_matches_the_spec(self) -> None:
+        """The enum's members must equal what the model spec derives.
+
+        The count is *derived* from the spec (4 attention projections + layer norms
+        + the per-head QK norms + 3 FFN matrices = 11 for Qwen3-0.6B), not typed as a
+        literal here. A sparse model needs a second level of indirection for the
+        expert dimension, and this is the field that has to change for it -- so the
+        test must fail when the spec moves, not when someone forgets to edit a `11`.
+        """
         header = read(TG_ABI_H)
         # The enum uses ``TG_LW_COUNT,  // 11`` (no explicit ``=``), so we
         # match the trailing comment. Alternatively an explicit
@@ -91,8 +99,48 @@ class AbiSyncTests(unittest.TestCase):
         m = re.search(r"TG_LW_COUNT\s*(?:=\s*(\d+)|,\s*//\s*(\d+))", header)
         self.assertIsNotNone(m)
         assert m is not None
-        count = int(m.group(1) or m.group(2))
-        self.assertEqual(count, 11)
+        documented = int(m.group(1) or m.group(2))
+
+        # Count the enum members rather than trusting the trailing comment.
+        block = header.split("enum TgLayerWeightIdx")[1].split("};")[0]
+        members = [
+            line.strip().rstrip(",")
+            for line in block.splitlines()
+            if line.strip().startswith("TG_LW_") and "COUNT" not in line
+        ]
+        expected = QWEN3_06B.weight_pointer_count
+        self.assertEqual(len(members), expected)
+        self.assertEqual(documented, expected)
+
+    def test_every_declared_weight_pointer_has_a_packer_slot(self) -> None:
+        """The enum order and ``weights.blob`` order must be the same list."""
+
+        header = read(TG_ABI_H)
+        block = header.split("enum TgLayerWeightIdx")[1].split("};")[0]
+        members = [
+            line.strip().rstrip(",")
+            for line in block.splitlines()
+            if line.strip().startswith("TG_LW_") and "COUNT" not in line
+        ]
+        self.assertEqual(len(members), QWEN3_06B.weight_pointer_count)
+        # weights.py packs layer_weights[11*j] positionally, so a reordered enum with
+        # an unchanged length is exactly the kind of drift a length check misses.
+        source = (MEGAKERNEL / "weights.py").read_text(encoding="utf-8")
+        for expected in (
+            "input_layernorm",
+            "q_weight",
+            "k_weight",
+            "v_weight",
+            "q_norm",
+            "k_norm",
+            "o_proj",
+            "post_attention_layernorm",
+            "gate_weight",
+            "up_weight",
+            "down_proj",
+        ):
+            with self.subTest(weight=expected):
+                self.assertIn(expected, source)
         # Cross-check against the task-graph weight ABI struct field count.
         kernel = read(TG_KERNEL_CU)
         # The struct has 11 const __nv_bfloat16* fields (one per weight).
@@ -135,12 +183,33 @@ class AbiSyncTests(unittest.TestCase):
                     "will silently write to the wrong offset.",
                 )
 
-    def test_bars_struct_has_eight_arrays(self) -> None:
+    def test_bars_struct_matches_the_declared_layout(self) -> None:
+        """The header's ``TgBars`` and ``tg.BAR_FIELDS`` are one list.
+
+        Checked in **both** directions. A field the header declares but the schedule
+        does not track is as much a bug as the reverse: the kernel indexes the array
+        it was compiled against, so an untracked bar is one the host never sizes or
+        zeroes. Hard-coding "eight" here would have to be edited by hand the moment
+        ``docs/22`` adds the MoE bars, which is precisely the drift to avoid.
+        """
         header = read(TG_ABI_H)
-        for bar in ("bar_qkv", "bar_attn", "bar_oproj", "bar_silu",
-                    "bar_ffn_down", "bar_layer", "bar_combine", "bar_lm_head"):
+        declared = [
+            line.strip().split()[1].rstrip(";")
+            for line in header.split("struct TgBars {")[1].split("};")[0].splitlines()
+            if line.strip().startswith("uint64_t bar_")
+        ]
+        self.assertEqual(declared, list(tg.BAR_FIELDS))
+        self.assertEqual(len(tg.BAR_FIELDS), QWEN3_06B.num_bar_arrays)
+
+    def test_moe_bars_are_declared_as_an_extension_not_a_claim(self) -> None:
+        """``docs/22``'s four MoE bars must not be in the header until they exist."""
+
+        header = read(TG_ABI_H)
+        for bar in tg.MOE_BAR_FIELDS:
+            if bar in tg.BAR_FIELDS:
+                continue
             with self.subTest(bar=bar):
-                self.assertIn(f"uint64_t {bar};", header)
+                self.assertNotIn(f"uint64_t {bar};", header)
 
 
 # =============================================================================
@@ -1181,6 +1250,109 @@ class MultiBatchGeometryTests(unittest.TestCase):
         sched = tg.build_schedule(tg.default_geometry(BS=8, attn_splits=1), 108)
         self.assertGreater(sched.total_instructions, 0)
         self.assertEqual(len(sched.num_inst_per_sm), 108)
+
+
+class InstructionFieldBudgetTests(unittest.TestCase):
+    """The 16-word width is a hard limit; how much each opcode spends was untracked.
+
+    ``test_all_instructions_are_width_sixteen`` locks the *width*. Nothing locked the
+    *budget*: a builder could reach word 15 and the next field would have nowhere to
+    go, discoverable only by hand-counting. ``docs/22`` predicts the four sparse
+    opcodes fit in this encoding; this is where that prediction is checked instead of
+    assumed.
+    """
+
+    def test_every_opcode_has_a_declared_word_count(self) -> None:
+        declared = set(tg.OPCODE_FIELD_USAGE)
+        implemented = {
+            value
+            for name, value in vars(tg.TgOp).items()
+            if not name.startswith("_") and isinstance(value, int)
+        }
+        self.assertEqual(declared, implemented)
+
+    def test_no_opcode_overflows_the_instruction_width(self) -> None:
+        for opcode, (words, names) in sorted(tg.OPCODE_FIELD_USAGE.items()):
+            with self.subTest(opcode=opcode):
+                self.assertGreaterEqual(words, 1)
+                self.assertLessEqual(
+                    words,
+                    tg.TG_INST_WIDTH,
+                    f"opcode {opcode} needs {words} words but the instruction is "
+                    f"{tg.TG_INST_WIDTH} wide",
+                )
+                self.assertEqual(words, len(names))
+
+    def test_the_sparse_opcodes_fit_with_headroom(self) -> None:
+        """The claim ``docs/22`` §3 makes by hand, checked against the real layout."""
+
+        for opcode in tg.MOE_OPCODES:
+            with self.subTest(opcode=opcode):
+                words, _ = tg.OPCODE_FIELD_USAGE[opcode]
+                self.assertLess(words, tg.TG_INST_WIDTH)
+                spare = tg.TG_INST_WIDTH - words
+                # At least one word of headroom, so a field can still be added
+                # without re-encoding the instruction.
+                self.assertGreaterEqual(
+                    spare, 1, f"opcode {opcode} has no room for another field"
+                )
+        self.assertEqual(len(tg.MOE_OPCODES), 4)
+
+    def test_the_sparse_opcodes_do_not_disturb_the_dense_numbers(self) -> None:
+        """Adding reserved opcode values must not renumber anything existing."""
+
+        self.assertEqual(tg.TgOp.LM_ARGMAX, 9)
+        self.assertEqual(min(tg.MOE_OPCODES), 10)
+        self.assertEqual(
+            sorted(tg.MOE_OPCODES), [tg.TgOp.ROUTER, tg.TgOp.EXPERT_GATEUP,
+                                     tg.TgOp.EXPERT_DOWN, tg.TgOp.EXPERT_COMBINE]
+        )
+
+    def test_the_sparse_opcodes_are_declared_but_not_yet_emitted(self) -> None:
+        """Reserved values without builders: the field budget is fixed before stage A1.
+
+        A builder appearing before the kernel has an op body would emit instructions
+        the dispatch switch does not handle, which the verifier would happily accept
+        (it models dependencies, not opcode coverage).
+        """
+
+        for opcode in tg.MOE_OPCODES:
+            with self.subTest(opcode=opcode):
+                self.assertFalse(
+                    any(
+                        name.startswith("make_")
+                        and getattr(tg, name, None) is not None
+                        and _emits(tg, name, opcode)
+                        for name in dir(tg)
+                    ),
+                    f"a builder already emits opcode {opcode}",
+                )
+
+
+def _emits(module, builder_name: str, opcode: int) -> bool:
+    """Whether invoking ``builder_name`` with permissive args yields ``opcode``."""
+
+    import inspect
+
+    builder = getattr(module, builder_name)
+    if not callable(builder):
+        return False
+    try:
+        signature = inspect.signature(builder)
+    except (TypeError, ValueError):
+        return False
+    args = []
+    for parameter in signature.parameters.values():
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            continue
+        if parameter.default is not parameter.empty:
+            continue
+        args.append(0)
+    try:
+        inst = builder(*args)
+    except Exception:  # noqa: BLE001 - a builder that needs real args cannot emit
+        return False
+    return bool(inst) and len(inst) == tg.TG_INST_WIDTH and inst[0] == opcode
 
 
 if __name__ == "__main__":
