@@ -1,6 +1,6 @@
 # 文档索引
 
-> **本页是 `docs/` 的唯一入口。** 22 份文档按三种状态分类，读之前先确认状态：
+> **本页是 `docs/` 的唯一入口。** 23 份文档按三种状态分类，读之前先确认状态：
 >
 > - **现行**：随代码更新，可以作为操作与结论依据；
 > - **历史证据**：归档 `kernel.cu` 线的实测记录，只用于追溯结论来源，**不得当作当前主线的测量**；
@@ -43,6 +43,7 @@
 | [18 成本模型](18_成本模型.md) | 现行 | 结构式解码步成本模型 + 预注册的粒度预测（纯 CPU） |
 | [19 上机清单](19_上机清单.md) | 现行 | 离线已做完 vs 必须上机；执行顺序、决策门、回传文件 |
 | [20 方向重构](20_方向重构_从dense到MoE融合kernel.md) | 现行 | **方向决议**：dense device 侧无空间 → MoE + 低比特；含预注册假设与反证信号 |
+| [21 RTX 5090 复现：融合粒度](21_5090复现_融合粒度实验.md) | 现行 | `docs/20` §9 第 1 步：5090 上的口径、预注册假设、命令序列；**上机结果待填** |
 | [99 变更历史](99_变更历史.md) | 历史 | 各文档抽出的版本变更日志 |
 | [taskgraph_progress](taskgraph_progress.md) | **历史快照** | 2026-09-23 的优化进展报告 |
 
@@ -62,7 +63,8 @@ RUN_MODE=taskgraph-fusion  bash SERVER_COMMANDS.txt   # 融合粒度扫描
 ## 3b. 开发机（CPU）命令
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests          # 全套 CPU 测试
+python -m pip install numpy xxhash                             # 缺 xxhash 时 4 个 scheduler 模块 import 失败
+PYTHONPATH=src python -m unittest discover -s tests          # 全套 CPU 测试（499 项，11 项需 torch 自动 skip）
 python -m tools.verify_schedule --json results/schedule_verification.json  # 调度验证器
 python -m tools.bench_fusion_granularity --help              # 粒度扫描计划（不需要 GPU）
 ```
