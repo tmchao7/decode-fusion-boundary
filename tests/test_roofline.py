@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nanovllm.roofline import (  # noqa: E402
+    DEFAULT_BANDWIDTH_JSON,
     A100_SXM4_80GB,
     DEFAULT_KERNEL_SOURCE,
     RTX_5090,
@@ -19,7 +20,11 @@ from nanovllm.roofline import (  # noqa: E402
     account_step,
     assert_kernel_constants,
     gap_table,
+    hardware_from_bandwidth_json,
+    load_measured_bandwidth,
+    measured_hardware_spec,
     parse_kernel_constants,
+    read_bandwidth_probe,
     render_markdown,
     step_accounting_from_metrics,
 )
@@ -300,6 +305,8 @@ class CliTests(unittest.TestCase):
     def test_cli_emits_json_and_checks_kernel(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "roofline.json"
+            # An explicit measured rate: the CLI default is now the probe
+            # artifact (results/bandwidth.json), which a checkout does not carry.
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -309,6 +316,8 @@ class CliTests(unittest.TestCase):
                     "1,8",
                     "--seq-len",
                     "224",
+                    "--bandwidth-gbps",
+                    "1699",
                     "--check-kernel",
                     "--json",
                     str(out),
@@ -327,6 +336,8 @@ class CliTests(unittest.TestCase):
             )
             self.assertAlmostEqual(payload["weight_bytes"] / 1e9, 1.192, places=3)
             self.assertEqual([row["batch_size"] for row in payload["rows"]], [1, 8])
+            self.assertEqual(payload["bandwidth_source"]["kind"], "explicit_cli")
+            self.assertEqual(payload["hardware"]["name"], "explicit --bandwidth-gbps")
 
     def test_cli_rejects_malformed_wall_pairs(self) -> None:
         proc = subprocess.run(
@@ -373,3 +384,162 @@ class HardwareSpecPresetTests(unittest.TestCase):
         self.assertAlmostEqual(
             step_bytes / A100_SXM4_80GB.bandwidth_gbps / 1e6, 0.585, places=3
         )
+
+
+class MeasuredBandwidthTests(unittest.TestCase):
+    """The roofline denominator is a measurement, never a spec number.
+
+    ``docs/20`` §8 pins the 5090 number at 1559.2 GB/s (measured) against 1792
+    GB/s (spec). These tests lock the loader to the probe artifact's real schema
+    (``achieved_gbps.mean``) and lock it against silently guessing.
+    """
+
+    def _write(self, payload) -> Path:
+        tmpdir = Path(tempfile.mkdtemp())
+        path = tmpdir / "bandwidth.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _probe_payload(self, mean: float = 1559.2) -> dict:
+        return {
+            "requested_bytes": 1_200_000_000,
+            "measured_bytes": 1_200_000_000,
+            "iterations": 20,
+            "warmup": 5,
+            "device": "NVIDIA GeForce RTX 5090",
+            "sm_count": 170,
+            "spec_gbps": 1792.0,
+            "achieved_gbps": {
+                "count": 20,
+                "mean": mean,
+                "stddev": 10.6,
+                "cov": 0.0068,
+                "min": 1540.0,
+                "max": 1575.0,
+            },
+            "achieved_fraction_of_spec": mean / 1792.0,
+        }
+
+    def test_reads_the_probe_artifacts_mean(self) -> None:
+        path = self._write(self._probe_payload())
+        self.assertAlmostEqual(load_measured_bandwidth(path), 1559.2, places=1)
+
+    def test_builds_a_spec_whose_bandwidth_is_the_measurement(self) -> None:
+        hw = hardware_from_bandwidth_json(self._write(self._probe_payload()))
+        self.assertAlmostEqual(hw.bandwidth_gbps, 1559.2, places=1)
+        self.assertIn("RTX 5090", hw.name)
+        self.assertIn("measured", hw.name)
+
+    def test_the_measured_denominator_is_not_the_spec_value(self) -> None:
+        """1792 GB/s is the spec; using it understates the floor by ~13%."""
+
+        hw = hardware_from_bandwidth_json(self._write(self._probe_payload()))
+        model = RooflineModel(ModelDims(), hw, tied_embedding=True)
+        measured_floor_ms = model.core_weight_bytes() / hw.bandwidth_gbps / 1e6
+        spec_floor_ms = model.core_weight_bytes() / RTX_5090.bandwidth_gbps / 1e6
+        self.assertGreater(measured_floor_ms, spec_floor_ms)
+        self.assertAlmostEqual(measured_floor_ms / spec_floor_ms, 1792.0 / 1559.2, places=4)
+
+    def test_probe_spec_gbps_never_reaches_the_hardware_spec(self) -> None:
+        hw = hardware_from_bandwidth_json(self._write(self._probe_payload()))
+        self.assertNotEqual(hw.bandwidth_gbps, 1792.0)
+        self.assertNotEqual(hw.effective_bandwidth_gbps(), 1792.0)
+
+    def test_missing_artifact_names_the_command_that_creates_it(self) -> None:
+        missing = Path(tempfile.mkdtemp()) / "nope.json"
+        with self.assertRaises(FileNotFoundError) as caught:
+            load_measured_bandwidth(missing)
+        self.assertIn("RUN_MODE=bandwidth", str(caught.exception))
+
+    def test_a_spec_only_artifact_is_rejected(self) -> None:
+        """A device spec without a measurement must not become a denominator."""
+
+        path = self._write({"device": "RTX 5090", "spec_gbps": 1792.0})
+        with self.assertRaises(ValueError) as caught:
+            load_measured_bandwidth(path)
+        self.assertIn("achieved_gbps", str(caught.exception))
+
+    def test_null_mean_is_rejected_instead_of_read_as_zero(self) -> None:
+        payload = self._probe_payload()
+        payload["achieved_gbps"]["mean"] = None
+        with self.assertRaises(ValueError):
+            load_measured_bandwidth(self._write(payload))
+
+    def test_non_positive_mean_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            load_measured_bandwidth(self._write(self._probe_payload(mean=0.0)))
+
+    def test_measured_hardware_spec_refuses_a_nonsense_rate(self) -> None:
+        for bad in (0.0, -1.0, float("inf"), float("nan")):
+            with self.subTest(bandwidth=bad):
+                with self.assertRaises(ValueError):
+                    measured_hardware_spec(bad)
+
+    def test_cli_defaults_to_the_probe_artifact(self) -> None:
+        """No --bandwidth-gbps and no artifact must fail, not fall back to spec."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "nanovllm.roofline",
+                    "--batch-sizes",
+                    "1",
+                    "--bandwidth-json",
+                    str(Path(tmpdir) / "absent.json"),
+                ],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("RUN_MODE=bandwidth", proc.stderr)
+
+    def test_cli_records_where_the_denominator_came_from(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bandwidth.json"
+            path.write_text(json.dumps(self._probe_payload()), encoding="utf-8")
+            out = Path(tmpdir) / "roofline.json"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "nanovllm.roofline",
+                    "--batch-sizes",
+                    "1",
+                    "--bandwidth-json",
+                    str(path),
+                    "--json",
+                    str(out),
+                ],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(payload["bandwidth_source"]["kind"], "measured_probe")
+            self.assertEqual(payload["bandwidth_source"]["path"], str(path))
+            self.assertAlmostEqual(payload["hardware"]["bandwidth_gbps"], 1559.2, places=1)
+
+    def test_cli_rejects_both_denominator_inputs_at_once(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "nanovllm.roofline",
+                "--bandwidth-gbps",
+                "1559.2",
+                "--bandwidth-json",
+                "results/bandwidth.json",
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            env={"PYTHONPATH": "src", "PATH": "/usr/bin:/bin"},
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("mutually exclusive", proc.stderr)

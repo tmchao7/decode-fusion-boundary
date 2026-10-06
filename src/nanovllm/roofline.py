@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 BYTES_PER_PARAM_BF16 = 2
 
@@ -128,15 +130,153 @@ class HardwareSpec:
 
 
 #: Named presets. Every ``bandwidth_gbps`` here is the **spec**, not what the
-#: device reaches: the A100 gap is 2039 spec vs 1699 measured (83%), so pass a
-#: measured value (``tools/bench_memory_bandwidth.py``) whenever one exists --
-#: the same must be done on a rented 5090 rather than inheriting the A100 number.
+#: device reaches: the A100 gap is 2039 spec vs 1699 measured (83%), and the RTX
+#: 5090 gap is 1792 spec vs 1559.2 measured (87%, docs/21). Every roofline in this
+#: project must use a measured value -- run ``RUN_MODE=bandwidth`` and pass
+#: ``--bandwidth-json results/bandwidth.json`` (or call
+#: :func:`hardware_from_bandwidth_json`). The spec presets exist for provenance
+#: and for the CPU test suite, never as a headroom denominator.
 A100_SXM4_80GB = HardwareSpec()
 RTX_5090 = HardwareSpec(
     name="RTX 5090",
-    bandwidth_gbps=1792.0,  # 32 GB GDDR7, 512-bit at 28 Gbps
+    bandwidth_gbps=1792.0,  # 32 GB GDDR7, 512-bit at 28 Gbps  -- SPEC, see below
     peak_tflops=209.5,      # vendor dense BF16 tensor TFLOPs
 )
+
+#: Default location of the measured-bandwidth artifact written by
+#: ``RUN_MODE=bandwidth`` (``tools/bench_memory_bandwidth.py --json``). Keeping
+#: the filename in one place is what stops a report from quietly falling back to
+#: a spec number.
+DEFAULT_BANDWIDTH_JSON = Path("results") / "bandwidth.json"
+
+#: The only key ``load_measured_bandwidth`` reads. The artifact nests the
+#: distribution under ``achieved_gbps`` (mean/stddev/cov/CI), because the probe
+#: reports dispersion rather than a single number.
+BANDWIDTH_SUMMARY_KEY = "achieved_gbps"
+
+
+def read_bandwidth_probe(path: str | Path = DEFAULT_BANDWIDTH_JSON) -> dict[str, Any]:
+    """Load and validate one probe artifact; single source of truth for the keys.
+
+    Returns ``{"measured_gbps", "mean", "cov", "count", "spec_gbps", "device"}``
+    so callers never have to re-open (and possibly re-interpret) the file.
+    """
+
+    resolved = Path(path)
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{resolved}: no measured bandwidth artifact. Run "
+            f"`RUN_MODE=bandwidth bash SERVER_COMMANDS.txt` on this machine first "
+            f"-- the roofline must not inherit another device's number."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{resolved}: not valid JSON ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"{resolved}: expected a JSON object, got {type(payload).__name__}"
+        )
+    summary = payload.get(BANDWIDTH_SUMMARY_KEY)
+    if not isinstance(summary, dict):
+        raise ValueError(
+            f"{resolved}: missing the {BANDWIDTH_SUMMARY_KEY!r} summary object; "
+            f"got keys {sorted(payload)}"
+        )
+    if "mean" not in summary:
+        raise ValueError(
+            f"{resolved}: {BANDWIDTH_SUMMARY_KEY} has no 'mean'; "
+            f"got keys {sorted(summary)}"
+        )
+    value = summary["mean"]
+    if value is None:
+        raise ValueError(
+            f"{resolved}: {BANDWIDTH_SUMMARY_KEY}.mean is null -- the probe "
+            f"collected no usable samples"
+        )
+    return {
+        "path": str(resolved),
+        "measured_gbps": value,
+        "mean": summary["mean"],
+        "stddev": summary.get("stddev"),
+        "cov": summary.get("cov"),
+        "count": summary.get("count"),
+        "spec_gbps": payload.get("spec_gbps"),
+        "device": payload.get("device"),
+        "sm_count": payload.get("sm_count"),
+    }
+
+
+def load_measured_bandwidth(path: str | Path = DEFAULT_BANDWIDTH_JSON) -> float:
+    """Read the measured mean read bandwidth (GB/s) from a bandwidth artifact.
+
+    The roofline denominator must be **measured on the machine that produced the
+    measurement** and must never be invented: on the A100 the spec-vs-achievable
+    gap is 2039 vs 1699 GB/s (~17%), and the RTX 5090 has its own gap (1792 spec
+    vs 1559.2 measured, see ``docs/21``). A missing file, a missing key, or a
+    non-positive value raises -- there is no fallback to a spec value, because
+    that would silently turn every headroom number into the wrong one.
+    """
+
+    measured = read_bandwidth_probe(path)["measured_gbps"]
+    value = float(measured)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{path}: nonsensical measured bandwidth {measured!r} GB/s")
+    return value
+
+
+def measured_hardware_spec(
+    bandwidth_gbps: float,
+    *,
+    name: str = "measured device",
+    spec_gbps: float | None = None,
+    peak_tflops: float | None = None,
+) -> HardwareSpec:
+    """A :class:`HardwareSpec` whose bandwidth is a **measurement**, not a spec.
+
+    ``spec_gbps`` is carried for provenance only (reports can quote the
+    spec-vs-measured gap); it never enters the roofline arithmetic.
+    """
+
+    bandwidth = float(bandwidth_gbps)
+    if not math.isfinite(bandwidth) or bandwidth <= 0:
+        raise ValueError(f"measured bandwidth must be positive; got {bandwidth_gbps!r}")
+    del spec_gbps  # provenance only; the roofline never reads a spec number
+    return HardwareSpec(
+        name=str(name),
+        bandwidth_gbps=bandwidth,
+        peak_tflops=float(RTX_5090.peak_tflops if peak_tflops is None else peak_tflops),
+    )
+
+
+def hardware_from_bandwidth_json(
+    path: str | Path = DEFAULT_BANDWIDTH_JSON,
+    *,
+    name: str | None = None,
+    peak_tflops: float | None = None,
+) -> HardwareSpec:
+    """Build a :class:`HardwareSpec` from a probe artifact, keeping provenance.
+
+    ``name`` defaults to the artifact's own ``device`` field and falls back to
+    ``"<path> (measured)"``, so a report can always say where the denominator
+    came from.
+    """
+
+    probe = read_bandwidth_probe(path)
+    label = name
+    if label is None:
+        label = (
+            f"{probe['device']} (measured)"
+            if probe.get("device")
+            else f"{probe['path']} (measured)"
+        )
+    return measured_hardware_spec(
+        probe["measured_gbps"],
+        name=label,
+        spec_gbps=probe.get("spec_gbps"),
+        peak_tflops=peak_tflops,
+    )
 
 
 def parse_kernel_constants(source: str | Path = DEFAULT_KERNEL_SOURCE) -> dict[str, int]:
@@ -618,7 +758,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--batch-sizes", type=_parse_int_list, default=[1, 8, 32])
     parser.add_argument("--seq-len", type=int, default=224)
-    parser.add_argument("--bandwidth-gbps", type=float, default=None)
+    parser.add_argument(
+        "--bandwidth-json",
+        default=None,
+        help=(
+            "measured-bandwidth artifact from `RUN_MODE=bandwidth` "
+            "(default results/bandwidth.json). This is the roofline denominator "
+            "and must come from the machine that produced the measurement."
+        ),
+    )
+    parser.add_argument(
+        "--bandwidth-gbps",
+        type=float,
+        default=None,
+        help="explicit measured GB/s override; mutually exclusive with --bandwidth-json",
+    )
     parser.add_argument("--peak-tflops", type=float, default=None)
     parser.add_argument(
         "--tied-embedding",
@@ -660,10 +814,41 @@ def main(argv: list[str] | None = None) -> int:
 
     dims = ModelDims()
     assert_kernel_constants(dims, args.kernel_source)
-    hw = HardwareSpec(
-        bandwidth_gbps=args.bandwidth_gbps or HardwareSpec().bandwidth_gbps,
-        peak_tflops=args.peak_tflops or HardwareSpec().peak_tflops,
-    )
+    peak_tflops = args.peak_tflops or HardwareSpec().peak_tflops
+    if args.bandwidth_gbps is not None and args.bandwidth_json is not None:
+        parser.error("--bandwidth-gbps and --bandwidth-json are mutually exclusive")
+    if args.bandwidth_gbps is not None:
+        hw = HardwareSpec(
+            name="explicit --bandwidth-gbps",
+            bandwidth_gbps=float(args.bandwidth_gbps),
+            peak_tflops=peak_tflops,
+        )
+        bandwidth_source: dict[str, object] = {
+            "kind": "explicit_cli",
+            "path": None,
+            "spec_gbps": None,
+        }
+    else:
+        # Default to the probe artifact: a spec number is only reachable when the
+        # caller passes one explicitly.
+        bandwidth_path = Path(args.bandwidth_json or DEFAULT_BANDWIDTH_JSON)
+        probe = read_bandwidth_probe(bandwidth_path)
+        hw = measured_hardware_spec(
+            probe["measured_gbps"],
+            name=(
+                f"{probe['device']} (measured)"
+                if probe.get("device")
+                else f"{bandwidth_path} (measured)"
+            ),
+            peak_tflops=peak_tflops,
+        )
+        bandwidth_source = {
+            "kind": "measured_probe",
+            "path": probe["path"],
+            "spec_gbps": probe.get("spec_gbps"),
+            "cov": probe.get("cov"),
+            "count": probe.get("count"),
+        }
     model = RooflineModel(
         dims,
         hw,
@@ -690,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "hardware": asdict(hw),
+                    "bandwidth_source": bandwidth_source,
                     "dims": asdict(dims),
                     "weight_bytes": model.weight_bytes(),
                     "rows": rows,
