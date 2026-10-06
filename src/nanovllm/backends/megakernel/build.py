@@ -68,6 +68,8 @@ def cuda_flags() -> list[str]:
         flags.append("--use_fast_math")
     if os.getenv("NANOVLLM_CUDA_SANITIZE") == "1":
         flags.append("-lineinfo")
+    if os.getenv("NANOVLLM_DEBUG_BOUNDS") == "1":
+        flags.append("-DTG_DEBUG_BOUNDS=1")
     return flags + taskgraph_kernel_flags()
 
 

@@ -20,13 +20,23 @@ class CorrectnessSmokeProcessTests(unittest.TestCase):
     def test_serializes_only_json_safe_backend_result(self):
         result = {
             "outputs": [{"token_ids": [1, 2, 3]}],
-            "metrics": {"summary": {"backend_actuals": ["megakernel"]}},
+            "metrics": {
+                "summary": {
+                    "backend_actuals": ["megakernel"],
+                    "megakernel_attn_splits": 2,
+                }
+            },
         }
         self.assertEqual(
             serialize_backend_result(result),
             {
                 "outputs": [[1, 2, 3]],
-                "metrics": {"summary": {"backend_actuals": ["megakernel"]}},
+                "metrics": {
+                "summary": {
+                    "backend_actuals": ["megakernel"],
+                    "megakernel_attn_splits": 2,
+                }
+            },
             },
         )
 
@@ -92,6 +102,68 @@ class ClassifyComparisonTests(unittest.TestCase):
         self.assertEqual(status, "FAIL")
 
 
+class BackendErrorClassificationTests(unittest.TestCase):
+    def test_cuda_fault_is_device_error_not_cascade(self):
+        from tools.correctness_smoke import classify_backend_error
+
+        kind = classify_backend_error(
+            "RuntimeError: CUDA error: an illegal memory access was encountered"
+        )
+        self.assertEqual(kind, "DEVICE_ERROR")
+
+    def test_normal_backend_exception_is_runtime_error(self):
+        from tools.correctness_smoke import classify_backend_error
+
+        self.assertEqual(
+            classify_backend_error("ValueError: tokenizer failed"), "RUNTIME_ERROR"
+        )
+
+    def test_serialized_result_records_effective_split(self):
+        from tools.correctness_smoke import serialize_backend_result
+
+        result = {
+            "outputs": [{"token_ids": [1, 2]}],
+            "metrics": {
+                "summary": {
+                    "backend_actuals": ["megakernel"],
+                    "megakernel_attn_splits": 2,
+                }
+            },
+        }
+        serialized = serialize_backend_result(result, backend="megakernel", requested_attn_splits=2)
+        self.assertEqual(serialized["requested_attn_splits"], 2)
+        self.assertEqual(serialized["effective_attn_splits"], 2)
+        self.assertTrue(serialized["effective_attn_splits_confirmed"])
+
+    def test_fallback_backend_reports_effective_split_one(self):
+        from tools.correctness_smoke import serialize_backend_result
+
+        result = {
+            "outputs": [],
+            "metrics": {"summary": {"backend_actuals": ["torch"]}},
+        }
+        serialized = serialize_backend_result(
+            result, backend="megakernel", requested_attn_splits=2
+        )
+        self.assertEqual(serialized["effective_attn_splits"], 1)
+
+    def test_device_error_path_preserves_artifact_before_final_failure(self):
+        from tools import correctness_smoke
+        import inspect
+
+        source = inspect.getsource(correctness_smoke.main)
+        self.assertIn("let the final non-zero exit report", source)
+        self.assertIn('"backend_errors": backend_errors', source)
+        self.assertIn("if had_backend_error", source)
+
+    def test_torch_backend_effective_split_is_one(self):
+        from tools.correctness_smoke import serialize_backend_result
+
+        result = {"outputs": [], "metrics": {"summary": {}}}
+        serialized = serialize_backend_result(result, backend="torch-eager", requested_attn_splits=1)
+        self.assertEqual(serialized["effective_attn_splits"], 1)
+
+
 class BackendConfigTests(unittest.TestCase):
     """``--attn-splits`` must reach the engine, and only where it means something."""
 
@@ -100,6 +172,13 @@ class BackendConfigTests(unittest.TestCase):
             backend_config("megakernel"),
             {"decode_backend": "megakernel", "enforce_eager": False},
         )
+
+    def test_debug_bounds_env_reaches_the_megakernel(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"NANOVLLM_DEBUG_BOUNDS": "1"}):
+            self.assertTrue(backend_config("megakernel")["megakernel_debug_bounds"])
 
     def test_attn_splits_reaches_the_megakernel(self) -> None:
         config = backend_config("megakernel", 2)

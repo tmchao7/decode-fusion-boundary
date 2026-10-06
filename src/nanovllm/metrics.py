@@ -233,8 +233,9 @@ def _safe_rate(tokens: int, seconds: float | None) -> float | None:
 class MetricsCollector:
     """Mutable recorder used by ``LLMEngine.generate_with_metrics``."""
 
-    def __init__(self, backend_requested: str):
+    def __init__(self, backend_requested: str, megakernel_attn_splits: int = 1):
         self.backend_requested = backend_requested
+        self.megakernel_attn_splits = int(megakernel_attn_splits)
         self.requests: dict[int, RequestMetrics] = {}
         self.time_origin: float | None = None
         self.step_count = 0
@@ -354,6 +355,9 @@ class MetricsCollector:
                 "decode_time_ms_total": self.decode_time * 1000.0,
                 "cuda_prefill_time_ms_total": self.cuda_prefill_time * 1000.0,
                 "cuda_decode_time_ms_total": self.cuda_decode_time * 1000.0,
+                "megakernel_attn_splits": self.megakernel_attn_splits
+                if self.backend_requested == "megakernel"
+                else 1,
             }
         )
         if scheduler_stats is not None:

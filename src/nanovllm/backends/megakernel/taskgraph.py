@@ -155,6 +155,7 @@ class TaskGraphDecoder:
         attn_splits: int = 1,
         fusion_groups: int = 1,
         verbose: bool = False,
+        debug_bounds: bool = False,
     ):
         import torch
 
@@ -199,6 +200,7 @@ class TaskGraphDecoder:
         self._fusion_groups = int(fusion_groups)
         self._segments = tg_schedule.split_layers(NUM_LAYERS, self._fusion_groups)
         self._verbose = verbose
+        self._debug_bounds = bool(debug_bounds)
 
         self._num_sms = resolve_num_sms(
             torch.cuda.get_device_properties(0).multi_processor_count
@@ -411,6 +413,8 @@ class TaskGraphDecoder:
         # only cross-segment dependency is the bar_layer handoff that the launch
         # boundary itself satisfies (see schedule.build_schedule).
         for geo in geometries:
+            if self._debug_bounds:
+                self._audit_geometry(geo)
             self._ops.tg_decode_step(
                 geo.inst_buf, geo.num_inst_per_sm, geo.schedule.max_inst,
                 self._num_sms,
@@ -435,6 +439,25 @@ class TaskGraphDecoder:
         # One sync for the whole batch. ``.item()`` per row would serialize a
         # D2H per row; the sampled ids are contiguous in the int32 alias.
         return self._lm_logits_i32[:rows, 0].cpu().tolist()
+
+    def _audit_geometry(self, geometry: _Geometry) -> None:
+        """Run the CPU ownership audit immediately before a debug launch."""
+
+        from nanovllm.backends.megakernel.audit import audit_schedule
+
+        report = audit_schedule(
+            geometry.schedule,
+            geometry=self._tg_schedule.default_geometry(
+                geometry.BS, attn_splits=geometry.attn_splits
+            ),
+            batch_size=geometry.BS,
+            num_sms=self._num_sms,
+            attn_splits=geometry.attn_splits,
+        )
+        if not report.ok:
+            raise RuntimeError(
+                f"taskgraph geometry audit failed before launch: {report.describe()}"
+            )
 
     def decode_row(self, token_id: int, position: int, block_table) -> int:
         """Single-row convenience wrapper (the batch=1 ModelRunner path).

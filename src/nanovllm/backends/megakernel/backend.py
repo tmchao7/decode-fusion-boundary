@@ -228,6 +228,7 @@ class MegakernelBackend:
             attn_splits=int(_get_attr(self.config, "megakernel_attn_splits", 1)),
             fusion_groups=int(_get_attr(self.config, "fusion_groups", 1)),
             verbose=bool(_get_attr(self.config, "megakernel_verbose", False)),
+            debug_bounds=bool(_get_attr(self.config, "megakernel_debug_bounds", False)),
         )
 
     def decode_batch(self, input_ids, positions, block_tables) -> list[int]:

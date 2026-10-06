@@ -567,6 +567,23 @@ class BarAllocationTests(unittest.TestCase):
                         )
 
 
+class TaskGraphDebugContractTests(unittest.TestCase):
+    def test_debug_bounds_is_explicitly_wired(self):
+        taskgraph = (
+            REPO_ROOT / "src/nanovllm/backends/megakernel/taskgraph.py"
+        ).read_text(encoding="utf-8")
+        backend = (
+            REPO_ROOT / "src/nanovllm/backends/megakernel/backend.py"
+        ).read_text(encoding="utf-8")
+        config = (REPO_ROOT / "src/nanovllm/config.py").read_text(encoding="utf-8")
+        build = (REPO_ROOT / "src/nanovllm/backends/megakernel/build.py").read_text(encoding="utf-8")
+        self.assertIn("debug_bounds: bool = False", taskgraph)
+        self.assertIn("megakernel_debug_bounds", backend)
+        self.assertIn("megakernel_debug_bounds: bool = False", config)
+        self.assertIn("NANOVLLM_DEBUG_BOUNDS", build)
+        self.assertIn("self._audit_geometry(geo)", taskgraph)
+
+
 if __name__ == "__main__":
     unittest.main()
 

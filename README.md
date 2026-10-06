@@ -153,7 +153,7 @@ fails with the production `ValueError`.
 
 A GPU machine additionally needs an NVIDIA driver, `nvcc`, and CUDA-enabled
 PyTorch. `setup_server.sh` creates the server environment from an existing
-system Python:
+system Python, preferring conda when available and supporting an explicit uv fallback:
 
 ```bash
 bash setup_server.sh

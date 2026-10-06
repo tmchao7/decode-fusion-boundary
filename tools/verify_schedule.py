@@ -33,6 +33,7 @@ for _path in (str(ROOT), str(ROOT / "src")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+from nanovllm.backends.megakernel import audit as A  # noqa: E402
 from nanovllm.backends.megakernel import schedule as tg  # noqa: E402
 from nanovllm.backends.megakernel import verifier as V  # noqa: E402
 from tools.cli import parse_int_list  # noqa: E402
@@ -93,6 +94,23 @@ def verify_matrix(
                 for groups in fusion_groups:
                     segments = build_segments(geo, num_sms, groups)
                     report = V.verify_segmented(segments, num_sms)
+                    audits = [
+                        A.audit_schedule(
+                            segment,
+                            geometry=geo,
+                            batch_size=batch_size,
+                            num_sms=num_sms,
+                            attn_splits=attn_split,
+                        )
+                        for segment in segments
+                    ]
+                    audit_failures = tuple(
+                        failure
+                        for audit in audits
+                        for failure in audit.failures
+                    )
+                    audit_ok = not audit_failures
+                    config_ok = report.ok and audit_ok
                     configs.append(
                         {
                             "batch_size": batch_size,
@@ -101,15 +119,20 @@ def verify_matrix(
                             "fusion_groups": groups,
                             "segments": len(segments),
                             "instructions": report.instructions,
-                            "ok": report.ok,
-                            "failures": report.failures,
+                            "ok": config_ok,
+                            "failures": tuple(report.failures) + audit_failures,
+                            "audit_ok": audit_ok,
+                            "audit_failures": audit_failures,
+                            "audit_checked_writes": sum(
+                                item.checked_writes for item in audits
+                            ),
                             "stalled_sms": list(report.stalled_sms),
                             "cycle": report.cycle,
                             "arrivals": report.arrival_audit.describe(),
                         }
                     )
                     totals["configs"] += 1
-                    totals["passed" if report.ok else "failed"] += 1
+                    totals["passed" if config_ok else "failed"] += 1
 
                 totals["valid_accepted"] += adversarial.accepted_valid
                 totals["valid_total"] += adversarial.valid_total

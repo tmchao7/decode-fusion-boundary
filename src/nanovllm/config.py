@@ -49,6 +49,7 @@ class Config:
     # (TaskGraphDecoder), not here.
     fusion_groups: int = 1
     megakernel_verbose: bool = False
+    megakernel_debug_bounds: bool = False
     hf_config: Any | None = None
     eos: int = -1
     kvcache_block_size: int = 256

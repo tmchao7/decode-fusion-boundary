@@ -172,7 +172,7 @@ run_taskgraph() {
   run_build
   PYTHONPATH="$PYTHONPATH" python -m unittest \
     tests.test_taskgraph_abi tests.test_taskgraph_backend \
-    tests.test_taskgraph_kernel_source -v \
+    tests.test_taskgraph_kernel_source tests.test_taskgraph_audit -v \
     2>&1 | tee results/taskgraph_abi_backend.log
   # GPU correctness modules. The first four are unittest classes; the last three
   # are scripts -- invoking a script through unittest reports 0 tests and exits 0,

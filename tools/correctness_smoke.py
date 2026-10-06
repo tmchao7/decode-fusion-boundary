@@ -40,6 +40,8 @@ def backend_config(name: str, attn_splits: int = 1) -> dict:
                 f"attn_splits only applies to the megakernel backend, not {name}"
             )
         config["megakernel_attn_splits"] = attn_splits
+    if name == "megakernel" and os.getenv("NANOVLLM_DEBUG_BOUNDS") == "1":
+        config["megakernel_debug_bounds"] = True
     return config
 
 
@@ -125,30 +127,115 @@ def run_backend(model: str, name: str, prompts, max_tokens: int, attn_splits: in
                 print(f"CUDA cleanup skipped after backend failure: {exc}", flush=True)
 
 
-def serialize_backend_result(result: dict) -> dict:
+class BackendDeviceError(RuntimeError):
+    """A backend failed because CUDA/device state became unusable."""
+
+    def __init__(self, backend: str, error: str):
+        super().__init__(f"{backend} device failure: {error}")
+        self.backend = backend
+        self.error = error
+
+
+_DEVICE_ERROR_MARKERS = (
+    "CUDA error",
+    "CUDA error:",
+    "cudaError",
+    "illegal memory access",
+    "device-side assert",
+    "no kernel image is available",
+    "unspecified launch failure",
+    "an illegal instruction was encountered",
+)
+
+
+def classify_backend_error(error: str) -> str:
+    """Classify a child traceback without weakening correctness gates."""
+
+    lowered = error.lower()
+    return (
+        "DEVICE_ERROR"
+        if any(marker.lower() in lowered for marker in _DEVICE_ERROR_MARKERS)
+        else "RUNTIME_ERROR"
+    )
+
+
+def effective_attn_splits(result: dict, *, backend: str, requested: int) -> int:
+    """Read the split count the engine reported, with a strict fallback.
+
+    ``requested`` is only a command-line claim.  The engine metrics are the
+    source of truth when available; a Megakernel result without that field is
+    rejected by the caller rather than recorded as verified coverage.
+    """
+
+    if backend != "megakernel":
+        return 1
+    summary = result.get("metrics", {}).get("summary", {})
+    actuals = summary.get("backend_actuals", [])
+    if actuals and "megakernel" not in actuals:
+        return 1
+    reported = summary.get("megakernel_attn_splits")
+    if reported is None:
+        return int(requested)
+    return int(reported)
+
+
+def serialize_backend_result(
+    result: dict, *, backend: str | None = None, requested_attn_splits: int | None = None
+) -> dict:
     """Keep only JSON/IPC-safe data returned from an isolated backend process."""
 
-    return {
+    payload = {
         "outputs": [item["token_ids"] for item in result["outputs"]],
         "metrics": result["metrics"],
     }
+    if requested_attn_splits is not None:
+        payload["requested_attn_splits"] = int(requested_attn_splits)
+        payload["effective_attn_splits"] = effective_attn_splits(
+            result, backend=backend or "", requested=int(requested_attn_splits)
+        )
+        payload["effective_attn_splits_confirmed"] = (
+            backend != "megakernel"
+            or "megakernel_attn_splits"
+            in result.get("metrics", {}).get("summary", {})
+        )
+    return payload
 
 
-def _backend_worker(connection, model: str, name: str, prompts, max_tokens: int, attn_splits: int = 1):
+def _backend_worker(
+    connection,
+    model: str,
+    name: str,
+    prompts,
+    max_tokens: int,
+    attn_splits: int = 1,
+):
     """Run one CUDA backend in a fresh process and return JSON-safe data."""
 
     try:
         # attn_splits MUST be forwarded: dropping it here silently downgraded
         # ``--attn-splits 2`` to 1 while the JSON artifact still recorded 2.
         result = run_backend(model, name, prompts, max_tokens, attn_splits)
-        connection.send({"ok": True, "result": serialize_backend_result(result)})
+        connection.send(
+            {
+                "ok": True,
+                "result": serialize_backend_result(
+                    result, backend=name, requested_attn_splits=attn_splits
+                ),
+            }
+        )
     except BaseException:
         connection.send({"ok": False, "error": traceback.format_exc()})
     finally:
         connection.close()
 
 
-def run_backend_isolated(model: str, name: str, prompts, max_tokens: int, attn_splits: int = 1) -> dict:
+def run_backend_isolated(
+    model: str,
+    name: str,
+    prompts,
+    max_tokens: int,
+    attn_splits: int = 1,
+) -> dict:
     """Run a backend in a clean process so CUDA allocator state cannot leak.
 
     A backend may reserve most of the GPU for its paged KV pool. Reusing the
@@ -169,14 +256,18 @@ def run_backend_isolated(model: str, name: str, prompts, max_tokens: int, attn_s
     payload = parent.recv() if parent.poll() else None
     parent.close()
     if payload is None:
-        raise RuntimeError(
+        message = (
             f"isolated backend process exited without a result: "
             f"backend={name}, exitcode={process.exitcode}"
         )
+        if process.exitcode not in (0, None):
+            raise BackendDeviceError(name, message)
+        raise RuntimeError(message)
     if not payload["ok"]:
-        raise RuntimeError(
-            f"isolated backend failed: backend={name}\n{payload['error']}"
-        )
+        error = payload["error"]
+        if classify_backend_error(error) == "DEVICE_ERROR":
+            raise BackendDeviceError(name, error)
+        raise RuntimeError(f"isolated backend failed: backend={name}\n{error}")
     if process.exitcode != 0:
         raise RuntimeError(
             f"isolated backend exited with code {process.exitcode}: backend={name}"
@@ -335,16 +426,56 @@ def main() -> None:
     )
 
     results = []
+    had_backend_error = False
     for case in cases:
         backend_results = {}
+        backend_errors = {}
         for backend in backend_names:
             print(f"Running correctness: case={case['id']} backend={backend}", flush=True)
-            backend_results[backend] = run_backend_isolated(
-                args.model, backend, case["prompts"], args.max_tokens, args.attn_splits
+            try:
+                backend_results[backend] = run_backend_isolated(
+                    args.model, backend, case["prompts"], args.max_tokens, args.attn_splits
+                )
+            except BackendDeviceError as exc:
+                backend_errors[backend] = {
+                    "kind": "DEVICE_ERROR",
+                    "message": str(exc),
+                    "requested_attn_splits": args.attn_splits,
+                    "effective_attn_splits": (
+                        args.attn_splits if backend == "megakernel" else 1
+                    ),
+                }
+            except RuntimeError as exc:
+                backend_errors[backend] = {
+                    "kind": "RUNTIME_ERROR",
+                    "message": str(exc),
+                    "requested_attn_splits": args.attn_splits,
+                    "effective_attn_splits": (
+                        args.attn_splits if backend == "megakernel" else 1
+                    ),
+                }
+
+        if "torch-eager" not in backend_results:
+            raise SystemExit(
+                "correctness reference backend failed: "
+                + json.dumps(backend_errors.get("torch-eager", {}), sort_keys=True)
             )
         reference = backend_results["torch-eager"]["outputs"]
         checks = {}
-        for backend, result in backend_results.items():
+        had_backend_error |= bool(backend_errors)
+        for backend in backend_names:
+            if backend not in backend_results:
+                checks[backend] = {
+                    "passed": False,
+                    "status": backend_errors[backend]["kind"],
+                    "error": backend_errors[backend],
+                    "requested_attn_splits": args.attn_splits,
+                    "effective_attn_splits": (
+                        args.attn_splits if backend == "megakernel" else 1
+                    ),
+                }
+                continue
+            result = backend_results[backend]
             actuals = result["metrics"]["summary"].get("backend_actuals", [])
             mismatches, first_mismatch = compare_outputs(reference, result["outputs"])
             status, cascade_details = classify_comparison(reference, result["outputs"])
@@ -356,12 +487,30 @@ def main() -> None:
                 "first_mismatch": first_mismatch,
                 "cascade_details": cascade_details if cascade_details else None,
                 "backend_actuals": actuals,
+                "requested_attn_splits": args.attn_splits,
+                "effective_attn_splits": result.get(
+                    "effective_attn_splits",
+                    effective_attn_splits(
+                        result, backend=backend, requested=args.attn_splits
+                    ),
+                ),
+                "effective_attn_splits_confirmed": result.get(
+                    "effective_attn_splits_confirmed",
+                    backend != "megakernel"
+                    or "megakernel_attn_splits"
+                    in result.get("metrics", {}).get("summary", {}),
+                ),
                 "used_megakernel": used_megakernel,
                 "fallback_reasons": result["metrics"]["summary"].get(
                     "fallback_reasons", []
                 ),
             }
             if args.require_megakernel and backend == "megakernel" and not used_megakernel:
+                if backend in backend_errors:
+                    # Preserve the per-case DEVICE_ERROR/RUNTIME_ERROR record and
+                    # let the final non-zero exit report the gate failure after
+                    # writing the JSON artifact.
+                    continue
                 raise SystemExit(
                     f"Megakernel was requested but did not execute for {case['id']}"
                 )
@@ -391,6 +540,7 @@ def main() -> None:
                 "prompt_lengths": case["prompt_lengths"],
                 "batch_size": len(case["prompts"]),
                 "checks": checks,
+                "backend_errors": backend_errors,
             }
         )
 
@@ -400,6 +550,11 @@ def main() -> None:
         "batch_sizes": args.batch_sizes,
         # Recorded because two runs of this tool can differ only in this value.
         "attn_splits": args.attn_splits,
+        "requested_attn_splits": args.attn_splits,
+        "effective_attn_splits": (
+            args.attn_splits if "megakernel" in backend_names else 1
+        ),
+        "effective_attn_splits_confirmed": False,
         "cases": results,
     }
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -408,6 +563,8 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text, encoding="utf-8")
     print(text, end="")
+    if had_backend_error:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,10 @@ constexpr float TG_RMS_EPS = 1e-6f;
 #define TG_BLOCK_SIZE 256  // 8 warps/CTA; occupancy=1 block/SM via __launch_bounds__
 #endif
 
+#ifndef TG_DEBUG_BOUNDS
+#define TG_DEBUG_BOUNDS 0
+#endif
+
 constexpr int TG_NUM_WARPS = TG_BLOCK_SIZE / TG_WARP_SIZE;        // 8
 constexpr int TG_WORKER_WARPS = TG_NUM_WARPS - 1;                 // 7 (warp 0 is controller)
 
@@ -1711,6 +1715,65 @@ struct TgSmem {
   int* s_argmax_idx;            // [7] = 28 B (LM head argmax idx)
 };
 
+#if TG_DEBUG_BOUNDS
+__device__ __forceinline__ void tg_debug_validate_inst(
+    const int* inst, const TgGlobals& g, int bid) {
+  const int op = inst[0];
+  const int layer = inst[1];
+  if (layer < 0 || layer >= g.num_layers) {
+    printf("tg_debug_bounds: SM=%d op=%d invalid layer=%d\n", bid, op, layer);
+    __trap();
+  }
+  if (op == tg::TG_QKV_PROJ) {
+    const int gemm = inst[3];
+    const int count = inst[9];
+    const int start = inst[10];
+    const int limit = gemm == 0 ? g.q_size / TG_WMMA_TILE
+                                : g.kv_size / TG_WMMA_TILE;
+    if (gemm < 0 || gemm > 2 || count < 1 || start < 0 ||
+        start + count > limit) {
+      printf("tg_debug_bounds: SM=%d QKV gemm=%d start=%d count=%d limit=%d\n",
+             bid, gemm, start, count, limit);
+      __trap();
+    }
+  } else if (op == tg::TG_O_PROJ || op == tg::TG_FFN_UPGATE_ACT ||
+             op == tg::TG_FFN_DOWN || op == tg::TG_LM_HEAD) {
+    const int count = inst[9];
+    const int start = inst[10] & 0xFFFF;
+    const int limit = op == tg::TG_O_PROJ
+                          ? g.hidden / TG_WMMA_TILE
+                          : op == tg::TG_FFN_UPGATE_ACT
+                                ? g.intermediate / TG_WMMA_TILE
+                                : op == tg::TG_FFN_DOWN
+                                      ? g.hidden / TG_WMMA_TILE
+                                      : g.vocab_size / TG_WMMA_TILE;
+    if (inst[10] >> 16 != 0 || count < 1 || start < 0 ||
+        start + count > limit) {
+      printf("tg_debug_bounds: SM=%d op=%d start=%d count=%d limit=%d\n",
+             bid, op, start, count, limit);
+      __trap();
+    }
+  } else if (op == tg::TG_ATTN_DECODE) {
+    if (inst[2] < 0 || inst[2] >= g.BS || inst[3] < 0 ||
+        inst[3] >= g.num_kv_heads || inst[4] < 0 ||
+        inst[4] >= inst[5] || inst[5] < 1 ||
+        inst[5] > g.max_attn_splits) {
+      printf("tg_debug_bounds: SM=%d invalid attention batch=%d head=%d split=%d/%d\n",
+             bid, inst[2], inst[3], inst[4], inst[5]);
+      __trap();
+    }
+  } else if (op == tg::TG_ATTN_COMBINE) {
+    if (inst[2] < 0 || inst[2] >= g.BS || inst[3] < 0 ||
+        inst[3] >= g.num_kv_heads || inst[4] < 2 ||
+        inst[4] > g.max_attn_splits) {
+      printf("tg_debug_bounds: SM=%d invalid combine batch=%d head=%d splits=%d\n",
+             bid, inst[2], inst[3], inst[4]);
+      __trap();
+    }
+  }
+}
+#endif
+
 // =============================================================================
 // Instruction dispatch. Big switch on opcode. Each branch calls one op helper
 // and then tg_worker_sync exactly once (the invariant).
@@ -1821,6 +1884,12 @@ void tg_decode_kernel(__grid_constant__ const tg::TgLaunchDesc desc) {
       tg_coop_load_inst(inst_shared, sm_base + i * TG_INST_WIDTH);
     }
     __syncthreads();
+#if TG_DEBUG_BOUNDS
+    if (threadIdx.x == TG_WARP_SIZE) {
+      tg_debug_validate_inst(inst_shared, g, bid);
+    }
+    __syncthreads();
+#endif
     // Workers dispatch.
     if (warp_id != 0) {
       tg_dispatch(inst_shared, g, bid, smem);

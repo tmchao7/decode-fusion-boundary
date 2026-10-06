@@ -205,7 +205,10 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = False,
     ) -> dict:
-        collector = MetricsCollector(self.config.decode_backend)
+        collector = MetricsCollector(
+            self.config.decode_backend,
+            megakernel_attn_splits=self.config.megakernel_attn_splits,
+        )
         outputs, report = self._generate(
             prompts,
             sampling_params,
