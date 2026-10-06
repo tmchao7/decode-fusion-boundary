@@ -196,6 +196,119 @@ x_ffn[b] = Σ_{j=1..8} routing_w[b][j] · expert_out[slot(b,j)]
 
 ---
 
+## 1.5 真机实测：sm_120 能力与 persistent grid（2026-10-06，RTX 5090）
+
+**这一节是测量，不是推理。** 在 cc=12.0 上直接编译/运行探测得到：
+
+```text
+device = NVIDIA GeForce RTX 5090, cc=12.0, smemPerSM=102400 B, maxThreadsPerSM=1536
+
+[✗] wgmma.fence.sync.aligned     sm_120 → ptxas: "Instruction 'wgmma.fence' not
+                                  supported on .target 'sm_120'"
+                                  （同一份源文件 sm_90a 编译通过 —— 对照有效）
+[✓] thread-block cluster (2 CTA) 启动成功，num_blocks=2
+[✓] cluster DSMEM map_shared_rank 跨 block 共享内存读写成功
+[✓] TMA cp.async.bulk + mbarrier  运行无错
+[✓] bf16 wmma mma.sync           运行无错
+```
+
+**cooperative persistent grid（P0.1 的门）——已通过：**
+
+| grid (CTA) | 严格 logit 对拍（20 个位置） | 崩溃 |
+|---:|---|---|
+| 1 | PASS，`logit_maxdiff ≤ 0.21`、`ref_gap = 0.0000` | 无 |
+| 4 | PASS（`TG_NUM_SMS=4`，correctness_smoke CASCADE 于 token 7） | **无** |
+| 8 | PASS，与 grid=1 **逐 token 相同** | 无 |
+| **170** | PASS，与 grid=1 **逐 token 相同** | 无 |
+
+> 所以 `docs/19` §3c.3 那条"grid≥4 起硬崩、容器带 SSH 一起挂"**已被内核修复消除**
+> （`7118516` 动态 smem、`3b6dd3c` SiLU tile、`93ad16e` 越界读）。
+> **H-MoE-4 的判决：不否证，170 CTA 可用。**
+
+## 1.6 真机实测：可达带宽不是唯一值（影响所有 roofline 分母）
+
+同一台机器、同一探针（`torch.sum` 单遍约减）、只改 buffer 尺寸：
+
+| buffer | 迭代 | mean GB/s | 说明 |
+|---:|---:|---:|---|
+| 0.3 GB | 20 | 1,476.7 | 与 Qwen3-0.6B 单步权重同量级 |
+| 1.2 GB | 20 | **1,600.2** | `RUN_MODE=bandwidth` 的默认尺寸 |
+| 3.0 GB | 20 | 1,648.3 | |
+| 4.0 GB | 15 | **1,683.3** | 渐近值 |
+| 1.2 GB | 15 | 1,672.8（**median**） | 同一数据的中位数 |
+
+对 `time_ms = a + bytes/B` 做线性拟合：**截距 −3.9 µs**（即**没有**固定 per-call 开销）、
+斜率对应 **1,675 GB/s**。所以差异不是"小 buffer 摊不开开销"，而是**小 buffer 的单次
+`torch.sum` 扫描本身没跑满**（迭代间方差也更大：0.3 GB 档 CoV 1.21% vs 3 GB 档 0.42%）。
+
+**本仓的口径决定**（写下来免得反复漂）：
+
+1. roofline 分母用**本仓实测**（`results/bandwidth.json`），引用 LeanMoE 的 1,559.2 GB/s
+   仅作交叉校验（低 6%），**不得**混用；
+2. 记录为 **1,600 ± 80 GB/s**，即在该 buffer 尺寸上的 20 次 mean，误差按尺寸敏感性给；
+3. 地板随之平移（**所有 floor 按同一分母，不混**）：
+
+| 分母 | floor_W | floor_T(ctx=1024) | floor_T(ctx=4096) |
+|---:|---:|---:|---:|
+| 1,559.2（引用） | 1.5123 | 1.5984 | 1.8566 |
+| **1,600.2（本仓）** | **1.4736** | **1.5574** | **1.8091** |
+| 1,675.0（渐近） | 1.4078 | 1.4879 | 1.7283 |
+
+> 结论不变（专家仍占 68.3%，算力仍不到地板 1%），但**报"离墙多远"时必须声明用的是哪一行**。
+
+---
+
+## 1.7 架构决议：为什么继续本仓、为什么不移植 cohere
+
+用户提过三条路：新开仓 / 魔改 cohere-megakernel / 继续本仓。**决议：继续本仓。**
+
+### 为什么不移植 cohere
+
+读源码得到的耦合面（不是推测）：
+
+| 位置 | 内容 | 在 sm_120 上 |
+|---|---|---|
+| `src/decode/megakernel.cuh` | 3233 行；GEMM 走 `wgmma.mma_async` + `warpgroup::mma_async_wait` + mbarrier 分段流水 | **全部要重写**（§1.5 已实测 wgmma 不可用） |
+| `src/decode/gemm-n8-wgmma.cuh` | 232 行，手写 `wgmma.mma_async...m64n8k16` 的 n=8 扩展 | 不可用 |
+| `CMakeLists.txt:5` | `set(CMAKE_CUDA_ARCHITECTURES 90a)` | 构建锁 Hopper |
+| `src/decode/runtime.cu:336` | JIT `--generate-code=arch=compute_90a` + `-DKITTENS_HOPPER` | JIT 锁 Hopper |
+| `src/decode/schedule.py:33-41` | 只服务 North Mini Code：`EXPERTS=128 / TOPK=8 / DFF=768 / HIDDEN=2048 / HEADS=32 / KV_HEADS=4 / VOCAB=262144` | 换模型直接被 `_validate_nmc_model_abi()` 拒 |
+
+**关键**：cohere 的 MoE 相关代码只有约 164 行（`megakernel.cuh`）+ 136 行（`schedule.py`），
+而它**没有用 cluster/TMA 实现 MoE/attention**——用的是 wgmma + warpgroup。
+所以"移植 cohere 顺便拿到 sm_120 特性"这条路**不存在**：你要的特性它没用，
+它用的特性 sm_120 没有。要付的是重写全部 3233 行计算核。
+
+### 为什么不开新仓
+
+`docs/20` §2.3 已立"两个项目不要重复"的纪律。第三个仓要重造的是本仓已验证的资产：
+指令流+bar-DAG 调度器（1110 行）、对抗性验证器（838 行，误接受 0）、ownership 审计、
+结构式成本模型、roofline/带宽/accounting、PASS/CASCADE/**DEVICE_ERROR 不可降级** 门、
+三道文档护栏 + 590 项 CPU 测试。**这些没有一行是 Qwen3-0.6B 专用的。**
+
+### 继续本仓要付的代价（诚实列出）
+
+| 代价 | 状态 |
+|---|---|
+| 模型维度 4 份拷贝 | ✅ 已解（`model_spec.py`） |
+| `TG_LW_COUNT == 11` 硬锁（每层 11 个权重指针） | ⬜ 待解（S2），MoE 需要专家维度的第二层间接 |
+| 恰好 8 个 bar 数组硬锁 | ⬜ 待解（S2） |
+| 16 字指令的字段预算无人管 | ⬜ 待解（S2），MoE 需 9 字段，目前是手算 |
+| 4 个 wave builder 各带 copy 的 packer | ⬜ 待解（S3），MoE 会变 6 套 |
+
+### 从 cohere **借鉴设计**（不移植代码）
+
+| 借什么 | 为什么 sm_120 可用 | 落到哪 |
+|---|---|---|
+| 计数器 DAG + work-stealing drain | 纯 atomic，无 arch 依赖 | §L1（阶段 D2） |
+| arrive/wait 分离的跨 SM barrier | 同上 | §L2.2 |
+| packed MoE task record（int4/记录） | 路由 task 压缩，无 arch 依赖 | 阶段 A1 |
+| 按 SM id 的 per-SM profiler | 纯计时；**本仓没有，是缺口** | 新增 `tools/` |
+| TMA 权重预取 | §1.5 已实测可用 | 阶段 D |
+| thread-block cluster / DSMEM | §1.5 已实测可用 | 阶段 D |
+
+---
+
 ## 2. 明确**不**做的事（每条附证据）
 
 1. **不做 token-major grouped GEMM + gather**。那是为"多个 token 命中同一专家"摊销构造开销的；
@@ -248,18 +361,17 @@ MoE 的 tile 比 dense 大，实际可打包数必须在内核侧重新推导并
 
 ### 阶段 P0 —— 上机前必须先清掉"会不会白干"
 
-| # | 动作 | 判决门 |
+| # | 动作 | 状态 / 判决门 |
 |---|---|---|
-| **P0.1** | 把 [19](19_上机清单.md) §3c.3 的 **grid>1 崩溃** 做成完整矩阵（`sms=1 → 4 → 170`，先 `TG_NUM_SMS=1`） | 170 CTA cooperative launch 能稳定跑 ≥100 步 → 持久化路线可行；**否则本方向必须改为"少量 CTA + 多 kernel"**，本页 §1 的 L1 需重写 |
-| **P0.2** | 带宽探针加臂：1 CTA/SM（现状）+ 2 CTA/SM + 每 CTA ≥8 stages，量"每 SM 要多少 in-flight bytes 才到 90% 可达带宽" | 得出这个数字；它直接决定 kernel 的 stage / warp / CTA 配置 |
-| **P0.3** | 纯 CPU：`moe_budget.py` + `tests/test_moe_budget.py` | ✅ **本次已完成**（48 项） |
+| **P0.1** | cooperative grid 隔离矩阵（`sms=1 → 4 → 8 → 170`，先 `TG_NUM_SMS=1`） | ✅ **已通过**（2026-10-06 真机）。见 §1.5：1/4/8/170 CTA 全部**无崩溃**且逐位一致，`docs/19` §3c.3 记录的 grid>1 硬崩**已随内核修复消失**。**持久化路线的前提成立**，§1 的 L1 不需要改成多 kernel |
+| **P0.2** | 带宽探针加臂（1 CTA/SM vs 2 CTA/SM vs ≥8 stages） | ⬜ **未做**。但已测出两个必需的数字，见 §1.6：**可达带宽随 buffer 尺寸变化**（0.3 GB→1,477；1.2 GB→1,600；3–4 GB→**1,675** GB/s），且**没有固定 per-call 开销**（拟合截距 −3.9 µs）。所以每 SM 要 9.2 GB/s / 50 KB in-flight 的目标仍然成立 |
+| **P0.3** | 纯 CPU：`moe_budget.py` + `tests/test_moe_budget.py` | ✅ **已完成**（54 项） |
 
-> P0.1/P0.2 **需要 GPU**。本次未做，已登记进 [19](19_上机清单.md) 的执行顺序。
-
-### 阶段 A —— b=1 的 MoE kernel（主目标 2–4 ms/token，地板 1.598 ms）
+### 阶段 A —— b=1 的 MoE kernel（主目标 2–4 ms/token，地板见 §1.6）
 
 | # | 交付 | 门 |
 |---|---|---|
+| A0 | **模型维度单一来源** `nanovllm/model_spec.py` | ✅ **已完成**（`tests/test_model_spec.py`，34 项）。用户与 `ModelSpec` 双向对拍；`weights.py`/`taskgraph.py` 改为 spec 视图 |
 | A1 | `tg_abi.h` 加 4 opcode；`schedule.py` 加 4 个 builder + 4 个 bar + `build_moe_layer_waves`；内核侧重推 shared memory 打包上限 | 头文件对拍绿；`verify_schedule` 在 `g∈{1,2,4,7,14,28}`×`sms∈{1,4,108,170}` 全 PASS、误接受 0 |
 | A2 | `router_reference.py`（torch，纯 CPU 可测）：softmax → top-8 → **不归一化** | 与 HF `OlmoeSparseMoeBlock` 逐元素对拍，含"全部 token 挤到同一专家"的极端路由 |
 | A3 | 4 个 op body；先 `--dry-run` 验 schedule 合法，再实装 | 扩展编译过；`TG_NUM_SMS=1` 能跑完不崩 |
@@ -282,7 +394,7 @@ MoE 的 tile 比 dense 大，实际可打包数必须在内核侧重新推导并
 | **H-MoE-1** | b=1 字节账完整：`[W]=2.358 GB`、专家 68.3%、**gather 可完全省掉** | 实测 device ms/token 显著高于 `[T]/实测带宽`，且 nsys 显示额外大块 memcpy | 修正 `[W]` 口径 |
 | **H-MoE-2** | 融合在 MoE 上的收益**远大于** dense（dense 已贴 95% 墙，MoE 只忙 10.5%） | 融合后 device 时间没改善，或改善全在 launch 侧 | [20](20_方向重构_从dense到MoE融合kernel.md) §5 的 H2 被否证 |
 | **H-MoE-3** | 串行波深（82 层）不是瓶颈 | 实测层间 drain 占总时间 > 20% | 需要 arrive/wait 分离的 cross-SM barrier |
-| **H-MoE-4** | 170 CTA persistent grid 在 sm_120 上可用 | P0.1 崩溃 | 架构改为多 kernel + 少量 CTA，本页 §1 重写 |
+| **H-MoE-4** | 170 CTA persistent grid 在 sm_120 上可用 | P0.1 崩溃 | ✅ **已裁决：不否证**（§1.5 实测 1/4/8/170 全部无崩溃且逐位一致） |
 | **量化门** | W8/W4 使 `[W]` 降到 1.18/0.59 GB → floor 降到 ~0.76/0.38 ms | — | **依赖 LeanMoE `EXP-p1-01`，不假定** |
 
 **可复现的判读**：`python -m nanovllm.moe_budget` 的输出（或 `render_report()`）给出
@@ -290,43 +402,89 @@ MoE 的 tile 比 dense 大，实际可打包数必须在内核侧重新推导并
 
 ---
 
+## 5b. 真机实测：dense 在 5090 上的裁决（决定本页的分工，2026-10-06）
+
+主表 b=1，`runs=5` + warmup 2，`prompt=32`，CUDA event 计时：
+
+```text
+                wall ms/step   device ms/step
+torch-eager        13.5            13.5
+torch-cudagraph     1.74            1.74    ← 唯一可用基线
+megakernel          4.56            4.54
+
+device 比值 megakernel ÷ cudagraph = 2.6x
+host 残差 wall − device ≈ 0.02 ms  （13.5→13.5、1.74→1.74 同样成立）
+```
+
+**两条结论，都否证了先验：**
+
+1. **"消除 host 边界"这个机制在 5090 上已经归零**（wall ≈ device）。
+   [14](14_融合粒度实验.md) 架构线里那 ~2.2 ms/step 的 host 残差在 5090 上**不存在**，
+   所以 dense 融合在 5090 上**没有可赚的东西**——不是赚得少，是机制消失。
+2. **device 侧也没有变好**：megakernel ÷ cudagraph 仍是 **2.6×**，
+   而 cudagraph 只跑到权重要求的 **76%**（1.74 ms vs floor 1.42 ms @1,675 GB/s）。
+
+**对 MoE 的推论**：这恰好加强了 §0 结论 2——dense 的收益来源（host 消除）已消失，
+device 侧又贴着墙，所以**融合要产生增量只能靠"streaming fewer bytes"**，
+这正是 MoE + 低比特的立论。**dense 在本仓降级为回归基线 + 验证器算例，不再作为加速路径。**
+
+> ⚠️ 口径声明：`torch-cudagraph` 作为主对照臂，在 **b≥2 时 8 个网格点里只有 2 个过
+> correctness 门**（与 torch-eager 的 token 不一致）。**上表只用了 b=1**，
+> 因为按本仓硬规则"没有配对正确性结果的延迟数字不许写出来"。
+> cudagraph 在 b≥2 的行为需要单独一轮排查，在此之前 batch 扫描这条线是断的。
+
+---
+
 ## 6. 风险（按会杀死项目的程度排序）
 
 | 风险 | 后果 | 缓解 |
 |---|---|---|
-| **P0.1：170 CTA cooperative grid 不可用** | 持久化 task graph 的整个前提没了 | 先做 P0.1；有明确 fallback（多 kernel + 少量 CTA） |
-| **MLP 不足** | 跑到地板的 3–5 倍，看起来像"融合没用" | P0.2 先定配置；必要时 2 CTA/SM 或加 stage |
+| ~~**P0.1：170 CTA cooperative grid 不可用**~~ | ~~持久化 task graph 的整个前提没了~~ | ✅ **已排除**（§1.5 实测通过） |
+| **MLP 不足** | 跑到地板的 3–5 倍，看起来像"融合没用" | P0.2 先定配置；必要时 2 CTA/SM 或加 stage。§1.6 已确认无固定开销，所以目标仍是 50 KB in-flight/SM |
+| **roofline 分母口径漂移** | 所有"离墙多远"都错 | §1.6：分母只用本仓实测，四条候选值列成表，报数时必须声明用哪行 |
 | 专家 tile 太小、指令太碎 | 每条指令流不到足够字节，barrier 占比上升 | §2.3 的并行度表已给出每 SM 指令数；A1 时用真实 smem 预算重推 |
 | 权重 bf16↔fp16 落差 | 精度门误判 | 内核走 bf16 流式；落差必须记录（不是"顺手转 fp16"） |
 | `[W]` 与实测不符 | 所有"离墙多远"都错 | H-MoE-1 的修正路径；不得当 kernel 快 |
+| **CASCADE 门只查"从哪个 token 开始不一致"，不查差多少** | 一个算错的层可以稳定报 CASCADE | 用 `tests/test_taskgraph_positions.py` 的**严格 logit 对拍**（`LOGIT_ATOL=1.0`）做第二道门，不只看 CASCADE |
 
 ---
 
-## 7. 验证与验收（本轮已完成的离线部分）
+## 7. 验证与验收（本轮已完成的部分）
 
 ```bash
-PYTHONPATH=src python -m unittest tests.test_moe_budget      # 48 项
-python -c "from nanovllm.moe_budget import *; print(render_report(decode_budget(OLMOE_1B_7B, bandwidth_gbps=1559.2), plan_work()))"
+python -m pip install numpy xxhash
+PYTHONPATH=src python -m unittest discover -s tests            # 590 项（CPU）/ 596 项（含 GPU）
+python -m nanovllm.moe_budget --bandwidth-gbps 1600.2          # MoE 字节账（不需要 GPU）
+PYTHONPATH=src python -m unittest tests.test_model_spec        # 模型维度单一来源（34 项）
 ```
 
-**已锁定的量**（容差见测试）：`[W]=2,357,985,280`；专家占 68.3%；
-`floor_W=1.512 ms`、`floor_T(ctx=1024)=1.598 ms`、`floor_T(ctx=4096)=1.857 ms`；
-gather 路径地板 3.664 ms（省下 2.066 ms）；算力占地板 0.74%；
+**已锁定的量**（容差见测试）：`[W]=2,357,985,280`（6 个分量与 safetensors 逐张量相等）；
+专家占 68.30%、attention 22.78%、lm_head 8.74%、router 0.18%；
+`floor_W=1.4736 ms`、`floor_T(ctx=1024)=1.5574 ms`（分母 **1,600.2 GB/s**，本仓实测，
+见 §1.6；引用值 1,559.2 下的 1.5123/1.5984 与渐近值 1,675 下的 1.4078/1.4879 都列在 §1.6）；
+gather 路径地板 3.570 ms（省下 2.013 ms）；算力占地板 0.76%；
 `total_params=6,919,161,856` 与 safetensors 完全相等；b=1 槽负载 min==max==1；
 36,249 tiles/step、82 串行层级、专家波每 SM 8 条指令。
 
-**未做（需 GPU）**：P0.1、P0.2、阶段 A 全部、阶段 D 全部。
+**真机已裁决**：P0.1 ✅（§1.5）；H-MoE-4 ✅ 不否证；dense 的 host 机制已归零（§5b）。
+
+**未做**：P0.2 的加臂探针；阶段 A 的 A1–A5；阶段 D 全部。
 
 ---
 
 ## 8. [未测] / [推测] 清单（不得清空前不得对外）
 
 ```text
-[未测] P0.1 170 CTA cooperative launch 是否稳定（H-MoE-4）
+[已测] P0.1 grid 1/4/8/170 全部无崩溃且逐位一致        （docs/22 §1.5）
+[已测] sm_120 无 wgmma；有 cluster/TMA/DSMEM/mma.sync  （docs/22 §1.5）
+[已测] 可达带宽随 buffer 尺寸变化，无固定 per-call 开销 （docs/22 §1.6）
+[已测] dense b=1：device 比值 2.6x，host 残差 ≈ 0       （docs/22 §5b）
 [未测] P0.2 达到 90% 可达带宽所需的 in-flight bytes/SM
-[未测] 在 5090 上实装 MoE kernel 的 device ms/token、implied GB/s、离 1.598 ms 的倍数
+[未测] 在 5090 上实装 MoE kernel 的 device ms/token、implied GB/s、离地板（1.5574 ms）的倍数
 [未测] H-MoE-1/2/3 的裁决
+[未测] torch-cudagraph 在 b≥2 的正确性（8 个点里 6 个不过门）
+[待修] attn_splits=2 数值 bug（pos 1 差 13.34，选错 token），修好前该臂不可用于取数
 [推测] 目标 2–4 ms/token（docs/20 §5 的 H2 预测值）
-[推测] MLP 不足是当前 10.8 ms/step 的主因之一（§0 结论 3）
+[推测] MLP 不足是 dense 当前 10.8 ms/step（A100，docs/12）的主因之一
 [依赖] W8/W4 的精度门（LeanMoE-Quant EXP-p1-01）
 ```
