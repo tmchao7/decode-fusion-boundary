@@ -476,10 +476,16 @@ class ServerCommandReferenceTests(unittest.TestCase):
         self.assertEqual(extras, [])
 
     def test_docs_promise_files_the_commands_actually_write(self) -> None:
-        """docs/08 tells the user which files to send back; they must be real."""
+        """docs/08 tells the user which files to send back; they must be real.
+
+        Artifact names are machine-neutral on purpose (``results/performance.json``
+        rather than ``results/a100_performance.json``): the same command file must
+        run on an A100 and on an RTX 5090 without implying one machine's numbers
+        are the other's.
+        """
 
         promised = set(
-            re.findall(r"(a100_[a-z_]+\.(?:json|md|log))", DOCS_09.read_text(encoding="utf-8"))
+            re.findall(r"results/([a-z0-9_]+\.(?:json|md|log))", DOCS_09.read_text(encoding="utf-8"))
         )
         self.assertTrue(promised)
         for filename in sorted(promised):
@@ -489,6 +495,18 @@ class ServerCommandReferenceTests(unittest.TestCase):
                     self.text,
                     f"docs/08 promises {filename} but SERVER_COMMANDS never writes it",
                 )
+
+    def test_artifact_names_are_not_tied_to_one_architecture(self) -> None:
+        """A machine-specific prefix would make the other machine's run lie."""
+
+        for line in self.text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            self.assertNotRegex(
+                line,
+                r"results/(?:a100|h100|v100|rtx)_",
+                "artifact names must be machine-neutral (docs/08 §4)",
+            )
 
 
 class CitationTests(unittest.TestCase):

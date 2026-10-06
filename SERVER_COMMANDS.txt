@@ -17,6 +17,12 @@
 # dispersion (stddev/CoV) plus a bootstrap 95% CI -- see docs/02 统计口径.
 # docs/06/07's historical tables used runs=3 and are only comparable within
 # themselves.
+#
+# Artifact names are deliberately machine-neutral (results/performance.json, not
+# results/a100_performance.json): the same command file must be runnable on an
+# A100 and on an RTX 5090 without pretending one machine's number is the other's.
+# Every accounting run resolves its roofline denominator from
+# results/bandwidth.json, so `RUN_MODE=bandwidth` must run first on each machine.
 # The archived kernel.cu/burst line is intentionally not exposed here. See
 # branch codex/archive/frozen-kernel for historical reproduction commands.
 
@@ -103,7 +109,7 @@ run_verify() {
 run_bandwidth() {
   select_gpu
   python -m tools.bench_memory_bandwidth --bytes 1.2e9 --iterations 20 \
-    --json results/bandwidth.json 2>&1 | tee results/a100_bandwidth.log
+    --json results/bandwidth.json 2>&1 | tee results/bandwidth.log
 }
 
 run_build() {
@@ -116,7 +122,7 @@ run_build() {
     2>&1 | tee results/schedule_verification.log
   select_gpu
   rm -rf "$TORCH_EXTENSIONS_DIR/nanovllm_megakernel_C"
-  python -m nanovllm.backends.megakernel.build 2>&1 | tee results/a100_build.log
+  python -m nanovllm.backends.megakernel.build 2>&1 | tee results/build.log
 }
 
 run_verify_extension() {
@@ -139,8 +145,8 @@ run_correctness() {
     --max-tokens 16 \
     --require-megakernel \
     --allow-cascade \
-    --json results/a100_correctness_megakernel.json \
-    2>&1 | tee results/a100_correctness_megakernel.log
+    --json results/correctness_megakernel.json \
+    2>&1 | tee results/correctness_megakernel.log
 }
 
 run_benchmark() {
@@ -158,12 +164,13 @@ run_benchmark() {
     --warmup 2 \
     --runs 5 \
     --baseline torch-cudagraph \
-    --json results/a100_performance.json \
-    --markdown results/a100_performance.md \
-    2>&1 | tee results/a100_performance.log
-  python -m tools.account_decode results/a100_performance.json \
-    --json results/a100_account_breakdown.json \
-    2>&1 | tee results/a100_account_breakdown.md
+    --json results/performance.json \
+    --markdown results/performance.md \
+    2>&1 | tee results/performance.log
+  python -m tools.account_decode results/performance.json \
+    --json results/account_breakdown.json \
+    --bandwidth-json results/bandwidth.json \
+    2>&1 | tee results/account_breakdown.md
 }
 
 run_taskgraph() {
@@ -242,6 +249,7 @@ run_taskgraph_baseline() {
 
   python -m tools.account_decode results/taskgraph_baseline.json \
     --json results/taskgraph_baseline_breakdown.json \
+    --bandwidth-json results/bandwidth.json \
     2>&1 | tee results/taskgraph_baseline_breakdown.md
 }
 
@@ -249,8 +257,15 @@ run_taskgraph_fusion() {
   require_model
   select_gpu
   run_build
-  # Same (batch, context) grid as the main table, megakernel arm only, one row
-  # per fusion granularity. FUSION_GROUPS overrides the sweep points.
+  # Same (batch, context) grid as the main table, one row per fusion granularity.
+  # FUSION_GROUPS overrides the sweep points.
+  #
+  # Unlike the archived version this sweep carries a REAL correctness gate: every
+  # row is grouped with the reference arms run through the same run_case harness
+  # and passed to benchmarks.compare.mark_correctness, and the mode exits non-zero
+  # if any row fails (docs/14 §6 acceptance 1). --reference-backends also gives
+  # the artifact the CUDA Graph opponent, so one file answers "fused vs cuBLAS".
+  # --baseline-json cross-checks g=1 against the main table (acceptance 2).
   python -m tools.bench_fusion_granularity \
     --model "$MODEL" \
     --fusion-groups "${FUSION_GROUPS:-1,2,4,7,14,28}" \
@@ -259,6 +274,9 @@ run_taskgraph_fusion() {
     --max-tokens 128 \
     --warmup 2 \
     --runs 5 \
+    --reference-backends torch-eager,torch-cudagraph \
+    --bandwidth-json results/bandwidth.json \
+    --baseline-json results/taskgraph_baseline.json \
     --json results/fusion_granularity.json \
     2>&1 | tee results/fusion_granularity.log
 }
