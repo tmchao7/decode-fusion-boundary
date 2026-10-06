@@ -1199,7 +1199,23 @@ __device__ __forceinline__ void tg_attn_decode_op(
     s_out_acc[wwarp * g.head_dim + out_base + 3] = out_acc[3];
     tg_worker_sync_inner();
 
-    if (wwarp == 0) {
+    // Cross-warp reduce. This runs in EVERY warp, not just warp 0.
+    //
+    // It has to, for the same reason it does in the non-split path below the
+    // `else`: `out_base = wlane * 4` is the lane's column offset and `s_out_acc`
+    // is shared, so each warp's lanes reduce the *same* 128-float head into
+    // their own 4 columns. Those columns are disjoint across warps, which is
+    // exactly why the whole reduce has to be replicated rather than hoisted into
+    // warp 0: warp 0 only ever fills columns 0..3 of its head.
+    //
+    // An earlier revision published the partial inside `if (wwarp == 0)`, which
+    // therefore wrote 4 of 128 floats and left the other 124 as stale scratch.
+    // At the first decoded position only one split is non-empty, so ATTN_COMBINE
+    // rescaled the garbage by exp(lse - M) with M == lse -- by exactly zero --
+    // and the bug was invisible. From the second position on, two splits are
+    // non-empty, the stale floats get a non-zero weight, and the answer is
+    // silently wrong (measured: 13.3 logit error and the wrong argmax).
+    {
       float global_max = s_max[0];
       for (int w = 1; w < TG_WORKER_WARPS; w++) {
         if (s_max[w] > -INFINITY)
@@ -1221,10 +1237,8 @@ __device__ __forceinline__ void tg_attn_decode_op(
       }
 
       if (is_combine) {
-        // Publish this split's UNNORMALIZED partial and its LSE for
-        // ATTN_COMBINE. o_partial is [BS, hkv, max_splits, hidden]; the q
-        // heads of one kv_head occupy the first group_size*head_dim floats.
-        // ATTN_COMBINE then computes
+        // o_partial is [BS, hkv, max_splits, hidden]; the q heads of one kv_head
+        // occupy the first group_size*head_dim floats. ATTN_COMBINE computes
         //   out = sum_s exp(lse_s - M) * o_s / sum_s exp(lse_s - M)
         // which equals the full softmax because
         //   exp(lse_s - M) * o_s = sum_{pos in s} exp(score - M) * v.
@@ -1238,8 +1252,9 @@ __device__ __forceinline__ void tg_attn_decode_op(
         partial[out_base + 2] = final_out[2];
         partial[out_base + 3] = final_out[3];
         if (wlane == 0) {
-          // Empty split -> global_max = -inf, total_sum_exp = 0 -> lse = -inf,
-          // which ATTN_COMBINE skips.
+          // The LSE is a per-head scalar, so one lane is enough. An empty split
+          // gives global_max = -inf, total_sum_exp = 0 -> lse = -inf, which
+          // ATTN_COMBINE skips.
           g.lse_partial[(batch * g.num_kv_heads + kv_head) * g.max_attn_splits +
                         split_idx] = global_max + logf(total_sum_exp);
         }
@@ -1250,6 +1265,7 @@ __device__ __forceinline__ void tg_attn_decode_op(
         out_head[out_base + 3] = tg_round_bf16(final_out[3] / total_sum_exp);
       }
     }
+
     tg_worker_sync_inner();
   }
 
