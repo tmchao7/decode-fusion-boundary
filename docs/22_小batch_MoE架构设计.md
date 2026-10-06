@@ -502,7 +502,13 @@ gather 路径地板 3.570 ms（省下 2.013 ms）；算力占地板 0.76%；
 [未测] 在 5090 上实装 MoE kernel 的 device ms/token、implied GB/s、离地板（1.5574 ms）的倍数
 [未测] H-MoE-1/2/3 的裁决
 [未测] torch-cudagraph 在 b≥2 的正确性（8 个点里 6 个不过门）
-[待修] attn_splits=2 数值 bug（pos 1 差 13.34，选错 token），修好前该臂不可用于取数
+[待修] attn_splits=2 数值 bug —— **仍未修好**，已定位到 ATTN_COMBINE 或其 split 区间分配：
+       已修一个真 bug（ATTN_DECODE 只发布 warp 0 的 lane 到 o_partial，见内核注释），
+       修后 pos-1 两个 split 的 128 列全部正确、lse 均有限值，但误差**逐位不变**（13.3384）；
+       对照实验把范围收窄到 combine 本身：
+         pos 0: |attn_out(splits=1) - attn_out(splits=2)|_max = 0.000000
+         pos 1: |attn_out(splits=1) - attn_out(splits=2)|_max = 5.242188
+       **attn_splits=1 不受影响**（不进该分支）；修好前 attn_splits=2 不可用于取数
 [推测] 目标 2–4 ms/token（docs/20 §5 的 H2 预测值）
 [推测] MLP 不足是 dense 当前 10.8 ms/step（A100，docs/12）的主因之一
 [依赖] W8/W4 的精度门（LeanMoE-Quant EXP-p1-01）
