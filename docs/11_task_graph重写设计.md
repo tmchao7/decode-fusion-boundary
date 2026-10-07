@@ -5,6 +5,11 @@
 > 替换当前每层全网格 `grid.sync()` 大同步。参照隔壁 `cohere-megakernel` 的 task-graph
 > + persistent-worker + dependency-counter 架构，适配到 Qwen3-0.6B（dense）+ A100（sm_80）。
 >
+> ⚠️ **架构目标已迁移**：本文的 **`sm_80` / A100 表述属于 2026-09 的第一轮设计**，
+> 其中的实测记录（§11.4 等）是**历史证据，保持原样**。
+> 当前目标机是 **RTX 5090 / sm_120**，架构对照见 **§2.2（已更新）**；
+> 方向范围与「参考 cohere 的借 / 不借」见 [AGENTS.md](../AGENTS.md) §2。
+>
 > 阅读顺序：先读 §1 目标与约束，再 §2 总体架构，再 §3-§8 各模块细节，最后 §9 迁移路径。
 > 配套代码：`csrc/taskgraph_kernel.cu`（新文件，不动 `kernel.cu`）、`csrc/tg_bindings.cpp`、
 > `schedule.py`、`runtime.cu`、`session.py`（新增）。
@@ -57,13 +62,13 @@ GEMM tile、一个 attention split、一次 RMSNorm…）。task 之间的依赖
 `atomicAdd`，消费者 `volatile` 轮询直到 `>= target`。ready 的 task 立即被认领，partial
 wave 的空闲 SM 被 backfill。
 
-### 2.2 与 cohere 的差异（适配 sm_80 + dense）
+### 2.2 与 cohere 的差异（适配 sm_120 + dense）
 
-| 维度 | cohere（H100/sm_90a） | 我们（A100/sm_80） |
+| 维度 | cohere（H100/sm_90a） | 我们（RTX 5090/sm_120） |
 |---|---|---|
 | GEMM 原语 | TMA load + wgmma + TMA store | WMMA `m16n16k16` + `cp.async`/`__ldg` load + `store_matrix_sync` |
 | cross-SM 信号 | `fence.proxy.async`（TMA proxy）+ `__threadfence` + `atomicAdd` | **`__threadfence` + `atomicAdd`**（无 TMA，不需要 proxy fence） |
-| warp 角色 | 4 role（producer/storer/consumer×1-2/idle），TMA 专用 warp | **简化为 2 role**：compute warp（做 WMMA + global load + store）+ aux warp（做 RMSNorm/attention/argmax 等标量）。sm_80 无 TMA，不需要 producer/storer 分离 |
+| warp 角色 | 4 role（producer/storer/consumer×1-2/idle），TMA 专用 warp | **简化为 2 role**：compute warp（做 WMMA + global load + store）+ aux warp（做 RMSNorm/attention/argmax 等标量）。sm_120 **无 wgmma、无 TMA**（wgmma 被 ptxas 直接拒绝，已实测），不需要 producer/storer 分离 |
 | task 图 | 14 bar（含 MoE） | **8 bar**：`bar_qkv, bar_attn, bar_oproj, bar_silu, bar_ffn_down, bar_layer, bar_combine, bar_lm_head`（dense） |
 | 动态 claimer | attn drain + MoE drain | 先做**静态** attention split（Qwen3-0.6B context ≤ 2048，split 数可静态算）；动态 drain 留作后续 |
 | JIT | little_jit 按 batch size 编译 .so | **先不做 JIT**：用 `build.py` 的 torch cpp_extension 一次编译，靠 runtime 配置（batch/context bucket）切 `inst_buf`。若寄存器压力需要按 batch 特化再引入 JIT |
