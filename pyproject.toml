@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/tmchao7/MegaKernel-vLLM"
+Homepage="https://github.com/tmchao7/decode-fusion-boundary"
 
 [tool.setuptools.packages.find]
 where = ["src"]
