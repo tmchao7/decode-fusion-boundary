@@ -157,7 +157,7 @@ dense 模型只需要 10 种（砍掉 cohere 的 8 个 MoE/Router opcode）：
 
 > 注：`RMSNORM` 不单独列 opcode——QKV 前的 input-layernorm 融进 `TG_QKV_PROJ`，
 > O_PROJ 前的 post-attn-layernorm融进 `TG_O_PROJ`，层末的 final-norm 融进
-> `TG_ADD_RMSNORM`。这跟当前 `kernel.cu` 的融合边界一致（`docs/03` §fusion boundaries）。
+> `TG_ADD_RMSNORM`。这跟当前 `kernel.cu` 的融合边界一致（`docs/archive/03` §fusion boundaries）。
 
 ### 3.3 各 opcode 的字段 layout
 
@@ -679,7 +679,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 ---
 
 > 本设计稿完成后，进入阶段 0 实现。每阶段完成后回填本文档的"实测状态"小节，
-> 并更新 `docs/10_交接文档.md` §1/§2/§3。
+> 并更新 `docs/archive/10_交接文档.md` §1/§2/§3。
 
 ---
 
@@ -769,7 +769,7 @@ prefill 走 PyTorch/FlashAttention（nano-vLLM 现有路径），**期间 decode
 > 向量化并移出 `cp.async` 等待、tile 打包 6→7）。`docs/12 §2.6` 估计 10.8 ms →
 > 4.7~7 ms，但**尚未在 GPU 上验证**。所以这些数字只能当"改动前基线"，不是当前
 > task-graph 实现的能力；当前基线的唯一来源是服务器上的
-> `RUN_MODE=taskgraph-baseline`（`docs/13`）。
+> `RUN_MODE=taskgraph-baseline`（`docs/archive/13`）。
 
 #### 硬件 / 环境
 
@@ -846,7 +846,7 @@ output: Hello, how are you? I am a student, and I am studying for the final exam
   （184/10264 指令可执行），但用同一份 `simulate_execution` 在 `f6cd3a8` /
   `1a7539b` 上复现不出来（10264/10264 全部可执行）。`f3d8114` 之后 ABI 测试覆盖
   `attn_splits∈{1,2}` × `BS∈{1..8}` × `num_sms∈{1,4,8,108}` 全部无死锁；
-  数值侧仍需服务器。详见 `docs/taskgraph_progress.md §4.1`。
+  数值侧仍需服务器。详见 `docs/archive/taskgraph_progress.md §4.1`。
 - 性能远未优化（且本节数字早于 `docs/12` 的改动）：`__syncthreads` dispatch
   ~2µs/SM（占每步 <0.1%）、scalar attention 未向量化、权重带宽利用率低
   （111 GB/s vs A100 HBM 峰值 1.5 TB/s）。ring buffer 不在当前实现里（§11.2）。

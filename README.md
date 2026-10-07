@@ -284,5 +284,5 @@ It produces the correctness log, the torch-eager/torch-cudagraph/Megakernel
 comparison table, and the host/GPU accounting table under `results/`.
 
 Historical performance conclusions for the archived implementation remain in
-`docs/06_实际运行数据.md` and `docs/07_融合收益边界与根因.md`; they
+`docs/archive/06_实际运行数据.md` and `docs/07_融合收益边界与根因.md`; they
 must not be read as measurements of the current task-graph implementation.

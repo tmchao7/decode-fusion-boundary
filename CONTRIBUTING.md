@@ -17,7 +17,7 @@ the SM-count sweep as the test for waiting-vs-working).
 Then [`docs/02_指标说明.md`](docs/02_指标说明.md) for the statistics conventions,
 [`docs/04_基准测试方法.md`](docs/04_基准测试方法.md) for how numbers are produced,
 and [`docs/07_融合收益边界与根因.md`](docs/07_融合收益边界与根因.md) for the full
-derivation. [`AGENTS.md`](AGENTS.md) has the hard rules; `docs/10_交接文档.md` is the
+derivation. [`AGENTS.md`](AGENTS.md) has the hard rules; `docs/archive/10_交接文档.md` is the
 engineering log.
 
 ## Layout
