@@ -236,7 +236,7 @@ class ServerCommandReferenceTests(unittest.TestCase):
     # They are excluded from the "current docs" scan below on purpose.
     HISTORICAL_DOCS = {
         "06_实际运行数据.md",
-        "07_架构结论_megakernel为何打不过cudagraph.md",
+        "07_融合收益边界与根因.md",
     }
 
     def test_current_docs_only_advertise_existing_run_modes(self) -> None:
@@ -513,7 +513,7 @@ class CitationTests(unittest.TestCase):
     """docs/06 section 9.9 is the external-evidence record; keep it usable."""
 
     def setUp(self) -> None:
-        self.text = (REPO_ROOT / "docs" / "07_架构结论_megakernel为何打不过cudagraph.md").read_text(
+        self.text = (REPO_ROOT / "docs" / "07_融合收益边界与根因.md").read_text(
             encoding="utf-8"
         )
 

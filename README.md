@@ -1,20 +1,45 @@
-# Megakernel-vLLM
+# Megakernel-vLLM — the fusion / CUDA-Graph boundary
 
 **Question.** In LLM decode, how do the returns from *whole-model kernel fusion*
 compare with those from *CUDA Graph* as batch size grows — and where does each one
 stop paying?
 
-**Answer (measured, on A100-SXM4-80GB).** Kernel fusion wins at batch 1 and only
-there, and the win is not compute: it eliminates ~2.2 ms/step of host work while
-being **2.6x slower on the device**. At batch ≥ 2 the device gap dominates and the
-megakernel loses by up to 133x. An independent 2026 result
-([AutoMegaKernel](https://arxiv.org/abs/2606.09682)) localizes the same A100/H100
-loss to the cross-SM-sync bottleneck, while the same design wins on
-inference-class parts (L4/L40S/A10G/RTX 5090, 1.08–1.33x).
+**Answer.** The gain is real but narrow, and on the current machine its *source*
+has already been eliminated by the baseline:
+
+- **On A100**, fusion wins at batch 1 and only there, and the win is not compute:
+  it eliminates ~2.2 ms/step of host work while being **2.6x slower on the device**.
+  At batch ≥ 2 the device gap dominates and it loses by up to 133x.
+- **On RTX 5090** (the current measurement), the host residual is **0.3%** of a step
+  (*wall 624.1 / host 603.4 / device 601.7 ms over 128 tokens*) -- CUDA Graph has
+  already removed the boundary this design exists to remove. Device-side it is
+  **5.81x off its own weight floor** at ctx=1, where there is **no attention at all**,
+  and the cause is a **dependency/synchronisation chain, not HBM**: going 16->170 SMs
+  cuts work per SM by 10.5x while total time falls only 1.5x, and per-instruction time
+  *rises* 7x (22 -> 155 us). A single SM alone sustains 16 GB/s against the 9.75 GB/s
+  per SM that peak would need. Only ~55 instructions are concurrently runnable at any
+  level.
 
 So this repo is **not** a "faster kernel" claim. It is an instrument for locating
 the fusion/CUDA-Graph boundary, with the physics (roofline + measured achievable
-bandwidth) and the negative results reported alongside the wins.
+bandwidth) and the negative results reported alongside the wins. An independent 2026
+result ([AutoMegaKernel](https://arxiv.org/abs/2606.09682)) localizes the same
+A100/H100 loss to the cross-SM-sync bottleneck, while the same design wins on
+inference-class parts.
+
+**Status: archived (2026-10-06).** See [ARCHIVE.md](ARCHIVE.md) for the boundary
+result and the list of assets worth carrying forward.
+
+### One engineering trap worth reading even if you skip everything else
+
+`ncu` (Nsight Compute) **cannot profile a cooperative kernel**: its kernel-replay
+mechanism conflicts with `cudaLaunchCooperativeKernel`, and the measured outcome is a
+**hung GPU driver** -- `nvidia-smi` blocks with it. Use `nsys` instead. This cost real
+debugging time here, and it is why the profiling story in this repo is nsys-based.
+
+Related, and the method that localized the bottleneck above: **sweep the SM count and
+watch whether per-instruction time RISES with more SMs.** If it does, the time is going
+into waiting, not into work.
 
 ```text
 decode_backend="torch", enforce_eager=False -> torch-cudagraph  (the strong baseline)
@@ -250,5 +275,5 @@ It produces the correctness log, the torch-eager/torch-cudagraph/Megakernel
 comparison table, and the host/GPU accounting table under `results/`.
 
 Historical performance conclusions for the archived implementation remain in
-`docs/06_实际运行数据.md` and `docs/07_架构结论_megakernel为何打不过cudagraph.md`; they
+`docs/06_实际运行数据.md` and `docs/07_融合收益边界与根因.md`; they
 must not be read as measurements of the current task-graph implementation.

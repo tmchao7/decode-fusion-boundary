@@ -7,7 +7,7 @@ tooling that decided how it should be dispatched.
 
 Start with [`docs/01_项目说明.md`](docs/01_项目说明.md) for what the project is,
 [`docs/06_实际运行数据.md`](docs/06_实际运行数据.md) for the measured numbers, and
-[`docs/07_架构结论_megakernel为何打不过cudagraph.md`](docs/07_架构结论_megakernel为何打不过cudagraph.md)
+[`docs/07_融合收益边界与根因.md`](docs/07_融合收益边界与根因.md)
 for the root-cause analysis and the decision rule. `docs/10_交接文档.md` is the
 engineering log (what each round changed, what is frozen).
 
