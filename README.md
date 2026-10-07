@@ -1,8 +1,17 @@
-# Megakernel-vLLM — the fusion / CUDA-Graph boundary
+# decode-fusion-boundary
 
 **Question.** In LLM decode, how do the returns from *whole-model kernel fusion*
-compare with those from *CUDA Graph* as batch size grows — and where does each one
-stop paying?
+compare with those from *CUDA Graph* as **batch size grows** — and where does each
+one stop paying?
+
+**Why this framing.** The return from fusion is *conditional*. Claiming "faster"
+gets overturned by a single batch sweep; stating a **boundary** does not — it only
+gets refined. The comparison arm is CUDA Graph, not eager, because graph is the
+strong baseline and a speedup over eager means nothing.
+
+**The method is part of the deliverable.** What survives a hardware refresh is not
+the number but how it was obtained, so the profiling discipline here is written
+down and reusable — see [docs/00_定位与方法论.md](docs/00_定位与方法论.md) §3.
 
 **Answer.** The gain is real but narrow, and on the current machine its *source*
 has already been eliminated by the baseline:

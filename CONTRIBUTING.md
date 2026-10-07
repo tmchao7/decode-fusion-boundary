@@ -1,15 +1,24 @@
 # Contributing
 
-Thanks for looking at Megakernel-vLLM. This is a research extension of
-[nano-vLLM](https://github.com/GeeeekExplorer/nano-vLLM): a fused persistent
-cooperative kernel for the Qwen3-0.6B decode step, plus the measurement
-tooling that decided how it should be dispatched.
+Thanks for looking at `decode-fusion-boundary`.
 
-Start with [`docs/01_项目说明.md`](docs/01_项目说明.md) for what the project is,
-[`docs/06_实际运行数据.md`](docs/06_实际运行数据.md) for the measured numbers, and
-[`docs/07_融合收益边界与根因.md`](docs/07_融合收益边界与根因.md)
-for the root-cause analysis and the decision rule. `docs/10_交接文档.md` is the
-engineering log (what each round changed, what is frozen).
+This is a **measurement study**, not a "faster kernel" claim: it locates where
+whole-model kernel fusion stops paying relative to CUDA Graph as batch size grows,
+and explains the mechanism. The fused persistent cooperative kernel (for the
+Qwen3-0.6B decode step, built on nano-vLLM's paged KV cache) is the **instrument**;
+the boundary and its root cause are the result, and the profiling method is a
+deliverable in its own right.
+
+Start with [`docs/00_定位与方法论.md`](docs/00_定位与方法论.md) — it is the single
+source for what is being asked, what was found, and the method, including two traps
+worth knowing independently of this repo (`ncu` cannot profile a cooperative kernel;
+the SM-count sweep as the test for waiting-vs-working).
+
+Then [`docs/02_指标说明.md`](docs/02_指标说明.md) for the statistics conventions,
+[`docs/04_基准测试方法.md`](docs/04_基准测试方法.md) for how numbers are produced,
+and [`docs/07_融合收益边界与根因.md`](docs/07_融合收益边界与根因.md) for the full
+derivation. [`AGENTS.md`](AGENTS.md) has the hard rules; `docs/10_交接文档.md` is the
+engineering log.
 
 ## Layout
 
