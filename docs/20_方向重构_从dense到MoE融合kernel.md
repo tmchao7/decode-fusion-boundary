@@ -108,7 +108,7 @@ megakernel 想赢  →  必须 streaming fewer bytes
 | 项目 | 回答什么问题 | 手段 |
 |---|---|---|
 | **LeanMoE-Quant** | 天花板在哪？量化值不值得？ | 测量方法学、roofline、字节账 |
-| **MegaKernel-vLLM** | 一个 kernel 能不能够到天花板？ | CUDA/Triton kernel、同步、occupancy |
+| **decode-fusion-boundary** | 一个 kernel 能不能够到天花板？ | CUDA/Triton kernel、同步、occupancy |
 
 **分工纪律**：不要两个项目都变成"我证明了 MoE 很吃 launch"。那是同一句话讲两遍。
 
