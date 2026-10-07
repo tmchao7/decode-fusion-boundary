@@ -4,7 +4,16 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    # Configurable instead of a hardcoded personal path; SERVER_COMMANDS.txt sets
+    # NANOVLLM_MODEL_PATH, so the same variable works here.
+    path = os.path.expanduser(
+        os.environ.get("NANOVLLM_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
+    )
+    if not os.path.isdir(path):
+        raise SystemExit(
+            f"model directory not found at {path!r}; set NANOVLLM_MODEL_PATH to a "
+            f"local Qwen3-0.6B directory"
+        )
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 

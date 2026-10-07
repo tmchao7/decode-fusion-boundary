@@ -24,6 +24,8 @@
 | `22_小batch_MoE架构设计.md` | 设计决议，**未实现**。其中的 opcode 契约**不得引用为"已完成"** |
 | `99_变更历史.md` | 各文档抽出的版本变更日志 |
 | `taskgraph_progress.md` | 2026-09-23 的优化进展快照 |
+| `plans/2026-09-24-taskgraph-as-megakernel.md` | 9 月的实施计划，已执行完毕 |
+| `plans/2026-09-30-taskgraph-finalization.md` | 9 月的收尾计划，已执行完毕 |
 
 ## 引用规则
 
